@@ -7,7 +7,7 @@
 //! name is a source of an own crate, a file of OUT_DIR or a variable set by a build script. The files of the package
 //! of an own crate that can load a proc macro select its entry too.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 use std::{env, fs, io};
@@ -15,6 +15,12 @@ use std::{env, fs, io};
 pub const TARGET: &str = "{trucker:target}/";
 pub const CARGO_HOME: &str = "{trucker:cargo-home}/";
 pub const WORKTREE: &str = "{trucker:worktree}";
+
+// The placeholders of the roots in a JSON string, which doubles each `\` of a path on Windows.
+#[cfg(windows)]
+const TARGET_JSON: &str = "{trucker:target-json}/";
+#[cfg(windows)]
+const CARGO_HOME_JSON: &str = "{trucker:cargo-home-json}/";
 
 /// A field of the key of every own crate that changes with how entries are selected, so an older entry is not found.
 const OWN: &[u8] =
@@ -59,10 +65,28 @@ pub struct Roots {
 
 impl Roots {
     /// Each root with its placeholder, the longest first, because the target directory may lie inside the worktree.
+    #[cfg(unix)]
     fn placeholders(&self) -> Vec<(&str, &str)> {
         let mut pairs =
             vec![(self.target.as_str(), TARGET), (self.cargo_home.as_str(), CARGO_HOME)];
         pairs.extend(self.worktree.as_deref().map(|root| (root, WORKTREE)));
+        pairs.sort_by_key(|(root, _)| std::cmp::Reverse(root.len()));
+        pairs
+    }
+
+    /// Each root with its placeholder, also in the spelling of a JSON string, the longest first.
+    ///
+    /// rustc writes the paths of its JSON diagnostics and artifact notifications with each `\` doubled. A worktree is
+    /// never set on Windows, where an own crate runs as plain rustc.
+    #[cfg(windows)]
+    fn placeholders(&self) -> Vec<(String, &'static str)> {
+        let (target, home) = (&self.target, &self.cargo_home);
+        let mut pairs = vec![
+            (target.clone(), TARGET),
+            (target.replace('\\', r"\\"), TARGET_JSON),
+            (home.clone(), CARGO_HOME),
+            (home.replace('\\', r"\\"), CARGO_HOME_JSON),
+        ];
         pairs.sort_by_key(|(root, _)| std::cmp::Reverse(root.len()));
         pairs
     }
@@ -84,7 +108,8 @@ impl Roots {
     /// The target directory where it lies outside the worktree and so needs a remap and a scan of its own.
     pub fn separate_target(&self) -> Option<&str> {
         let root = self.worktree.as_deref()?;
-        let inside = self.target.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'));
+        let inside =
+            self.target.strip_prefix(root).is_some_and(|rest| rest.starts_with(MAIN_SEPARATOR));
         (!inside).then_some(self.target.as_str())
     }
 
@@ -132,11 +157,15 @@ pub struct Unit {
 }
 
 /// CARGO_HOME with a trailing slash.
+#[cfg(unix)]
 pub fn cargo_home() -> String {
     let home = env::var("CARGO_HOME")
         .unwrap_or_else(|_| format!("{}/.cargo", env::var("HOME").unwrap_or_default()));
     format!("{}/", home.trim_end_matches('/'))
 }
+
+#[cfg(windows)]
+pub use crate::windows::cargo_home;
 
 /// Whether `input` is a source of the registry or of a git dependency, which never changes once unpacked.
 pub fn is_third_party(input: &Path, cargo_home: &str) -> bool {
@@ -209,10 +238,20 @@ pub fn identity(path: &Path) -> io::Result<String> {
 ///
 /// Every write to a file sets its ctime, which only a change of the system clock can set back. So a file whose identity
 /// stays the same has the same contents.
+#[cfg(unix)]
 pub fn identity_of(file: &fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
     let (mtime, ctime) = ((file.mtime(), file.mtime_nsec()), (file.ctime(), file.ctime_nsec()));
     format!("{} {} {} {mtime:?} {ctime:?}", file.dev(), file.ino(), file.len())
+}
+
+/// The length and mtime of `file`, which never select a memo, because [`settled`] never lets one be written.
+///
+/// A process that may write the attributes of a file can set back its change time on Windows, so no identity there
+/// proves the contents of a file.
+#[cfg(windows)]
+pub fn identity_of(file: &fs::Metadata) -> String {
+    format!("{} {:?}", file.len(), file.modified().ok())
 }
 
 /// The hash of the file at `path`, remembered in `memos` under its [`identity`].
@@ -240,12 +279,19 @@ pub fn remembered_hash(path: &Path, memos: &Path) -> io::Result<blake3::Hash> {
 ///
 /// A write in the same tick of a coarse clock leaves the identity of a file alone, so a memo is written only for a
 /// file whose times lie further back than any tick.
+#[cfg(unix)]
 fn settled(file: &fs::Metadata, start: i64) -> bool {
     use std::os::unix::fs::MetadataExt;
     file.ctime().max(file.mtime()).saturating_add(1) < start
 }
 
-/// The hash of each of `paths` in order, computed on every core through [`remembered_hash`] in `memos`.
+/// Never holds, so that Windows remembers no hash, for the reason that [`identity_of`] gives.
+#[cfg(windows)]
+fn settled(_: &fs::Metadata, _: i64) -> bool {
+    false
+}
+
+/// The hash of each of `paths` in order, remembered in `memos` as [`remembered_hash`] remembers it.
 ///
 /// The libraries of a linked crate take a gigabyte or more and an edit changes few of them, so remembered hashes keep
 /// them from delaying its compile. The files without a memo are hashed through [`crate::lazy::scan`], so a library
@@ -262,9 +308,13 @@ pub fn file_hashes(paths: &[PathBuf], memos: &Path) -> io::Result<Vec<blake3::Ha
     let missing = Vec::from_iter((0..paths.len()).filter(|&at| hashes[at].is_none()));
     // The files of a chunk are open at once, so a chunk stays well within the limit of open files.
     for chunk in missing.chunks(64) {
+        #[cfg(unix)]
         let computed =
             crate::lazy::scan(&Vec::from_iter(chunk.iter().map(|&at| paths[at].clone())), &[])
                 .map(|(computed, _)| computed.into_iter());
+        // Windows does not build `lazy`, so each file is hashed on its own.
+        #[cfg(windows)]
+        let computed = None::<std::vec::IntoIter<blake3::Hash>>;
         let mut computed = computed.into_iter().flatten();
         for &at in chunk {
             hashes[at] = Some(match computed.next() {
@@ -453,7 +503,7 @@ pub fn remember(directory: &Path, identity: &str, output: &[u8]) -> io::Result<(
     let memo = directory.join(blake3::hash(identity.as_bytes()).to_hex().as_str());
     let staging = memo.with_extension(std::process::id().to_string());
     fs::create_dir_all(directory)?;
-    fs::write(&staging, output).and_then(|()| fs::rename(&staging, &memo))
+    fs::write(&staging, output).and_then(|()| crate::store::rename(&staging, &memo))
 }
 
 /// The target directory that holds `out_dir` as the output directory of one unit in the layout of cargo.
@@ -543,13 +593,18 @@ impl Unit {
             return Err("emit");
         }
         let target = target_directory(out_dir, triple);
-        let target = format!("{}/", target.ok_or("no-target-dir")?.display());
-        // The JSON diagnostics of rustc escape these characters, so the placeholders would not find a root in them.
-        let escaped = |c: char| c.is_control() || c == '\\' || c == '"';
+        let target = format!("{}{MAIN_SEPARATOR}", target.ok_or("no-target-dir")?.display());
+        // The JSON diagnostics of rustc escape these characters, so the placeholders would not find a root in them. On
+        // Windows a root has a placeholder for its spelling in JSON too.
+        let escaped = |c: char| c.is_control() || (c == '\\' && cfg!(unix)) || c == '"';
         if [&target, &cargo_home].into_iter().chain(&worktree).any(|path| path.contains(escaped)) {
             return Err("escaped-path");
         }
         let roots = Roots { target, cargo_home, worktree };
+        #[cfg(windows)]
+        if !crate::windows::is_keyable(&roots, trees.iter().map(String::as_str)) {
+            return Err("path-spelling");
+        }
         let stem = format!("{name}{extra}");
         let apple =
             cfg!(target_os = "macos") && triple.is_none_or(|triple| triple.contains("-apple-"));
@@ -761,7 +816,11 @@ impl Unit {
         let script = self.roots.worktree.is_none()
             && self.stem.starts_with("build_script_")
             && !self.stem.contains('-');
-        script.then(|| self.out_dir.join(&self.stem))
+        #[cfg(unix)]
+        let name = &self.stem;
+        #[cfg(windows)]
+        let name = format!("{}.exe", self.stem);
+        script.then(|| self.out_dir.join(name))
     }
 
     /// The flags that name paths in spans, panics, debug info and links, which the key covers.
@@ -821,6 +880,9 @@ impl Unit {
         let lossy = |text: std::ffi::OsString| text.to_string_lossy().into_owned();
         let mut variables =
             Vec::from_iter(environment.map(|(name, value)| (lossy(name), lossy(value))));
+        // Windows reads a variable whatever the case of its name.
+        #[cfg(windows)]
+        variables.iter_mut().for_each(|(name, _)| name.make_ascii_uppercase());
         variables.sort();
         for (name, value) in variables.iter().filter(|(name, _)| is_keyed(name)) {
             field(name.as_bytes());
@@ -878,7 +940,17 @@ impl Unit {
     fn native_library(&self, link: &str) -> Option<PathBuf> {
         let (kind, name) = link.split_once('=').unwrap_or(("dylib", link));
         let name = name.split(':').next().unwrap_or(name);
+        #[cfg(windows)]
+        let spellings = match kind {
+            _ if kind.contains("+verbatim") => vec![name.to_string()],
+            _ if kind.starts_with("static") => vec![format!("{name}.lib"), format!("lib{name}.a")],
+            _ => ["{}.lib", "{}.dll.lib", "lib{}.dll.a", "{}.dll.a", "lib{}.a"]
+                .map(|spelling| spelling.replace("{}", name))
+                .to_vec(),
+        };
+        #[cfg(unix)]
         let dynamic: &[&str] = if cfg!(target_os = "macos") { &["tbd", "dylib"] } else { &["so"] };
+        #[cfg(unix)]
         let spellings = match kind {
             _ if kind.contains("+verbatim") => vec![name.to_string()],
             _ if kind.starts_with("framework") => vec![],
@@ -898,8 +970,10 @@ impl Unit {
     /// resolved against the working directory. Returns `None` where the crate read a path with a control character, or
     /// a file elsewhere outside CARGO_HOME and the hashed trees, because an entry cannot cover it.
     pub fn portable_dep_info(&self, dep_info: &str) -> Option<(String, String)> {
-        let directory =
-            |path: &str| self.roots.normalized(&format!("{}/", path.trim_end_matches('/')));
+        let directory = |path: &str| {
+            let path = path.trim_end_matches(MAIN_SEPARATOR);
+            self.roots.normalized(&format!("{path}{MAIN_SEPARATOR}"))
+        };
         let mut covered = vec![CARGO_HOME.to_string(), directory(&self.out_dir.to_string_lossy())];
         let hashed = self.trees.iter().filter(|tree| tree.starts_with(&self.roots.target));
         covered.extend(hashed.map(|tree| directory(tree)));

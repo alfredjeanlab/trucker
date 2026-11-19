@@ -7,9 +7,24 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 blake3 = { version = "1", features = ["mmap"] }
-libc = "0.2"
 memchr = "2"
 memmap2 = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows needs its own system calls for clones, file identities, volumes and processes.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 # Unsafe code only in the system calls that clone a file, lease a library and ask a filesystem's size, and in the map of
 # an output that is scanned, each allowed where it is written.

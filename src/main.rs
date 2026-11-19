@@ -9,17 +9,28 @@
 
 mod duplicates;
 mod gc;
+#[cfg(unix)]
 mod lazy;
 mod script;
+#[cfg(unix)]
 mod session;
 mod store;
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
 mod unit;
+#[cfg(windows)]
+mod windows;
+#[cfg(any(windows, test))]
+mod windows_scan;
+
+#[cfg(windows)]
+use windows::{lazy, session};
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
@@ -42,7 +53,7 @@ fn main() {
         (Some(rustc), Some(rest)) => {
             exit(wrap(rustc, &rest, &store_directory(), unit::cargo_home()))
         }
-        _ => exit(report(rustc.as_ref(), Command::new(rustc).args(rest).exec())),
+        _ => exit(replace(Command::new(rustc).args(rest), rustc.as_ref())),
     }
 }
 
@@ -60,10 +71,29 @@ fn report(rustc: &Path, error: io::Error) -> i32 {
     1
 }
 
-fn store_directory() -> PathBuf {
-    let home = || PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache");
-    env::var_os("XDG_CACHE_HOME").map_or_else(home, PathBuf::from).join("trucker")
+/// Replaces this process with `command`, which runs `program`, and returns an exit code only where that fails.
+#[cfg(unix)]
+fn replace(command: &mut Command, program: &Path) -> i32 {
+    report(program, command.exec())
 }
+
+/// Runs `command`, which runs `program`, and returns its exit code, because Windows cannot replace a process.
+#[cfg(windows)]
+fn replace(command: &mut Command, program: &Path) -> i32 {
+    windows::run(command).unwrap_or_else(|error| report(program, error))
+}
+
+fn store_directory() -> PathBuf {
+    env::var_os("XDG_CACHE_HOME").map_or_else(cache_home, PathBuf::from).join("trucker")
+}
+
+#[cfg(unix)]
+fn cache_home() -> PathBuf {
+    PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache")
+}
+
+#[cfg(windows)]
+use windows::cache_home;
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())
@@ -76,7 +106,7 @@ fn now() -> u64 {
 fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
     let started = Instant::now();
     let _ = fs::create_dir_all(store.join("entries"));
-    let untouched = || report(rustc.as_ref(), Command::new(rustc).args(args).exec());
+    let untouched = || replace(Command::new(rustc).args(args), rustc.as_ref());
     if unit::is_query(args) {
         return untouched();
     }
@@ -95,6 +125,13 @@ fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
     let input = args.iter().find(|arg| arg.ends_with(".rs") && !arg.starts_with('-'));
     let input = input.and_then(|input| Some(unit::lexical(&env::current_dir().ok()?.join(input))));
     let local = input.filter(|input| !unit::is_third_party(input, &cargo_home));
+    // An own crate on Windows runs as plain rustc would, without a remap, a slot or a candidate.
+    #[cfg(windows)]
+    if local.is_some() {
+        let code = replace(Command::new(rustc).args(args), rustc.as_ref());
+        log(store, crate_name(args), started, "passthrough windows-own-crate");
+        return code;
+    }
     let worktree = local.as_deref().and_then(|input| unit::worktree(input, &cargo_home));
     let unit = Unit::model(args, cargo_home, env::var("OUT_DIR").ok(), worktree.clone());
     let remap = unit.as_ref().map_or_else(|_| Vec::new(), Unit::remap);
@@ -392,8 +429,11 @@ fn localize_dep_info(dep_info: &[PathBuf], slot: &session::Slot) {
 ///
 /// A file in `store` named after `kind` and the process of cargo marks the build that was told, until gc removes it.
 fn notice(store: &Path, kind: &str, message: &str) {
-    let marker =
-        store.join("notices").join(format!("{kind}-{}", std::os::unix::process::parent_id()));
+    #[cfg(unix)]
+    let parent = std::os::unix::process::parent_id();
+    #[cfg(windows)]
+    let parent = windows::parent_id();
+    let marker = store.join("notices").join(format!("{kind}-{parent}"));
     let _ = fs::create_dir_all(store.join("notices"));
     if fs::File::create_new(marker).is_ok() {
         eprintln!("trucker {message}");

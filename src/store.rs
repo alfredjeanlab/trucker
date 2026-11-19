@@ -3,8 +3,10 @@
 //! Outputs are cloned in and out without copying data, or linked in and copied out where the filesystem cannot clone.
 //! An entry is written in a directory of its own and renamed into place, so a reader finds it whole or missing.
 
+#[cfg(unix)]
 use std::ffi::c_int;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -29,9 +31,16 @@ pub const HASHES: &str = ".hashes";
 /// The time that a process waits for another process to store a key before it compiles the key too.
 const PATIENCE: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 600 });
 
+#[cfg(unix)]
 pub fn same_filesystem(store: &Path, out_dir: &Path) -> bool {
     matches!((fs::metadata(store), fs::metadata(out_dir)), (Ok(store), Ok(out_dir)) if store.dev() == out_dir.dev())
 }
+
+#[cfg(windows)]
+pub use crate::windows::{clone, rename, same_volume as same_filesystem};
+
+#[cfg(unix)]
+pub use std::fs::rename;
 
 /// Clones `source` to `destination` as a file of its own that shares the blocks of `source`.
 ///
@@ -124,7 +133,10 @@ impl Files {
     pub fn duplicate(self, source: &Path, destination: &Path) -> io::Result<()> {
         match self {
             Files::Clones => clone(source, destination),
+            #[cfg(unix)]
             Files::Links => fs::copy(source, destination).map(drop),
+            #[cfg(windows)]
+            Files::Links => crate::windows::copy(source, destination),
         }
     }
 
@@ -138,6 +150,7 @@ impl Files {
 
     /// Writes the tree of `from` into `to` through [`Files::duplicate`], so a file of `to` is a snapshot that a write
     /// in place to the other tree never reaches.
+    #[cfg(unix)]
     pub fn duplicate_tree(self, from: &Path, to: &Path) -> io::Result<()> {
         fs::create_dir_all(to)?;
         for (path, kind) in tree(from)? {
@@ -176,11 +189,16 @@ pub fn tree(directory: &Path) -> io::Result<Vec<(PathBuf, fs::FileType)>> {
 /// a linked output in place.
 fn copy(source: &Path, destination: &Path, expected: &str) -> io::Result<()> {
     use std::io::Read;
+    #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut source = fs::File::open(source)?;
+    #[cfg(unix)]
     let mode = source.metadata()?.permissions().mode() | 0o200;
+    #[cfg(unix)]
     let mut copy =
         fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(destination)?;
+    #[cfg(windows)]
+    let mut copy = fs::OpenOptions::new().write(true).create_new(true).open(destination)?;
     let (mut hasher, mut buffer) = (blake3::Hasher::new(), vec![0; 1 << 20]);
     loop {
         let read = source.read(&mut buffer)?;
@@ -225,6 +243,10 @@ fn stage(
             let dep_info =
                 fs::read_to_string(output).ok().and_then(|text| unit.portable_dep_info(&text));
             let (dep_info, read) = dep_info.ok_or("unkeyed-input")?;
+            #[cfg(windows)]
+            if crate::windows::contains(&dep_info, &[&roots.target]) {
+                return Err("baked-path");
+            }
             reads = read;
             fs::write(stored, dep_info).map_err(|_| "store-error")?;
         } else if files == Files::Clones {
@@ -240,6 +262,11 @@ fn stage(
         fs::write(staging.join(HASHES), hashes).map_err(|_| "store-error")?;
     }
     let stderr = unit.roots.normalized(&String::from_utf8_lossy(stderr));
+    // A path in another spelling than that of a root is not replaced, and would name this worktree in another one.
+    #[cfg(windows)]
+    if crate::windows::contains(&stderr, &[&roots.target]) {
+        return Err("baked-path");
+    }
     fs::write(staging.join(STDERR), stderr).map_err(|_| "store-error")?;
     fs::write(staging.join(RECORD), record).map_err(|_| "store-error").map(|()| reads)
 }
@@ -248,15 +275,29 @@ fn stage(
 ///
 /// The scan runs on every core, because it delays every edit that recompiles the crate. The debug info of an
 /// executable can take hundreds of megabytes, and a crate has hundreds of object files.
+#[cfg(unix)]
 pub fn any_contains(paths: &[impl AsRef<Path> + Sync], texts: &[&str]) -> bool {
     let finders = Vec::from_iter(texts.iter().map(memchr::memmem::Finder::new));
+    any_file(paths, |bytes| finders.iter().any(|text| text.find(bytes).is_some()))
+}
+
+/// Whether any file of `paths` contains a spelling of any of `texts`, which are roots, or cannot be read.
+///
+/// A spelling is one that [`crate::windows::scan`] finds.
+#[cfg(windows)]
+pub fn any_contains(paths: &[impl AsRef<Path> + Sync], texts: &[&str]) -> bool {
+    let scan = crate::windows::scan(texts);
+    any_file(paths, |bytes| scan.contains(bytes))
+}
+
+/// Whether `contains` holds for the bytes of any file of `paths`, or one cannot be read, on every core.
+fn any_file(paths: &[impl AsRef<Path> + Sync], contains: impl Fn(&[u8]) -> bool + Sync) -> bool {
     let (next, found) = (AtomicUsize::new(0), AtomicBool::new(false));
     let worker = || {
         while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
             if found.load(Ordering::Relaxed) {
                 return;
             }
-            let contains = |bytes: &[u8]| finders.iter().any(|text| text.find(bytes).is_some());
             let path = path.as_ref();
             let hit = match map(path) {
                 Some(map) => contains(&map),
@@ -321,7 +362,7 @@ pub fn commit(
     entry: &Path,
 ) -> Result<(), &'static str> {
     let recorded = reads.is_empty() || fs::write(reads_of(entries, key), reads).is_ok();
-    let renamed = recorded && fs::rename(staging, entry).is_ok();
+    let renamed = recorded && rename(staging, entry).is_ok();
     if let Some(store) = entries.parent().filter(|_| renamed) {
         crate::gc::add(store, entry);
     }
@@ -366,8 +407,11 @@ pub fn lock(store: &Path, key: &str, name: &str) -> Option<fs::File> {
 /// gc removes a `.reads` file by its mtime, because the name of an entry that it selects does not contain the key.
 pub fn touch(entries: &Path, key: &str, entry: &Path) {
     for path in [entry, &reads_of(entries, key)] {
+        #[cfg(unix)]
         let _ =
             fs::File::open(path).and_then(|file| file.set_modified(std::time::SystemTime::now()));
+        #[cfg(windows)]
+        let _ = crate::windows::touch(path);
     }
 }
 
@@ -375,7 +419,8 @@ pub fn touch(entries: &Path, key: &str, entry: &Path) {
 /// entry holds linked files.
 ///
 /// The output is remembered although its times are new, because it is whole once renamed into place, and nothing writes
-/// it in place afterwards, as rustc replaces an output that trucker removed.
+/// it in place afterwards, as rustc replaces an output that trucker removed. Windows remembers no hash.
+#[cfg(unix)]
 fn remember_restored(entry: &Path, stored: &Path, output: &Path, expected: Option<&str>) {
     let Some(memos) = entry.parent().and_then(Path::parent).map(|store| store.join("hashes"))
     else {
@@ -439,17 +484,18 @@ pub fn restore(
         let _ = fs::remove_file(&output);
         let partial = unit.out_dir.join(format!("{name}.{}.trucker", std::process::id()));
         let restored = files.restore_file(&stored, &partial, expected);
-        if let Err(error) = restored.and_then(|()| fs::rename(&partial, &output)) {
+        if let Err(error) = restored.and_then(|()| rename(&partial, &output)) {
             let _ = fs::remove_file(&partial);
             if error.kind() != io::ErrorKind::InvalidData {
                 return Err("unrestorable");
             }
             // An entry that a tool changed through a link is removed as gc removes one, and stored again.
             let doomed = entry.with_extension(std::process::id().to_string());
-            let _ = fs::rename(entry, &doomed).and_then(|()| fs::remove_dir_all(&doomed));
+            let _ = rename(entry, &doomed).and_then(|()| fs::remove_dir_all(&doomed));
             return Err("evicted");
         }
         // A dependent hashes each library for its key, and one that was just restored is not settled.
+        #[cfg(unix)]
         if name.starts_with("lib") {
             remember_restored(entry, &stored, &output, expected);
         }

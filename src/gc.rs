@@ -10,8 +10,12 @@
 //! store.
 
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -139,6 +143,7 @@ pub fn add_bytes(store: &Path, bytes: u64) {
 /// The total size and the free space in bytes of the filesystem of `path`, as an unprivileged user sees them.
 ///
 /// Both are zero where the filesystem cannot be asked.
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast, unsafe_code)]
 fn space(path: &Path) -> (u64, u64) {
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
@@ -154,6 +159,9 @@ fn space(path: &Path) -> (u64, u64) {
     let block = stats.f_bsize as u64;
     (stats.f_blocks as u64 * block, stats.f_bavail as u64 * block)
 }
+
+#[cfg(windows)]
+use crate::windows::space;
 
 /// Starts `wrapper gc` detached, where the last run that a miss started in `store` is older than [`INTERVAL`] or
 /// the store gained more than [`ADDED_LIMIT`] since it.
@@ -172,7 +180,19 @@ pub fn trigger(store: &Path, wrapper: &Path) -> bool {
     let touched = fs::File::create(&stamp).and_then(|file| file.set_modified(SystemTime::now()));
     let mut command = Command::new(wrapper);
     command.arg("gc").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    touched.is_ok() && command.process_group(0).spawn().is_ok()
+    touched.is_ok() && detached(&mut command).spawn().is_ok()
+}
+
+#[cfg(unix)]
+fn detached(command: &mut Command) -> &mut Command {
+    command.process_group(0)
+}
+
+/// `command` in a process group of its own and without a console, so that Ctrl-C in the build does not reach it.
+#[cfg(windows)]
+fn detached(command: &mut Command) -> &mut Command {
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
 }
 
 /// Removes what `store` has not used since `cut`, then the least recently used while it is over `cap`.
@@ -272,7 +292,7 @@ pub fn collect(store: &Path, cut: u64, cap: u64, space: impl Fn() -> (u64, u64))
         let kept = String::from_iter(lines.map(|line| format!("{line}\n")));
         // A rewrite loses a line that a build appends meanwhile, so the log is rewritten only to drop old lines.
         if kept.len() < text.len() {
-            let _ = fs::write(&staging, kept).and_then(|()| fs::rename(&staging, &log));
+            let _ = fs::write(&staging, kept).and_then(|()| crate::store::rename(&staging, &log));
         }
     }
     entries.sort();
@@ -286,7 +306,7 @@ pub fn collect(store: &Path, cut: u64, cap: u64, space: impl Fn() -> (u64, u64))
             continue;
         }
         let doomed = path.with_extension(&pid);
-        if fs::rename(&path, &doomed).is_ok() {
+        if crate::store::rename(&path, &doomed).is_ok() {
             let (owned, unlinked) = size(&doomed, &mut HashSet::new());
             remove(&doomed);
             collected.entries += 1;
@@ -311,9 +331,13 @@ fn modified(path: &Path) -> Option<u64> {
 }
 
 /// The ctime of `path` itself in seconds since 1970, which a copy does not carry over from its source.
+#[cfg(unix)]
 fn changed(path: &Path) -> Option<u64> {
     fs::symlink_metadata(path).ok().and_then(|metadata| u64::try_from(metadata.ctime()).ok())
 }
+
+#[cfg(windows)]
+use crate::windows::change_time as changed;
 
 fn children(directory: &Path) -> Vec<PathBuf> {
     Vec::from_iter(
@@ -328,9 +352,17 @@ fn size(path: &Path, seen: &mut HashSet<(u64, u64)>) -> (u64, u64) {
             let size = size(child, seen);
             (sum.0 + size.0, sum.1 + size.1)
         }),
+        #[cfg(unix)]
         Ok(metadata) if seen.insert((metadata.dev(), metadata.ino())) => {
             (metadata.len(), if metadata.nlink() > 1 { 0 } else { metadata.len() })
         }
+        #[cfg(windows)]
+        Ok(_) => match crate::windows::information(path, false) {
+            Some((volume, index, links, length)) if seen.insert((u64::from(volume), index)) => {
+                (length, if links > 1 { 0 } else { length })
+            }
+            _ => (0, 0),
+        },
         _ => (0, 0),
     }
 }

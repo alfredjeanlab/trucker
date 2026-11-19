@@ -14,8 +14,11 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process::{Command, Output, Stdio, exit};
 use std::time::Instant;
 use std::{env, fs, io};
@@ -24,7 +27,12 @@ use crate::store::{self, Files};
 use crate::unit::{self, Roots, compiler, file_hash, hash_tree, remembered};
 
 /// The extension of the real script, which `Unit::outputs` matches so that the next compile of the script removes it.
+#[cfg(unix)]
 const REAL: &str = "real";
+
+/// The extension of the real script on Windows, which keeps `.exe` so that the script still looks like a program.
+#[cfg(windows)]
+const REAL: &str = "real.exe";
 
 /// Moves the build script at `script` aside and duplicates a copy of this wrapper into its place.
 ///
@@ -35,10 +43,10 @@ pub fn install(script: &Path, store: &Path, files: Files) -> io::Result<()> {
     let stand_in = wrapper_copy(store);
     let real = script.with_extension(REAL);
     let installed = stand_in.and_then(|stand_in| {
-        fs::rename(script, &real)?;
+        store::rename(script, &real)?;
         files.duplicate(&stand_in, script).or_else(|error| {
             let _ = fs::remove_file(script);
-            fs::rename(&real, script).and(Err(error))
+            store::rename(&real, script).and(Err(error))
         })
     });
     installed.inspect_err(|_| {
@@ -56,7 +64,7 @@ pub fn wrapper_copy(store: &Path) -> io::Result<PathBuf> {
     if !copy.exists() {
         let staging = copy.with_extension(std::process::id().to_string());
         fs::create_dir_all(store.join("stand-in"))?;
-        fs::copy(&wrapper, &staging).and_then(|_| fs::rename(&staging, &copy)).inspect_err(
+        fs::copy(&wrapper, &staging).and_then(|_| store::rename(&staging, &copy)).inspect_err(
             |_| {
                 let _ = fs::remove_file(&staging);
             },
@@ -76,6 +84,9 @@ pub fn dispatch() {
     let started = Instant::now();
     let environment = env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
+    // Windows reads a variable whatever the case of its name, so the key and the reads see each name in upper case.
+    #[cfg(windows)]
+    let environment = environment.map(|(name, value)| (name.to_ascii_uppercase(), value));
     let run = env::current_dir().map_err(|_| "no-working-directory").and_then(|directory| {
         Run::model(&real, directory, environment.collect(), unit::cargo_home())
     });
@@ -105,6 +116,7 @@ pub fn replay_or_run(real: &Path, run: Result<Run, &'static str>, store: &Path) 
 /// A test checks every other variable in the reference of cargo 1.100 against [`is_keyed`], and changes with the
 /// supported toolchain.
 #[cfg(test)]
+#[cfg(unix)]
 pub const UNKEYED_CARGO: &[(&str, &str)] = &[
     ("NUM_JOBS", "the parallelism of the build, which a script spends and does not write"),
     ("CARGO_MAKEFLAGS", "the descriptors of cargo's jobserver, which differ in every build"),
@@ -128,6 +140,12 @@ fn is_c_setting(name: &str) -> bool {
     let tools = "CC CXX AR RANLIB NVCC CFLAGS CXXFLAGS CPPFLAGS ARFLAGS RANLIBFLAGS CXXSTDLIB";
     let compiler = "CRATE_CC_NO_DEFAULTS CROSS_COMPILE DEVELOPER_DIR TOOLCHAINS CPATH C_INCLUDE_PATH \
                     CPLUS_INCLUDE_PATH COMPILER_PATH GCC_EXEC_PREFIX CCC_OVERRIDE_OPTIONS";
+    // The variables of a Visual Studio prompt, which choose the compiler, headers and libraries of MSVC.
+    #[cfg(windows)]
+    let compiler = format!(
+        "{compiler} INCLUDE LIB LIBPATH VCINSTALLDIR VCTOOLSINSTALLDIR VCTOOLSVERSION VSINSTALLDIR \
+         WINDOWSSDKDIR WINDOWSSDKVERSION VSCMD_ARG_TGT_ARCH PLATFORM"
+    );
     tools.split(' ').any(|tool| is_tool_setting(name, tool))
         || compiler.split_whitespace().any(|known| known == name)
         || name.ends_with("_DEPLOYMENT_TARGET")
@@ -161,14 +179,23 @@ impl Run {
         let out_dir = PathBuf::from(environment.get("OUT_DIR").ok_or("no-out-dir")?);
         let triple = environment.get("TARGET").map(String::as_str);
         let target = unit::target_directory(&out_dir, triple);
-        let target = format!("{}/", target.ok_or("no-target-dir")?.display());
+        let target = format!("{}{MAIN_SEPARATOR}", target.ok_or("no-target-dir")?.display());
         // The `cc` crate splits these variables at whitespace, so a target directory with a space is not mapped.
         let prefix_map = !target.contains(char::is_whitespace);
+        // MSVC ignores the prefix map with a warning, so it is not given there.
+        #[cfg(windows)]
+        let prefix_map = prefix_map && !triple.is_some_and(|triple| triple.contains("msvc"));
         for name in ["CFLAGS", "CXXFLAGS"].into_iter().filter(|_| prefix_map) {
             let flags = environment.entry(name.to_string()).or_default();
             *flags = format!("{flags} -ffile-prefix-map={target}=target/").trim_start().to_string();
         }
         let roots = Roots { target, cargo_home, worktree: None };
+        #[cfg(windows)]
+        let keyed = environment.iter().filter(|(name, _)| is_keyed(name));
+        #[cfg(windows)]
+        if !crate::windows::is_keyable(&roots, keyed.map(|(_, value)| value.as_str())) {
+            return Err("path-spelling");
+        }
         Ok(Run { real: real.to_path_buf(), directory, environment, out_dir, roots, prefix_map })
     }
 
@@ -301,6 +328,7 @@ impl Run {
     /// - It fails or changes a file that the key covers.
     /// - It writes anything into the slot outside its OUT_DIR.
     /// - It leaves the path of the target directory in a binary.
+    #[cfg(unix)]
     fn fixed(&self, store: &Path, key: &str, files: Files) -> Result<Output, &'static str> {
         let relative =
             self.out_dir.strip_prefix(&self.roots.target).map_err(|_| "no-target-dir")?;
@@ -372,9 +400,16 @@ impl Run {
         adopted
     }
 
+    /// Fails, because the run at a fixed OUT_DIR needs a symlink, which Windows allows only with Developer Mode.
+    #[cfg(windows)]
+    fn fixed(&self, _: &Path, _: &str, _: Files) -> Result<Output, &'static str> {
+        Err("windows-fixed")
+    }
+
     /// Replaces OUT_DIR with a copy of `from`, and writes a text file that contains one of `roots` through `local`.
     ///
     /// The copy is staged beside OUT_DIR and renamed into place, so a failure leaves OUT_DIR as it was.
+    #[cfg(unix)]
     fn adopt(
         &self,
         from: &Path,
@@ -437,6 +472,8 @@ impl Run {
             hasher.update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
         };
         field(file_hash(&self.real)?.as_bytes());
+        #[cfg(windows)]
+        field(crate::windows::toolchains().as_bytes());
         let rustc = self.environment.get("RUSTC").ok_or(io::ErrorKind::NotFound)?;
         field(&compiler(rustc, store)?);
         field(self.roots.normalized(&self.directory.to_string_lossy()).as_bytes());
@@ -444,7 +481,12 @@ impl Run {
             .environment
             .iter()
             .filter(|(name, _)| is_tool_setting(name, "CC") || is_tool_setting(name, "CXX"));
-        for setting in compilers.map(|(_, value)| value.as_str()).chain(["cc", "c++"]) {
+        #[cfg(unix)]
+        let defaults = ["cc", "c++"];
+        // The `cc` crate finds MSVC through Visual Studio rather than PATH, which `windows::toolchains` covers.
+        #[cfg(windows)]
+        let defaults = ["cc", "c++", "cl", "gcc", "clang"];
+        for setting in compilers.map(|(_, value)| value.as_str()).chain(defaults) {
             field(&self.c_compiler(setting, store));
         }
         for (name, value) in self.environment.iter().filter(|(name, _)| is_keyed(name)) {
@@ -471,10 +513,18 @@ impl Run {
         let path = self.environment.get("PATH");
         let mut found =
             env::split_paths(path.map_or("", String::as_str)).map(|path| path.join(program));
+        #[cfg(unix)]
         let found = if program.contains('/') {
             Some(self.directory.join(program))
         } else {
             found.find(|path| path.is_file())
+        };
+        #[cfg(windows)]
+        let found = if program.contains(['/', '\\']) {
+            Some(self.directory.join(program))
+        } else {
+            let executable = |path: PathBuf| [path.with_extension("exe"), path];
+            found.find_map(|path| executable(path).into_iter().find(|path| path.is_file()))
         };
         let Some(program) = found.and_then(|found| found.canonicalize().ok()) else {
             return b"none".to_vec();
@@ -490,7 +540,17 @@ impl Run {
             files.push(developer.join("Toolchains/XcodeDefault.xctoolchain/usr/bin").join(name));
         }
         let identity = String::from_iter(files.iter().map(|file| {
+            #[cfg(unix)]
             let metadata = fs::metadata(file).map(|file| (file.ino(), file.len(), file.mtime()));
+            #[cfg(windows)]
+            let metadata = fs::metadata(file).map(|metadata| {
+                (
+                    crate::windows::information(file, true)
+                        .map(|(volume, index, ..)| (volume, index)),
+                    metadata.len(),
+                    metadata.modified().ok(),
+                )
+            });
             format!("{} {metadata:?}\n", file.display())
         }));
         let version =
@@ -524,6 +584,8 @@ impl Run {
             else {
                 continue;
             };
+            #[cfg(windows)]
+            let value = &value.to_ascii_uppercase();
             if kind == "rerun-if-env-changed" && !is_keyed(value) {
                 reads.push(format!("env {value}"));
             } else if kind == "rerun-if-changed" {
@@ -550,6 +612,14 @@ impl Run {
         let reads = self.reads(stdout)?;
         let staging = scripts.join(format!("{key}.{}", std::process::id()));
         let write = |name, text: &str| fs::write(staging.join(name), self.roots.normalized(text));
+        // A path in another spelling than that of the target directory is not replaced, and would name it in another
+        // worktree, as a link search path that names its OUT_DIR would.
+        #[cfg(windows)]
+        for text in [stdout, &String::from_utf8_lossy(&output.stderr)] {
+            if crate::windows::contains(&self.roots.normalized(text), &[&self.roots.target]) {
+                return Err("unnormalized-path");
+            }
+        }
         let stored =
             self.stage(files, &staging.join("out"), &staging.join("text")).and_then(|links| {
                 if !links.is_empty() {
@@ -590,7 +660,12 @@ impl Run {
                     .map_err(failed)?;
             } else if store::any_contains(&[&path], &[&self.roots.target]) {
                 let text = fs::read_to_string(&path).map_err(|_| "binary-target-path")?;
-                fs::write(rewritten.join(&name), self.roots.normalized(&text)).map_err(failed)?;
+                let text = self.roots.normalized(&text);
+                #[cfg(windows)]
+                if crate::windows::contains(&text, &[&self.roots.target]) {
+                    return Err("unnormalized-path");
+                }
+                fs::write(rewritten.join(&name), text).map_err(failed)?;
             } else {
                 files.duplicate(&path, &cloned.join(&name)).map_err(|_| "clone-failed")?;
             }
@@ -604,6 +679,7 @@ impl Run {
     /// other target is kept as the absolute path that it names, as `absolute` or `relative`, where both of these hold.
     /// - The path lies in `out_dir`, or in a source of the registry or of a git checkout, which never changes.
     /// - The path resolves where it reads, so no `..` follows a symlink.
+    #[cfg(unix)]
     fn link(&self, out_dir: &Path, name: &Path) -> Result<(&'static str, String), &'static str> {
         let link = out_dir.join(name);
         let target = fs::read_link(&link).map_err(|_| "symlink")?;
@@ -623,10 +699,17 @@ impl Run {
         Ok((kind, path.to_str().ok_or("symlink")?.to_string()))
     }
 
+    /// Fails, because a symlink needs Developer Mode on Windows.
+    #[cfg(windows)]
+    fn link(&self, _: &Path, _: &Path) -> Result<(&'static str, String), &'static str> {
+        Err("symlink")
+    }
+
     /// Writes the symlinks that the lines of `links` describe into `at`, and returns those that name an absolute path.
     ///
     /// A target is written as it reads from the place of its link in OUT_DIR, into which `at` may yet be renamed. A
     /// `relative` link gets the path that [`relative`] finds, or the absolute path where it finds none.
+    #[cfg(unix)]
     fn make_links(
         &self,
         links: &str,
@@ -656,6 +739,17 @@ impl Run {
             std::os::unix::fs::symlink(target, link)?;
         }
         Ok(rooted)
+    }
+
+    /// Fails where `links` describes a symlink, which an entry on Windows never holds.
+    #[cfg(windows)]
+    fn make_links(
+        &self,
+        links: &str,
+        _: &Path,
+        _: &dyn Fn(&str) -> String,
+    ) -> io::Result<Vec<PathBuf>> {
+        if links.is_empty() { Ok(Vec::new()) } else { Err(io::ErrorKind::Unsupported.into()) }
     }
 
     /// Empties OUT_DIR, restores the stored tree of `entry` into it, then replays the script's output for cargo.
@@ -696,6 +790,7 @@ fn line(
 ///
 /// The directories under `out_dir` are real, so only those between that ancestor and `out_dir` can be symlinks. It is
 /// `None` where one is, as `cxx-build` then writes an absolute link too.
+#[cfg(unix)]
 fn relative(from: &Path, to: &Path, out_dir: &Path) -> Option<PathBuf> {
     let common = from.ancestors().find(|ancestor| to.starts_with(ancestor))?;
     if let Ok(down) = out_dir.strip_prefix(common) {
