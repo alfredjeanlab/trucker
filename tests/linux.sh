@@ -2,8 +2,9 @@
 # The Linux path, run inside a local VM whose root is ext4: `limactl shell <vm> bash tests/linux.sh`.
 #
 # Worktrees and the store live on /work, an XFS filesystem in a file on the root disk, where files clone. The unit
-# tests run there, then two copies of one workspace, each its own git worktree, are built with a shared store, and at
-# the end the store is put where it cannot clone, which must leave the build working and say so once.
+# tests run there, then two copies of one workspace, each its own git worktree, are built with a shared store. At the
+# end the store is put on another filesystem, which must say so once, then on ext4 with two workspaces, which cannot
+# clone and so must store by hard link, restore by copy and carry a session by hard link.
 set -euo pipefail
 source "$HOME/.cargo/env"
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -15,7 +16,7 @@ if ! findmnt -n -t xfs /work > /dev/null; then
     sudo mount -o loop /var/lib/work.img /work
     sudo chown "$(id -u):$(id -g)" /work
 fi
-rm -rf /work/tmp /work/e2e /work/cache /work/concurrent "$HOME/e2e-ext4" "$HOME/cache-ext4"
+rm -rf /work/tmp /work/e2e /work/cache /work/concurrent "$HOME"/e2e-ext4* "$HOME/cache-ext4"
 mkdir -p /work/tmp /work/e2e
 
 export CARGO_TARGET_DIR=/work/trucker-target
@@ -54,7 +55,7 @@ expect "misses after the second build" "$(outcomes /work/cache miss)" "$misses"
 expect "hits in the second build" "$(outcomes /work/cache hit)" "$misses"
 expect "build-script runs replayed in the second build" "$(scripts /work/cache hit)" "$runs"
 expect "build-script runs uncached" "$(scripts /work/cache passthrough)" 0
-[ "$(grep -c ' e2e [0-9]* hit$' /work/cache/trucker/log)" -gt 0 ] || { echo "FAILED: the own crate missed"; exit 1; }
+[ "$(grep -cE ' e2e [0-9]* hit( promoted)?$' /work/cache/trucker/log)" -gt 0 ] || { echo "FAILED: the own crate missed"; exit 1; }
 expect "crates compiled by a repeated build" "$(build /work/e2e/second /work/cache | grep -c Compiling || true)" 0
 /work/e2e/second/target/debug/e2e
 inode() { stat -c %i "$(ls "$1"/target/debug/build/libc/*/out/liblibc-*.rlib)"; }
@@ -86,15 +87,42 @@ build /work/e2e/sixth /work/cache > /dev/null
 expect "misses after gc" "$(outcomes /work/cache miss)" "$((2 * misses))"
 /work/e2e/sixth/target/debug/e2e
 
+# The first edit to the own crate in a fresh workspace starts from the session that another workspace left in a slot.
+reused() { grep -c ' e2e [0-9]* miss session$' /work/cache/trucker/log || true; }
+workspace /work/e2e/seventh
+cp /work/e2e/first/Cargo.lock /work/e2e/seventh/
+build /work/e2e/seventh /work/cache > /dev/null
+before=$(reused)
+echo 'pub fn edited() {}' >> /work/e2e/seventh/src/lib.rs
+# A compile that starts within a second of an edit is logged as `passthrough changed-source` in place of its outcome.
+sleep 1.1
+build /work/e2e/seventh /work/cache > /dev/null
+[ "$(reused)" -gt "$before" ] || { echo "FAILED: the edit did not start from a stored session"; exit 1; }
+/work/e2e/seventh/target/debug/e2e
+
 # The store on ext4 while the target is on XFS, then both on ext4, which cannot clone.
 workspace /work/e2e/third
 cp /work/e2e/first/Cargo.lock /work/e2e/third/
 said=$(build /work/e2e/third "$HOME/cache-ext4" | grep -c "different filesystems" || true)
 expect "notices of the other filesystem" "$said" 1
 expect "misses with the store on another filesystem" "$(outcomes "$HOME/cache-ext4" miss)" 0
-workspace "$HOME/e2e-ext4"
-cp /work/e2e/first/Cargo.lock "$HOME/e2e-ext4/"
-said=$(build "$HOME/e2e-ext4" "$HOME/cache-ext4" | grep -c "cannot clone" || true)
-expect "notices of a filesystem that cannot clone" "$said" 1
-"$HOME/e2e-ext4/target/debug/e2e"
+rm -rf "$HOME/cache-ext4"
+for name in e2e-ext4 e2e-ext4-second; do
+    workspace "$HOME/$name"
+    cp /work/e2e/first/Cargo.lock "$HOME/$name/"
+    expect "notices on ext4" "$(build "$HOME/$name" "$HOME/cache-ext4" | grep -c trucker || true)" 0
+    "$HOME/$name/target/debug/e2e"
+done
+expect "misses on ext4" "$(outcomes "$HOME/cache-ext4" miss)" "$misses"
+expect "hits on ext4" "$(outcomes "$HOME/cache-ext4" hit)" "$misses"
+echo 'pub fn edited() {}' >> "$HOME/e2e-ext4-second/src/lib.rs" && sleep 1.1
+build "$HOME/e2e-ext4-second" "$HOME/cache-ext4" > /dev/null
+[ "$(grep -c ' e2e [0-9]* miss session$' "$HOME/cache-ext4/trucker/log")" -gt 0 ] || { echo "FAILED: no session on ext4"; exit 1; }
+"$HOME/e2e-ext4-second/target/debug/e2e"
+expect "crates compiled by a repeated build on ext4" "$(build "$HOME/e2e-ext4" "$HOME/cache-ext4" | grep -c Compiling || true)" 0
+# strip rewrites a binary with several links in place, and so the stored one, which the next restore must refuse.
+strip "$HOME/e2e-ext4/target/debug/e2e"
+workspace "$HOME/e2e-ext4-third" && cp /work/e2e/first/Cargo.lock "$HOME/e2e-ext4-third/" && sleep 1.1
+build "$HOME/e2e-ext4-third" "$HOME/cache-ext4" > /dev/null
+file "$HOME/e2e-ext4-third/target/debug/e2e" | grep -q 'not stripped' || { echo "FAILED: a stripped binary was restored"; exit 1; }
 echo "linux: passed, with $misses entries stored and restored, $runs of them build-script runs"

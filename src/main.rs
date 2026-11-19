@@ -2,21 +2,24 @@
 //!
 //! A crate of the registry, of a git dependency or of a git worktree is compiled once per key and cloned into each
 //! later build. A key is as sound as cargo's own rebuild checks, which miss a file or variable that a proc macro or
-//! build script reads without declaring it. An invocation whose outputs cannot be predicted from a key runs rustc
-//! uncached, and one by a rustc older than 1.100 runs it untouched. The wrapper also stands in for each third-party
-//! build script that it compiles, to replay the script's runs.
+//! build script reads without declaring it, and also covers the files of the package of an own crate. An invocation
+//! whose outputs cannot be predicted from a key runs rustc uncached, and one by a rustc older than 1.100 runs it
+//! untouched. The wrapper also stands in for each third-party build script that it compiles, and replays the runs of
+//! the script.
 
 mod duplicates;
 mod gc;
+mod lazy;
 mod script;
+mod session;
 mod store;
 #[cfg(test)]
 mod tests;
 mod unit;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{BufRead, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
@@ -27,6 +30,7 @@ use unit::Unit;
 
 fn main() {
     script::dispatch();
+    session::link();
     let args = Vec::from_iter(env::args_os().skip(1));
     let Some((rustc, rest)) = args.split_first() else { usage() };
     let text = rest.iter().map(|arg| arg.to_str().map(str::to_string)).collect::<Option<Vec<_>>>();
@@ -67,8 +71,8 @@ fn now() -> u64 {
 
 /// Runs rustc for one invocation, through `store` where its crate is third-party or own, and returns its exit code.
 ///
-/// Every invocation that [`Unit::model`] reads is compiled with [`Unit::remap`], cached or not, so that the inputs of
-/// its dependents agree between worktrees.
+/// Every invocation that [`Unit::model`] reads is compiled with [`Unit::remap`] whether or not it is cached, so the
+/// inputs of its dependents agree between worktrees.
 fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
     let started = Instant::now();
     let _ = fs::create_dir_all(store.join("entries"));
@@ -80,6 +84,14 @@ fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
         notice(store, "version", "runs rustc untouched, because it needs Rust 1.100 or later");
         return untouched();
     }
+    if gc::setting().is_some_and(|setting| gc::bytes(&setting).is_none()) {
+        let variable = gc::SIZE_VARIABLE;
+        notice(
+            store,
+            "size",
+            &format!("ignores {variable}, which is not a size such as 200G or 1.5T"),
+        );
+    }
     let input = args.iter().find(|arg| arg.ends_with(".rs") && !arg.starts_with('-'));
     let input = input.and_then(|input| Some(unit::lexical(&env::current_dir().ok()?.join(input))));
     let local = input.filter(|input| !unit::is_third_party(input, &cargo_home));
@@ -88,7 +100,7 @@ fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
     let remap = unit.as_ref().map_or_else(|_| Vec::new(), Unit::remap);
     let outcome = match unit {
         _ if local.is_some() && worktree.is_none() => Err("no-repository"),
-        Ok(unit) => cached(rustc, args, store, &unit),
+        Ok(unit) => cached(rustc, args, store, &unit, &mut io::stderr()),
         Err(reason) => Err(reason),
     };
     let (outcome, code) = outcome.unwrap_or_else(|reason| {
@@ -100,7 +112,7 @@ fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
         (format!("passthrough {reason}"), code)
     });
     log(store, crate_name(args), started, &outcome);
-    if outcome == "miss" {
+    if outcome.starts_with("miss") {
         let _ = env::current_exe().map(|wrapper| gc::trigger(store, &wrapper));
     }
     code
@@ -120,83 +132,265 @@ fn log(store: &Path, name: &str, started: Instant, outcome: &str) {
 
 /// Restores the outputs of one invocation from `store`, or runs rustc and stores them, and returns the outcome.
 ///
-/// Fails with the reason, before rustc has run, where the invocation cannot be cached.
+/// `cargo` receives the stderr of rustc with no line twice, because cargo marks the metadata of a unit ready at each
+/// artifact notification and panics at a second one. Fails with the reason, before rustc has run, where the
+/// invocation cannot be cached.
 fn cached(
     rustc: &str,
     args: &[String],
     store: &Path,
     unit: &Unit,
+    cargo: &mut dyn Write,
 ) -> Result<(String, i32), &'static str> {
     if !store::same_filesystem(store, &unit.out_dir) {
         let reason = "its store and the target directory are on different filesystems";
         notice(store, "notice", &format!("compiles every crate uncached, because {reason}"));
         return Err("other-filesystem");
     }
-    let entries = store.join("entries");
-    let key = unit.key(rustc, args, store).map_err(|_| "unreadable-input")?;
+    if unit.reads_undeclared() {
+        return Err("undeclared-input");
+    }
+    let (entries, files) = (store.join("entries"), store::Files::probe(store));
+    let key = unit.key(rustc, args, store, env::vars_os()).map_err(|_| "unreadable-input")?;
     let current_entry = || {
         let reads = fs::read_to_string(store::reads_of(&entries, &key)).unwrap_or_default();
-        entries.join(unit.variant(&key, &reads))
+        unit.variant(&key, &reads, None).ok().map(|name| entries.join(name))
     };
     let mut entry = current_entry();
     // A process that finds no entry compiles under the key's lock, so that every worktree stores the same bytes.
-    let waited = !entry.is_dir();
-    let _lock = waited.then(|| store::lock(store, &key, crate_name(args))).flatten();
+    let waited = !entry.as_ref().is_some_and(|entry| entry.is_dir());
+    let lock = waited.then(|| store::lock(store, &key, crate_name(args))).flatten();
+    // An own crate is stored as a candidate, which a miss under the key's lock promotes into the entry.
+    let lazy = unit.roots.worktree.is_some() && !crate_name(args).starts_with("build_script_");
+    let mut promoted = false;
     if waited {
         entry = current_entry();
+        if let Some(entry) =
+            entry.as_ref().filter(|entry| lazy && lock.is_some() && !entry.is_dir())
+        {
+            promoted = lazy::promote(&entries, &key, entry, files);
+        }
     }
-    // An `.rmeta` stays for rustc and restore, which keep an unchanged one, so that cargo does not rebuild dependents.
+    // An `.rmeta` stays, because rustc and restore keep an unchanged one so that cargo does not rebuild dependents.
     let metadata = |output: &&PathBuf| output.extension().is_some_and(|kind| kind == "rmeta");
+    // An own crate is stored at once where this is its first compile in the target directory, and lazily in a rebuild,
+    // whose outputs after an edit no other worktree is likely to want. The kept `.rmeta` does not count as an output.
+    let rebuild =
+        unit.outputs().is_ok_and(|outputs| outputs.iter().any(|output| !metadata(&output)));
+    let lazy = lazy && rebuild;
     let clear = || {
         let outputs = unit.outputs()?;
         outputs.iter().filter(|output| !metadata(output)).try_for_each(fs::remove_file)
     };
     clear().map_err(|_| "unremovable-output")?;
     // A build script is published before its stand-in is installed, so that an entry never contains the stand-in.
-    let install = || unit.script().map(|script| script::install(&script, store));
-    if entry.is_dir() && store::restore(unit, &entry).is_ok() {
-        store::touch(&entries, &key, &entry);
+    let install = || unit.script().map(|script| script::install(&script, store, files));
+    let restored = entry.as_ref().filter(|entry| entry.is_dir()).map(|entry| {
+        let restored = store::restore(unit, entry, files, cargo);
+        restored.inspect(|()| store::touch(&entries, &key, entry))
+    });
+    if restored == Some(Ok(())) {
         install();
-        return Ok((if waited { "hit waited" } else { "hit" }.to_string(), 0));
+        let hit = if promoted {
+            "hit promoted"
+        } else if waited {
+            "hit waited"
+        } else {
+            "hit"
+        };
+        return Ok((hit.to_string(), 0));
     }
     clear().map_err(|_| "unremovable-output")?;
-    let compiling = Instant::now();
-    let mut child = Command::new(rustc)
-        .args(args)
-        .args(unit.remap())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| "rustc-not-started")?;
-    let (mut stderr, mut chunk) = (Vec::new(), [0; 8192]);
-    // Each chunk is passed on as it arrives, so that cargo starts the dependents once the metadata is written.
-    while let Some(read) =
-        child.stderr.as_mut().and_then(|pipe| pipe.read(&mut chunk).ok()).filter(|read| *read > 0)
+    let (compiling, started) = (Instant::now(), SystemTime::now());
+    let mut slot = session::Slot::take(unit, args, store, files);
+    let mut forwarded = HashSet::new();
+    let mut compiled = compile(rustc, args, unit, slot.as_ref(), cargo, &mut forwarded)?;
+    // A session that crashes rustc is deleted, and the crate is compiled once more without it. Where the session cannot
+    // be deleted, that compile runs in the worktree.
+    if slot
+        .as_ref()
+        .is_some_and(|slot| slot.restored && compiled.code.is_none_or(|code| code == 101))
     {
-        let _ = io::stderr().write_all(&chunk[..read]);
-        stderr.extend_from_slice(&chunk[..read]);
+        if slot.as_mut().is_some_and(|slot| slot.discard().is_err()) {
+            slot = None;
+        }
+        compiled = compile(rustc, args, unit, slot.as_ref(), cargo, &mut forwarded)?;
     }
-    let code = child.wait().ok().and_then(|status| status.code()).unwrap_or(1);
+    let Compiled { code, stderr, held } = compiled;
+    let outputs = unit.outputs();
+    let (dep_info, scanned): (Vec<_>, Vec<_>) = outputs
+        .iter()
+        .flatten()
+        .cloned()
+        .partition(|output| output.extension().is_some_and(|kind| kind == "d"));
+    // Each output is read once, for the hash that a candidate records and for the scan for the slot.
+    let digests = (code == Some(0) && (lazy || slot.is_some()))
+        .then(|| lazy::digests(&scanned, slot.as_ref().map(|slot| slot.path.as_str()).as_slice()));
+    // An output that names the slot, or cannot be read, is compiled again in the worktree, because the slot later
+    // mirrors another one.
+    let baked =
+        digests.as_ref().is_some_and(|digests| digests.as_ref().is_none_or(|(_, found)| *found));
+    if let Some(slot) = slot.as_mut().filter(|_| baked) {
+        slot.bake();
+        if forwarded.iter().any(|line| is_notification(line, "metadata")) {
+            return Ok(late_bake(unit, crate_name(args), cargo));
+        }
+        let code = compile(rustc, args, unit, None, cargo, &mut forwarded)?.code.unwrap_or(1);
+        return Ok(("passthrough baked-slot".to_string(), code));
+    }
+    let earlier = std::mem::take(&mut forwarded);
+    for line in held.into_iter().flatten() {
+        forward(cargo, &earlier, &mut forwarded, line);
+    }
+    let code = code.unwrap_or(1);
+    if let Some(slot) = &slot {
+        localize_dep_info(&dep_info, slot);
+        if code == 0 {
+            let _ = slot.keep();
+        }
+    }
     let stored = if code == 0 {
         let record = duplicates::record(unit, args, compiling.elapsed().as_millis());
-        store::publish(unit, &entries, &key, &stderr, &record)
+        let slot = slot.as_ref().map(|slot| slot.path.as_str());
+        // Outputs that cannot be listed leave no hashes, so that `publish` lists them again and fails.
+        let hashes = digests.flatten().filter(|_| outputs.is_ok()).map(|(hashes, _)| hashes);
+        let outputs = (&dep_info[..], &scanned[..], hashes);
+        match lazy
+            .then(|| lazy::record(unit, &entries, &key, (&stderr, &record), outputs, started, slot))
+        {
+            None | Some(Err("eager")) => {
+                store::publish(unit, &entries, &key, &stderr, &record, started, files)
+            }
+            Some(recorded) => recorded,
+        }
     } else {
         Err("rustc-failed")
     };
     if stored.is_ok() {
         install();
     } else if stored == Err("clone-failed") {
-        let reason = "the filesystem of its store cannot clone files";
-        notice(store, "notice", &format!("compiles every crate uncached, because {reason}"));
+        notice(store, "notice", "compiles a crate uncached, because its store refused a clone");
     }
-    Ok((
-        stored.map_or_else(|reason| format!("passthrough {reason}"), |()| "miss".to_string()),
-        code,
-    ))
+    let miss = match restored {
+        Some(Err("evicted")) => "miss evicted",
+        _ if slot.is_some_and(|slot| slot.restored) => "miss session",
+        _ => "miss",
+    };
+    Ok((stored.map_or_else(|reason| format!("passthrough {reason}"), |()| miss.to_string()), code))
+}
+
+/// The exit code and stderr of one run of rustc, and the lines of stderr that it held back from cargo.
+struct Compiled {
+    code: Option<i32>,
+    stderr: Vec<u8>,
+    /// The lines after the dep-info notification of a compile in a slot whose dep-info reads a variable that names the
+    /// slot.
+    ///
+    /// Such a crate is likely to be compiled again. cargo must not start a dependent from the metadata of the slot,
+    /// because its hash differs from that of the compile that stands. It is `None` where nothing was held back.
+    held: Option<Vec<Vec<u8>>>,
+}
+
+/// Runs rustc for `unit`, in `slot` where there is one, and returns its exit code and stderr.
+///
+/// Each line of stderr goes to `cargo` through [`forward`] as it arrives, so cargo starts the dependents once the
+/// metadata is written. A line is skipped where `forwarded` records that an earlier run of the same invocation passed
+/// it on, or held back into [`Compiled::held`].
+fn compile(
+    rustc: &str,
+    args: &[String],
+    unit: &Unit,
+    slot: Option<&session::Slot>,
+    cargo: &mut dyn Write,
+    forwarded: &mut HashSet<Vec<u8>>,
+) -> Result<Compiled, &'static str> {
+    let mut command = Command::new(rustc);
+    let args = [args, &unit.remap()].concat();
+    match slot {
+        Some(slot) => command
+            .args(slot.args(&args))
+            .envs(slot.environment(&args))
+            .current_dir(&slot.directory),
+        None => command.args(args).current_dir(&unit.directory),
+    };
+    let mut child = command.stderr(Stdio::piped()).spawn().map_err(|_| "rustc-not-started")?;
+    let (mut stderr, mut line, mut held) = (Vec::new(), Vec::new(), None::<Vec<Vec<u8>>>);
+    let earlier = std::mem::take(forwarded);
+    let mut pipe = child.stderr.take().map(io::BufReader::new);
+    while pipe
+        .as_mut()
+        .and_then(|pipe| pipe.read_until(b'\n', &mut line).ok())
+        .is_some_and(|read| read > 0)
+    {
+        if let Some(slot) = slot {
+            line = slot.localized(&String::from_utf8_lossy(&line)).into_bytes();
+        }
+        stderr.extend_from_slice(&line);
+        let dep_info = is_notification(&line, "dep-info");
+        match &mut held {
+            Some(held) => held.push(std::mem::take(&mut line)),
+            None => forward(cargo, &earlier, forwarded, std::mem::take(&mut line)),
+        }
+        if dep_info && slot.is_some_and(|slot| slot.reads_itself(unit)) {
+            held.get_or_insert_default();
+        }
+    }
+    forwarded.extend(earlier);
+    Ok(Compiled { code: child.wait().ok().and_then(|status| status.code()), stderr, held })
+}
+
+/// Passes `line` on to `cargo` unless `earlier` shows that an earlier run passed it on, and records it in `forwarded`.
+fn forward(
+    cargo: &mut dyn Write,
+    earlier: &HashSet<Vec<u8>>,
+    forwarded: &mut HashSet<Vec<u8>>,
+    line: Vec<u8>,
+) {
+    if !earlier.contains(&line) {
+        let _ = cargo.write_all(&line);
+        forwarded.insert(line);
+    }
+}
+
+/// Whether `line` is rustc's notification that the output of the kind `emit` is written.
+///
+/// rustc writes the dep-info before the metadata, and cargo starts the dependents of a library at the notification of
+/// its metadata.
+fn is_notification(line: &[u8], emit: &str) -> bool {
+    let line = String::from_utf8_lossy(line);
+    line.starts_with('{')
+        && line.contains("\"artifact\":")
+        && line.contains(&format!("\"emit\":\"{emit}\""))
+}
+
+/// Fails the compile of `unit` in a slot whose output names the slot, after cargo was told that its metadata was
+/// written, and returns the outcome.
+///
+/// A dependent may already have started from that metadata, and a compile in the worktree would give its library
+/// another hash. So the outputs are removed instead, and cargo compiles the crate and then its dependents in the next
+/// build. The crate is never carried again.
+fn late_bake(unit: &Unit, name: &str, cargo: &mut dyn Write) -> (String, i32) {
+    for output in unit.outputs().unwrap_or_default() {
+        let _ = fs::remove_file(output);
+    }
+    let message = format!(
+        "trucker failed {name}, whose output names the directory that it was compiled in, after its dependents could \
+         start, so the next build compiles it again in the worktree\n"
+    );
+    let _ = cargo.write_all(message.as_bytes());
+    ("passthrough baked-slot-late".to_string(), 1)
+}
+
+/// Rewrites the `dep_info` that rustc wrote in `slot` to name the paths of the worktree.
+fn localize_dep_info(dep_info: &[PathBuf], slot: &session::Slot) {
+    for path in dep_info {
+        let _ = fs::read_to_string(path).and_then(|text| fs::write(path, slot.localized(&text)));
+    }
 }
 
 /// Says `message` on stderr once per build and `kind` of notice.
 ///
-/// A file in `store` named after `kind` and cargo's process marks the build that was told, until gc removes it.
+/// A file in `store` named after `kind` and the process of cargo marks the build that was told, until gc removes it.
 fn notice(store: &Path, kind: &str, message: &str) {
     let marker =
         store.join("notices").join(format!("{kind}-{}", std::os::unix::process::parent_id()));
@@ -215,7 +409,8 @@ fn since(time: &str) -> Option<u64> {
     time.parse().ok().or_else(|| ages.iter().find_map(|(unit, seconds)| ago(*unit, *seconds)))
 }
 
-/// The count and the total time of each outcome in the log of `store`, then the share of cached invocations that hit.
+/// The count and the total time of each outcome in the log of `store`, then the share of cached invocations that hit
+/// and the cap of the store.
 ///
 /// With `--duplicates` it is the report of [`duplicates::report`] instead. It is `None` where `args` are not valid.
 fn stats(args: &[String], store: &Path) -> Option<String> {
@@ -243,10 +438,18 @@ fn stats(args: &[String], store: &Path) -> Option<String> {
         let _ = writeln!(text, "{count:>7} {:>9.1} s  {outcome}", *milliseconds as f64 / 1000.0);
     }
     let count = |outcome: &str| totals.get(outcome).map_or(0, |total| total.0);
-    let hits = count("hit") + count("hit waited");
-    if hits + count("miss") > 0 {
-        let share = 100.0 * hits as f64 / (hits + count("miss")) as f64;
+    let misses = count("miss") + count("miss session") + count("miss evicted");
+    let hits = count("hit") + count("hit waited") + count("hit promoted");
+    if hits + misses > 0 {
+        let share = 100.0 * hits as f64 / (hits + misses) as f64;
         let _ = writeln!(text, "{share:.1}% of the cached invocations hit");
     }
+    let (cap, set) = gc::store_cap(store);
+    let source = if set {
+        format!("as {} sets", gc::SIZE_VARIABLE)
+    } else {
+        "computed from its filesystem".to_string()
+    };
+    let _ = writeln!(text, "the store may take {:.1} GB, {source}", cap as f64 / 1e9);
     Some(text)
 }

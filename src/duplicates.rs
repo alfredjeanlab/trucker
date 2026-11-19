@@ -1,9 +1,10 @@
 //! The report of the crates that workspaces sharing the store compile again for other features or versions.
 //!
-//! Each rustc entry carries a record of the package, version, workspace, compile time and arguments of its compile.
-//! Two compiles are compared without the arguments that differ in every compile: `-C metadata`, `-C extra-filename`,
-//! `--extern`, `-L` and `--check-cfg`. A difference is reported only where it is between workspaces, because a
-//! single workspace resolves other features for `cargo test -p` of one package.
+//! Each rustc entry records the package, version, workspace, compile time and arguments of its compile. A comparison
+//! of two compiles leaves out `-C metadata`, `-C extra-filename`, `--extern`, `-L` and `--check-cfg`, because they
+//! differ in every compile. A difference is reported only between workspaces, because one workspace resolves other
+//! features for `cargo test -p` of one package. The report also names the own crates that rustc compiles slowly with
+//! ThinLTO between their codegen units.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -11,13 +12,17 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 use std::{env, fs};
 
+use crate::session;
 use crate::store::RECORD;
 use crate::unit::{self, Unit};
 
-/// The record of a compile of `unit` with `args` that took `milliseconds`, one field per line.
+/// The least time in milliseconds of the slowest compile of an own crate for its ThinLTO to be reported.
+const THIN_LTO_REPORTED: u64 = 10_000;
+
+/// The lines of the record of a compile of `unit` with `args` that took `milliseconds`.
 ///
 /// The workspace is the target directory relative to the nearest ancestor with a `.git`, so worktrees of one
-/// repository share it.
+/// repository share it. An incremental compile is recorded with `-C incremental` and without its directory.
 pub fn record(unit: &Unit, args: &[String], milliseconds: u128) -> String {
     let target = Path::new(unit.roots.target.trim_end_matches('/'));
     let repository = target.parent().and_then(unit::repository);
@@ -26,10 +31,15 @@ pub fn record(unit: &Unit, args: &[String], milliseconds: u128) -> String {
     let fields = [package("CARGO_PKG_NAME"), package("CARGO_PKG_VERSION")];
     let fields =
         fields.into_iter().chain([workspace.display().to_string(), milliseconds.to_string()]);
-    Vec::from_iter(fields.chain(unit.normalized_args(args))).join("\n")
+    let incremental = args.iter().any(|arg| arg.starts_with("incremental="));
+    let incremental = incremental.then(|| ["-C".to_string(), "incremental".to_string()]);
+    Vec::from_iter(
+        fields.chain(unit.normalized_args(args)).chain(incremental.into_iter().flatten()),
+    )
+    .join("\n")
 }
 
-/// One recorded compile, with its arguments split into its features and the rest.
+/// A recorded compile whose arguments are split into its features and the rest.
 struct Compile {
     /// The package, followed by the crate where it is not the library, such as a build script.
     package: String,
@@ -38,12 +48,14 @@ struct Compile {
     milliseconds: u64,
     rest: Vec<String>,
     features: BTreeSet<String>,
+    args: Vec<String>,
 }
 
 fn compile(record: &str) -> Option<Compile> {
     let mut lines = record.lines().peekable();
     let (package, version, workspace) = (lines.next()?, lines.next()?, lines.next()?);
     let milliseconds = lines.next()?.parse().ok()?;
+    let args = Vec::from_iter(lines.clone().map(str::to_string));
     let (mut rest, mut features, mut name) = (Vec::new(), BTreeSet::new(), "");
     while let Some(flag) = lines.next() {
         let paired = flag.starts_with('-') && !flag.contains('=');
@@ -53,7 +65,9 @@ fn compile(record: &str) -> Option<Compile> {
             features.insert(feature.trim_matches('"').to_string());
         } else if !(["-L", "--extern", "--check-cfg"].contains(&flag)
             || flag == "-C"
-                && (value.starts_with("metadata=") || value.starts_with("extra-filename=")))
+                && (value.starts_with("metadata=")
+                    || value.starts_with("extra-filename=")
+                    || value == "incremental"))
         {
             name = if flag == "--crate-name" { value } else { name };
             rest.push(format!("{flag} {value}"));
@@ -67,7 +81,19 @@ fn compile(record: &str) -> Option<Compile> {
         milliseconds,
         rest,
         features,
+        args,
     })
+}
+
+/// Whether `compile` is an incremental one of an own crate that links and runs ThinLTO between its codegen units.
+fn thin_lto(compile: &Compile) -> bool {
+    let args = &compile.args;
+    let input = args.iter().find(|arg| arg.ends_with(".rs") && !arg.starts_with('-'));
+    let own = input.is_some_and(|input| !input.starts_with(unit::CARGO_HOME));
+    let emit = args.iter().filter_map(|arg| arg.strip_prefix("--emit="));
+    let linked = emit.flat_map(|kinds| kinds.split(',')).any(|kind| kind == "link");
+    let incremental = args.windows(2).any(|pair| pair == ["-C", "incremental"]);
+    own && linked && incremental && session::local_thin_lto(args)
 }
 
 /// The version that a semver-compatible version starts with, such as `1` for 1.4.2 and `0.3` for 0.3.7.
@@ -82,6 +108,10 @@ fn compatible(version: &str) -> String {
 /// or at semver-compatible versions with equal arguments other than its features and sources. Its extra time is that
 /// of every variant except the costliest. Two variants come from different workspaces where neither one's workspaces
 /// include all of the other's.
+///
+/// A second section names each own crate whose slowest stored compile took [`THIN_LTO_REPORTED`] or more under
+/// [`thin_lto`]. Its profile avoids that with `lto = "off"`. Only an incremental compile counts, because a release
+/// build is not incremental.
 pub fn report(entries: &Path, start: u64) -> String {
     let stored =
         |path: &Path| fs::metadata(path).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok();
@@ -133,6 +163,23 @@ pub fn report(entries: &Path, start: u64) -> String {
         format!("{total:.1} s compiled, of which {extra:.1} s for other features or versions\n");
     for (extra, row) in rows {
         let _ = writeln!(text, "{:>8.1} s  {row}", seconds(extra));
+    }
+    let mut slowest = BTreeMap::<_, u64>::new();
+    for compile in compiles.iter().filter(|compile| thin_lto(compile)) {
+        let time = slowest.entry((&compile.package, &compile.workspace)).or_default();
+        *time = compile.milliseconds.max(*time);
+    }
+    let mut slow =
+        Vec::from_iter(slowest.into_iter().filter(|(_, time)| *time >= THIN_LTO_REPORTED));
+    slow.sort_by_key(|(_, time)| std::cmp::Reverse(*time));
+    if !slow.is_empty() {
+        text.push_str(
+            "\nOwn crates that run ThinLTO between their codegen units, which slows every build and incremental edit \
+             of them, unless their profile sets lto = \"off\":\n",
+        );
+    }
+    for ((package, workspace), time) in slow {
+        let _ = writeln!(text, "{:>8.1} s  {package}  in {workspace}", seconds(time));
     }
     text
 }

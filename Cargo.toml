@@ -2,7 +2,27 @@
 name = "trucker"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 blake3 = { version = "1", features = ["mmap"] }
 libc = "0.2"
+memchr = "2"
+memmap2 = "0.9"
+
+# Unsafe code only in the system calls that clone a file, lease a library and ask a filesystem's size, and in the map of
+# an output that is scanned, each allowed where it is written.
+[lints.rust]
+unsafe_code = "deny"
+
+# A panic in a compiler wrapper fails the build it wraps, so errors are handled; tests may still unwrap.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+strip = true
+lto = true
+panic = "abort"

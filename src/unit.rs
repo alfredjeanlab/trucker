@@ -1,19 +1,51 @@
-//! One cached rustc invocation, of a third-party crate or of the repository's own, and the key of what its outputs
-//! depend on.
+//! One cached rustc invocation of a third-party or own crate, and the key of what its outputs depend on.
 //!
-//! A key covers what cargo's own rebuild checks cover, and shares their blind spot: a proc macro or build script that
-//! reads a file or variable without declaring it to cargo gets a stale output. Paths under the target directory,
-//! CARGO_HOME and the worktree enter a key through placeholders, so that every worktree computes the same key. What
-//! rustc names only in its dep-info, such as a source of an own crate, a file of OUT_DIR or a variable set by a build
-//! script, selects among the entries of one key.
+//! A key covers what cargo's own rebuild checks cover, and shares their blind spot. A proc macro or build script that
+//! reads a variable, or a file outside what an own crate's package covers, without declaring it gets a stale output.
+//! Paths under the target directory, CARGO_HOME and the worktree enter a key through placeholders, so that every
+//! worktree computes the same key. What rustc names only in its dep-info selects among the entries of one key. Such a
+//! name is a source of an own crate, a file of OUT_DIR or a variable set by a build script. The files of the package
+//! of an own crate that can load a proc macro select its entry too.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 use std::{env, fs, io};
 
 pub const TARGET: &str = "{trucker:target}/";
 pub const CARGO_HOME: &str = "{trucker:cargo-home}/";
 pub const WORKTREE: &str = "{trucker:worktree}";
+
+/// A field of the key of every own crate that changes with how entries are selected, so an older entry is not found.
+const OWN: &[u8] =
+    b"own crate, selected by settled sources, the files of its package and the directories of its declared files";
+
+/// The names of the entries that a walk of [`Unit::package_hash`] skips, which version control, editors and tools own.
+const UNREAD: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".jj",
+    ".bzr",
+    ".pijul",
+    "_darcs",
+    ".sl",
+    ".github",
+    ".idea",
+    ".vscode",
+    ".zed",
+    ".claude",
+    ".cursor",
+    ".direnv",
+    ".cache",
+    "node_modules",
+    ".DS_Store",
+];
+
+/// How long before its compile started a source of the worktree must have last changed for the compile to be stored.
+///
+/// It covers a filesystem that keeps mtimes to the second, and a kernel clock that lags the system's.
+const SETTLED: Duration = Duration::from_secs(1);
 
 /// The directories whose paths differ between worktrees or machines.
 pub struct Roots {
@@ -49,14 +81,14 @@ impl Roots {
             .fold(text.to_string(), |text, (root, placeholder)| text.replace(placeholder, root))
     }
 
-    /// The target directory where it lies outside the worktree, which then needs a remap and a scan of its own.
+    /// The target directory where it lies outside the worktree and so needs a remap and a scan of its own.
     pub fn separate_target(&self) -> Option<&str> {
         let root = self.worktree.as_deref()?;
         let inside = self.target.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'));
         (!inside).then_some(self.target.as_str())
     }
 
-    /// Rewrites `dep_info` with `rewrite`, through each root as rustc writes it in that part of a line.
+    /// Rewrites `dep_info` with `rewrite`, through every root in the form that rustc writes in that part of a line.
     ///
     /// rustc escapes a space as `\ ` in the path of a source, but not in that of an output or in an `env-dep` value.
     pub fn dep_info(&self, dep_info: &str, rewrite: fn(&Roots, &str) -> String) -> String {
@@ -95,6 +127,8 @@ pub struct Unit {
     generated: Option<String>,
     /// The flags that make a link on macOS leave out the paths of the worktree and the target directory.
     link_paths: Vec<String>,
+    /// The directory of the package, from CARGO_MANIFEST_DIR, whose files a proc macro may read without declaring them.
+    pub package: Option<PathBuf>,
 }
 
 /// CARGO_HOME with a trailing slash.
@@ -121,7 +155,9 @@ pub fn worktree(input: &Path, cargo_home: &str) -> Option<String> {
     (!input.starts_with(cargo_home)).then(|| root.display().to_string())
 }
 
-/// Whether `args` ask rustc about itself or compile stdin, as cargo's probes do, which are never cached or logged.
+/// Whether `args` ask rustc about itself or compile stdin, as the probes of cargo do.
+///
+/// Such an invocation is never cached or logged.
 pub fn is_query(args: &[String]) -> bool {
     let query = |arg: &String| matches!(&**arg, "-" | "-vV" | "-V" | "--version");
     args.iter().any(|arg| query(arg) || arg.starts_with("--print"))
@@ -148,46 +184,240 @@ pub fn lexical(path: &Path) -> PathBuf {
     lexical
 }
 
-/// Whether the key covers the environment variable `name`, which cargo sets for rustc or a build script.
+/// Whether the key of a compile covers the environment variable `name`, which rustc reads itself or cargo sets for
+/// every compile of the crate.
 ///
-/// A variable that the user sets, such as CARGO_TARGET_DIR, enters only where dep-info names it.
+/// Any other variable enters only where dep-info names it, because the `[env]` table of the cargo configuration can set
+/// it to a path of the worktree. It can even set one that cargo leaves unset, such as CARGO_RUSTC_CURRENT_DIR or
+/// CARGO_TARGET_TMPDIR.
 pub fn is_keyed(name: &str) -> bool {
     let compiler = "CARGO OUT_DIR MACOSX_DEPLOYMENT_TARGET SDKROOT RUSTC_BOOTSTRAP CARGO_MANIFEST_DIR \
-                    CARGO_MANIFEST_PATH CARGO_MANIFEST_LINKS CARGO_CRATE_NAME CARGO_BIN_NAME CARGO_PRIMARY_PACKAGE \
-                    CARGO_TARGET_TMPDIR CARGO_RUSTC_CURRENT_DIR CARGO_SBOM_PATH CARGO_ENCODED_RUSTFLAGS \
-                    CARGO_TRIM_PATHS_SCOPE CARGO_TRIM_PATHS_REMAP";
-    let prefixes = ["CARGO_PKG_", "CARGO_BIN_EXE_", "CARGO_CFG_", "CARGO_FEATURE_", "CARGO_DEP_"];
-    compiler.split_whitespace().any(|known| known == name)
-        || prefixes.iter().any(|prefix| name.starts_with(prefix))
+                    CARGO_MANIFEST_PATH CARGO_CRATE_NAME CARGO_BIN_NAME CARGO_PRIMARY_PACKAGE";
+    compiler.split_whitespace().any(|known| known == name) || name.starts_with("CARGO_PKG_")
 }
 
 pub fn file_hash(path: &Path) -> io::Result<blake3::Hash> {
     Ok(blake3::Hasher::new().update_mmap(path)?.finalize())
 }
 
-/// Feeds the name and contents of every file under `directory` to `field`, in a fixed order.
-pub fn hash_tree(root: &Path, directory: &Path, field: &mut impl FnMut(&[u8])) -> io::Result<()> {
-    let mut entries = fs::read_dir(directory)?.collect::<io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        field(path.strip_prefix(root).unwrap_or(&path).as_os_str().as_encoded_bytes());
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            hash_tree(root, &path, field)?;
-        } else if kind.is_symlink() {
-            field(fs::read_link(&path)?.as_os_str().as_encoded_bytes());
-        } else {
-            field(file_hash(&path)?.as_bytes());
+/// The identity of the file at `path`, as [`identity_of`] gives it.
+pub fn identity(path: &Path) -> io::Result<String> {
+    Ok(identity_of(&fs::metadata(path)?))
+}
+
+/// The device, inode, length, mtime and ctime of `file`.
+///
+/// Every write to a file sets its ctime, which only a change of the system clock can set back. So a file whose identity
+/// stays the same has the same contents.
+pub fn identity_of(file: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let (mtime, ctime) = ((file.mtime(), file.mtime_nsec()), (file.ctime(), file.ctime_nsec()));
+    format!("{} {} {} {mtime:?} {ctime:?}", file.dev(), file.ino(), file.len())
+}
+
+/// The hash of the file at `path`, remembered in `memos` under its [`identity`].
+///
+/// A file with the identity of a memo has the contents that were hashed. A file that changes while it is hashed, or
+/// that is not [`settled`], is not remembered.
+pub fn remembered_hash(path: &Path, memos: &Path) -> io::Result<blake3::Hash> {
+    let start = crate::now() as i64;
+    let file = fs::metadata(path)?;
+    let before = identity_of(&file);
+    if let Some(Ok(bytes)) = recalled(memos, &before).map(<[u8; 32]>::try_from) {
+        return Ok(blake3::Hash::from_bytes(bytes));
+    }
+    let hash = file_hash(path)?;
+    if identity(path)? != before {
+        return file_hash(path);
+    }
+    if settled(&file, start) {
+        let _ = remember(memos, &before, hash.as_bytes());
+    }
+    Ok(hash)
+}
+
+/// Whether `file` last changed over a second before `start`, in seconds since the epoch.
+///
+/// A write in the same tick of a coarse clock leaves the identity of a file alone, so a memo is written only for a
+/// file whose times lie further back than any tick.
+fn settled(file: &fs::Metadata, start: i64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    file.ctime().max(file.mtime()).saturating_add(1) < start
+}
+
+/// The hash of each of `paths` in order, computed on every core through [`remembered_hash`] in `memos`.
+///
+/// The libraries of a linked crate take a gigabyte or more and an edit changes few of them, so remembered hashes keep
+/// them from delaying its compile. The files without a memo are hashed through [`crate::lazy::scan`], so a library
+/// that an edit replaced, which may take hundreds of megabytes, is hashed on every core.
+pub fn file_hashes(paths: &[PathBuf], memos: &Path) -> io::Result<Vec<blake3::Hash>> {
+    let start = crate::now() as i64;
+    let recall = |path: &PathBuf| {
+        let file = fs::metadata(path)?;
+        let before = identity_of(&file);
+        let bytes = recalled(memos, &before).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+        Ok((bytes.map(blake3::Hash::from_bytes), (before, settled(&file, start))))
+    };
+    let (mut hashes, before): (Vec<_>, Vec<_>) = on_every_core(paths, recall)?.into_iter().unzip();
+    let missing = Vec::from_iter((0..paths.len()).filter(|&at| hashes[at].is_none()));
+    // The files of a chunk are open at once, so a chunk stays well within the limit of open files.
+    for chunk in missing.chunks(64) {
+        let computed =
+            crate::lazy::scan(&Vec::from_iter(chunk.iter().map(|&at| paths[at].clone())), &[])
+                .map(|(computed, _)| computed.into_iter());
+        let mut computed = computed.into_iter().flatten();
+        for &at in chunk {
+            hashes[at] = Some(match computed.next() {
+                Some(hash) if identity(&paths[at])? == before[at].0 => {
+                    if before[at].1 {
+                        let _ = remember(memos, &before[at].0, hash.as_bytes());
+                    }
+                    hash
+                }
+                _ => remembered_hash(&paths[at], memos)?,
+            });
+        }
+    }
+    Ok(Vec::from_iter(hashes.into_iter().flatten()))
+}
+
+/// The result of `run` for each item of `paths` in order, computed on every core.
+fn on_every_core<I: Sync, T: Send>(
+    paths: &[I],
+    run: impl Fn(&I) -> io::Result<T> + Sync,
+) -> io::Result<Vec<T>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let worker = || {
+        let mut results = Vec::new();
+        loop {
+            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(path) = paths.get(at) else { return results };
+            results.push((at, run(path)));
+        }
+    };
+    let workers = std::thread::available_parallelism().map_or(1, usize::from).min(paths.len());
+    let mut results = std::thread::scope(|scope| {
+        let threads = Vec::from_iter((1..workers).map(|_| scope.spawn(worker)));
+        let mut results = worker();
+        for thread in threads {
+            results
+                .extend(thread.join().map_err(|_| io::Error::other("a hashing thread panicked"))?);
+        }
+        io::Result::Ok(results)
+    })?;
+    results.sort_by_key(|(at, _)| *at);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+/// What [`hash_tree`] feeds for one entry of a tree, with the hash of a file still to compute.
+enum Fed {
+    Bytes(Vec<u8>),
+    File(PathBuf),
+}
+
+/// Feeds the name and contents of every file under `root` to `field`, in a fixed order.
+///
+/// A UTF-8 file is fed through the placeholders of `roots`, because a file such as a pkg-config file names the target
+/// directory, and a key covers that only through its placeholder. The files are hashed on every core through
+/// [`tree_file_hash`], because a native library such as that of RocksDB takes a gigabyte, and each dependent's key
+/// covers it.
+pub fn hash_tree(
+    roots: &Roots,
+    root: &Path,
+    memos: &Path,
+    field: &mut impl FnMut(&[u8]),
+) -> io::Result<()> {
+    fn walk(roots: &Roots, root: &Path, directory: &Path, fed: &mut Vec<Fed>) -> io::Result<()> {
+        let mut entries = fs::read_dir(directory)?.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = path.strip_prefix(root).unwrap_or(&path).as_os_str().as_encoded_bytes();
+            fed.push(Fed::Bytes(name.to_vec()));
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(roots, root, &path, fed)?;
+            } else if kind.is_symlink() {
+                fed.push(Fed::Bytes(link_target(roots, &path)?));
+            } else {
+                fed.push(Fed::File(path));
+            }
+        }
+        Ok(())
+    }
+    let mut fed = Vec::new();
+    walk(roots, root, root, &mut fed)?;
+    let files = fed.iter().filter_map(|fed| match fed {
+        Fed::File(path) => Some(path.clone()),
+        Fed::Bytes(_) => None,
+    });
+    let files = Vec::from_iter(files);
+    let mut hashes = on_every_core(&files, |path| tree_file_hash(roots, path, memos))?.into_iter();
+    for fed in fed {
+        match fed {
+            Fed::Bytes(bytes) => field(&bytes),
+            Fed::File(_) => field(hashes.next().ok_or(io::ErrorKind::InvalidData)?.as_bytes()),
         }
     }
     Ok(())
 }
 
+/// What [`hash_tree`] feeds for the symlink at `link`.
+///
+/// A target that climbs with `..` or is absolute is fed as the path that it names, through the placeholders of `roots`,
+/// where that path resolves as it reads. A relative link that climbs out of the target directory, as `cxx-build` writes
+/// one into CARGO_HOME, then hashes alike in worktrees at different depths. Any other target is fed as written.
+fn link_target(roots: &Roots, link: &Path) -> io::Result<Vec<u8>> {
+    let target = fs::read_link(link)?;
+    let normal = |part| matches!(part, Component::Normal(_) | Component::CurDir);
+    let path = lexical(&link.parent().unwrap_or(link).join(&target));
+    let real = path.canonicalize().ok();
+    match path.to_str() {
+        Some(path)
+            if !target.components().all(normal)
+                && real.is_some()
+                && real == link.canonicalize().ok() =>
+        {
+            Ok(roots.normalized(path).into_bytes())
+        }
+        _ => Ok(target.into_os_string().into_encoded_bytes()),
+    }
+}
+
+/// The hash that [`hash_tree`] feeds for the file at `path`, remembered in `memos` under its [`identity`] where the
+/// file is not UTF-8.
+///
+/// A UTF-8 file is hashed through the placeholders of `roots`, which differ between worktrees, so it is read every
+/// time. A memo of this kind is named apart from those of [`remembered_hash`], so that it also says that the file is
+/// not UTF-8. A file that is not [`settled`] is not remembered.
+fn tree_file_hash(roots: &Roots, path: &Path, memos: &Path) -> io::Result<blake3::Hash> {
+    let start = crate::now() as i64;
+    let file = fs::metadata(path)?;
+    let before = format!("binary {}", identity_of(&file));
+    if let Some(Ok(bytes)) = recalled(memos, &before).map(<[u8; 32]>::try_from) {
+        return Ok(blake3::Hash::from_bytes(bytes));
+    }
+    let map = crate::store::map(path);
+    let bytes = match &map {
+        Some(map) => std::borrow::Cow::Borrowed(&map[..]),
+        None => std::borrow::Cow::Owned(fs::read(path)?),
+    };
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        return Ok(blake3::hash(roots.normalized(text).as_bytes()));
+    }
+    let hash = blake3::hash(&bytes);
+    if settled(&file, start)
+        && identity(path).is_ok_and(|after| format!("binary {after}") == before)
+    {
+        let _ = remember(memos, &before, hash.as_bytes());
+    }
+    Ok(hash)
+}
+
 /// The output of `rustc -vV`, remembered in `store` for each compiler binary and rustup toolchain.
 ///
-/// Without RUSTUP_TOOLCHAIN the path may be a rustup proxy, whose compiler depends on more than its
-/// path, so rustc is asked every time.
+/// Without RUSTUP_TOOLCHAIN the path may be a rustup proxy that picks its compiler by more than its path, so rustc is
+/// asked every time.
 pub fn compiler(rustc: &str, store: &Path) -> io::Result<Vec<u8>> {
     let version = || Command::new(rustc).arg("-vV").output().map(|output| output.stdout);
     let (Ok(toolchain), Ok(binary)) = (env::var("RUSTUP_TOOLCHAIN"), fs::metadata(rustc)) else {
@@ -203,18 +433,30 @@ pub fn remembered(
     identity: &str,
     run: impl FnOnce() -> io::Result<Vec<u8>>,
 ) -> io::Result<Vec<u8>> {
-    let memo = directory.join(blake3::hash(identity.as_bytes()).to_hex().as_str());
-    if let Ok(output) = fs::read(&memo) {
+    if let Some(output) = recalled(directory, identity) {
         return Ok(output);
     }
     let output = run()?;
-    let staging = memo.with_extension(std::process::id().to_string());
-    fs::create_dir_all(directory)?;
-    fs::write(&staging, &output).and_then(|()| fs::rename(&staging, &memo))?;
+    remember(directory, identity, &output)?;
     Ok(output)
 }
 
-/// The target directory that `out_dir` lies in, which is the output directory of one unit in cargo's layout.
+/// The output remembered in `directory` under the hash of `identity`, where there is one.
+pub fn recalled(directory: &Path, identity: &str) -> Option<Vec<u8>> {
+    fs::read(directory.join(blake3::hash(identity.as_bytes()).to_hex().as_str())).ok()
+}
+
+/// Remembers `output` in `directory` under the hash of `identity`.
+///
+/// The memo is staged and renamed into place, so a reader finds it whole or missing.
+pub fn remember(directory: &Path, identity: &str, output: &[u8]) -> io::Result<()> {
+    let memo = directory.join(blake3::hash(identity.as_bytes()).to_hex().as_str());
+    let staging = memo.with_extension(std::process::id().to_string());
+    fs::create_dir_all(directory)?;
+    fs::write(&staging, output).and_then(|()| fs::rename(&staging, &memo))
+}
+
+/// The target directory that holds `out_dir` as the output directory of one unit in the layout of cargo.
 ///
 /// Where cargo was given `--target`, a directory named after `triple` lies above the profile's. An output directory
 /// of another layout belongs to the nearest ancestor that cargo tagged, and cargo tags only a directory that it
@@ -230,10 +472,10 @@ pub fn target_directory<'a>(out_dir: &'a Path, triple: Option<&str>) -> Option<&
 }
 
 impl Unit {
-    /// Reads rustc's arguments, or names the reason that their outputs cannot be predicted from a key.
+    /// Reads the arguments of rustc, or fails with the reason why a key cannot predict their outputs.
     ///
-    /// `generated` is OUT_DIR, where a build script wrote the sources that this crate includes. `worktree` is that of
-    /// an own crate, whose incremental compile is allowed.
+    /// `generated` is OUT_DIR, where a build script wrote the sources that this crate includes. `worktree` is the
+    /// worktree of an own crate, and only such a crate may compile incrementally.
     pub fn model(
         args: &[String],
         cargo_home: String,
@@ -242,11 +484,11 @@ impl Unit {
     ) -> Result<Unit, &'static str> {
         let (mut name, mut extra, mut out_dir, mut emit, mut triple) = (None, "", None, "", None);
         let (mut externs, mut search, mut trees, mut links) = (vec![], vec![], vec![], vec![]);
-        let (mut linked, mut proc_macro) = (false, false);
+        let (mut linked, mut proc_macro, mut coverage) = (false, false, false);
         let mut rest = args.iter().map(String::as_str);
         while let Some(arg) = rest.next() {
             let (flag, value) = match arg {
-                "-C" | "-L" | "-l" | "-o" | "--extern" | "--out-dir" | "--emit"
+                "-C" | "--codegen" | "-L" | "-l" | "-o" | "--extern" | "--out-dir" | "--emit"
                 | "--crate-name" | "--crate-type" | "--target" => (arg, rest.next().unwrap_or("")),
                 _ if arg.starts_with("--") => arg.split_once('=').unwrap_or((arg, "")),
                 _ if arg.starts_with('-') && arg.len() > 1 => arg.split_at(2),
@@ -272,6 +514,14 @@ impl Unit {
                 ("-C", _) if value.starts_with("incremental") && worktree.is_none() => {
                     return Err("incremental");
                 }
+                // The last of these flags wins, as in rustc.
+                ("-C" | "--codegen", _)
+                    if value.split('=').next() == Some("instrument-coverage") =>
+                {
+                    let off =
+                        matches!(value.split_once('='), Some((_, "n" | "no" | "off" | "false")));
+                    coverage = !off;
+                }
                 ("-L", _) => match value.split_once('=') {
                     Some(("dependency", directory)) => search.push(PathBuf::from(directory)),
                     Some((_, directory)) => trees.push(directory.to_string()),
@@ -282,6 +532,11 @@ impl Unit {
                 _ => {}
             }
         }
+        // A remap would make the coverage map name the sources of an own crate relative to its worktree, which a tool
+        // that matches them by absolute path, as cargo-llvm-cov does, then fails to find.
+        if coverage && worktree.is_some() {
+            return Err("coverage");
+        }
         let (name, out_dir) = (name.ok_or("no-crate-name")?, out_dir.ok_or("no-out-dir")?);
         let known = |kind| matches!(kind, "dep-info" | "metadata" | "link");
         if !emit.split(',').all(known) || !emit.split(',').any(|kind| kind == "dep-info") {
@@ -289,7 +544,7 @@ impl Unit {
         }
         let target = target_directory(out_dir, triple);
         let target = format!("{}/", target.ok_or("no-target-dir")?.display());
-        // rustc's JSON diagnostics escape these characters, where the placeholders would not find a root.
+        // The JSON diagnostics of rustc escape these characters, so the placeholders would not find a root in them.
         let escaped = |c: char| c.is_control() || c == '\\' || c == '"';
         if [&target, &cargo_home].into_iter().chain(&worktree).any(|path| path.contains(escaped)) {
             return Err("escaped-path");
@@ -320,7 +575,169 @@ impl Unit {
             links,
             generated,
             link_paths,
+            package: env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
         })
+    }
+
+    /// The file names of the proc macros that rustc may load for this crate, from its externs and search directories.
+    ///
+    /// cargo names the directory of each crate that the externs depend on, so a macro that a dependency re-exports, as
+    /// `sqlx` does `sqlx-macros`, is found too.
+    fn proc_macros(&self) -> Vec<String> {
+        let entries = self.search.iter().filter_map(|directory| fs::read_dir(directory).ok());
+        let found = entries.flatten().flatten().map(|entry| entry.path());
+        let libraries = self.externs.iter().cloned().chain(found);
+        let dynamic = |path: &PathBuf| {
+            path.extension().is_some_and(|kind| kind == "dylib" || kind == "so" || kind == "dll")
+        };
+        let names = libraries
+            .filter(dynamic)
+            .map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()));
+        names.flatten().collect()
+    }
+
+    /// Whether this own crate loads a proc macro that may read what no file of its worktree holds.
+    ///
+    /// sqlx-macros queries the database of DATABASE_URL unless SQLX_OFFLINE is true, and reads its offline data from
+    /// SQLX_OFFLINE_DIR wherever that lies.
+    pub fn reads_undeclared(&self) -> bool {
+        let offline = env::var("SQLX_OFFLINE")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            && env::var_os("SQLX_OFFLINE_DIR").is_none();
+        let sqlx = |name: &String| {
+            let name = name.strip_prefix("lib").unwrap_or(name);
+            name.starts_with("sqlx_macros-") || name.starts_with("sqlx_macros.")
+        };
+        self.roots.worktree.is_some() && !offline && self.proc_macros().iter().any(sqlx)
+    }
+
+    /// The directories whose files a proc macro of this own crate may read without declaring them, each with the kind
+    /// of its read in [`Unit::variant`].
+    ///
+    /// The package is walked whole, as a `tree`. The workspace root, which rustc runs in, is a `top`, of which only the
+    /// hidden files and directories count, as the `.sqlx` of sqlx and a `.env` do. Its other files, such as a README
+    /// or `Cargo.lock`, would make every such crate of the workspace compile again after an edit of any one of them.
+    fn packages(&self) -> Vec<(&'static str, &Path)> {
+        let mut packages = Vec::from_iter(self.package.as_deref().map(|package| ("tree", package)));
+        if self.package.as_deref() != Some(&self.directory) {
+            packages.push(("top", &self.directory));
+        }
+        packages
+    }
+
+    /// Whether `path` is the target directory or holds a `.git`, a `Cargo.toml` or a `CACHEDIR.TAG`, as another
+    /// worktree, package or target directory does, which no walk enters.
+    fn other_root(&self, path: &Path) -> bool {
+        let targets = [Some(self.roots.target.as_str()), self.roots.separate_target()];
+        targets.into_iter().flatten().any(|target| Path::new(target) == path)
+            || ["Cargo.toml", ".git", "CACHEDIR.TAG"].iter().any(|name| path.join(name).exists())
+    }
+
+    /// The directories outside the walk of the package that hold a file of `declared`, each as a `dir` read.
+    ///
+    /// A proc macro that lists a directory, as `sqlx::migrate!` lists `migrations`, declares each file that it reads
+    /// but not the directory, so a file added there would change nothing else that selects the entry. A directory of
+    /// another package counts too, because a macro may list it alike. Left out are the directories that the `tree` of
+    /// the package walks, those under an entry of [`UNREAD`], and those that [`Unit::other_root`] names, such as the
+    /// workspace root, whose hidden files the `top` read covers. A file outside the worktree is a read of its own or
+    /// leaves the crate uncached already.
+    fn listed<'a>(&self, declared: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let package = self.package.as_deref().map(lexical);
+        let walked = |directory: &Path| {
+            package.as_deref().is_some_and(|package| {
+                directory.starts_with(package)
+                    && !directory
+                        .ancestors()
+                        .take_while(|ancestor| *ancestor != package)
+                        .any(|ancestor| self.other_root(ancestor))
+            })
+        };
+        let mut listed = Vec::new();
+        for path in declared.filter(|path| path.starts_with(&format!("{WORKTREE}/"))) {
+            let Some(directory) = Path::new(path).parent() else { continue };
+            let local = PathBuf::from(self.roots.localized(&directory.to_string_lossy()));
+            let unread = directory
+                .components()
+                .any(|component| UNREAD.iter().any(|name| component.as_os_str() == *name));
+            if !unread && !walked(&local) && !self.other_root(&local) {
+                listed.push(format!("dir {}", directory.display()));
+            }
+        }
+        listed
+    }
+
+    /// The hash of the names and contents of the files under `root`, other than those of `declared`.
+    ///
+    /// A `top` walk takes only the hidden entries of `root`. A `dir` walk takes only the entries of `root` itself, of
+    /// which a directory counts by its name. No walk takes an entry of [`UNREAD`], an editor's backup or swap file, or
+    /// a directory that [`Unit::other_root`] names. Fails with `changed-source` where a file changed less than
+    /// [`SETTLED`] before `started`, or after it.
+    fn package_hash(
+        &self,
+        root: &Path,
+        kind: &str,
+        declared: &std::collections::HashSet<PathBuf>,
+        started: Option<SystemTime>,
+    ) -> Result<String, &'static str> {
+        let skipped = |path: &Path, name: &str, directory: bool| {
+            let backup = [".swp", ".swo", ".swx", "~"].iter().any(|end| name.ends_with(end));
+            UNREAD.contains(&name)
+                || backup
+                || name.starts_with(".#")
+                || declared.contains(path)
+                || (directory && self.other_root(path))
+        };
+        // Each entry of the walk with whether it is a symlink, which is fed by its target, or None for a directory,
+        // which is fed by nothing.
+        let (mut files, mut pending) = (Vec::new(), vec![root.to_path_buf()]);
+        while let Some(directory) = pending.pop() {
+            let entries =
+                fs::read_dir(&directory).and_then(Iterator::collect::<io::Result<Vec<_>>>);
+            for entry in entries.map_err(|_| "unreadable-read")? {
+                let (path, entry_kind) =
+                    (entry.path(), entry.file_type().map_err(|_| "unreadable-read")?);
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if skipped(&path, &name, entry_kind.is_dir())
+                    || (kind == "top" && directory == root && !name.starts_with('.'))
+                {
+                    continue;
+                }
+                if entry_kind.is_dir() && kind == "dir" {
+                    files.push((path, None));
+                } else if entry_kind.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push((path, Some(entry_kind.is_symlink())));
+                }
+            }
+        }
+        files.sort();
+        let hash =
+            |(path, symlink): &(PathBuf, Option<bool>)| -> io::Result<(Vec<u8>, Option<SystemTime>)> {
+                let contents = match symlink {
+                    None => return Ok((Vec::new(), None)),
+                    Some(true) => fs::read_link(path)?.into_os_string().into_encoded_bytes(),
+                    Some(false) => file_hash(path)?.as_bytes().to_vec(),
+                };
+                // The mtime is read after the hash, so that a write during the hash is seen.
+                let modified =
+                    started.map(|_| fs::symlink_metadata(path)?.modified()).transpose()?;
+                Ok((contents, modified))
+            };
+        let hashes = on_every_core(&files, hash).map_err(|_| "unreadable-read")?;
+        let mut hasher = blake3::Hasher::new();
+        for ((path, _), (contents, modified)) in files.iter().zip(hashes) {
+            if let (Some(started), Some(modified)) = (started, modified)
+                && started.duration_since(modified).map_or(true, |age| age < SETTLED)
+            {
+                return Err("changed-source");
+            }
+            let name = path.strip_prefix(root).unwrap_or(path).as_os_str().as_encoded_bytes();
+            for field in [name, &contents] {
+                hasher.update(&(field.len() as u64).to_le_bytes()).update(field);
+            }
+        }
+        Ok(hasher.finalize().to_hex().to_string())
     }
 
     /// The files that rustc wrote, or will write, into the output directory for this crate.
@@ -349,8 +766,8 @@ impl Unit {
 
     /// The flags that name paths in spans, panics, debug info and links, which the key covers.
     ///
-    /// A file under the target directory, such as a build script's generated source, is named from `target/`, and a
-    /// source of an own crate relative to its worktree.
+    /// A file under the target directory, such as a generated source of a build script, is named from `target/`. A
+    /// source of an own crate is named relative to its worktree.
     pub fn remap(&self) -> Vec<String> {
         let worktree =
             self.roots.worktree.as_ref().map(|root| format!("--remap-path-prefix={root}/="));
@@ -374,16 +791,25 @@ impl Unit {
         normalized
     }
 
-    /// The key of this invocation by `rustc` with `args`, as hex.
+    /// The key of this invocation by `rustc` with `args` in `environment`, as hex.
     ///
     /// A crate that only needs metadata is keyed by the `.rmeta` of each dependency, because cargo
     /// starts it while their other files are still being written.
-    pub fn key(&self, rustc: &str, args: &[String], store: &Path) -> io::Result<String> {
+    pub fn key(
+        &self,
+        rustc: &str,
+        args: &[String],
+        store: &Path,
+        environment: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ) -> io::Result<String> {
         let mut hasher = blake3::Hasher::new();
         let mut field = |bytes: &[u8]| {
             hasher.update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
         };
         field(&compiler(rustc, store)?);
+        if self.roots.worktree.is_some() {
+            field(OWN);
+        }
         field(self.roots.normalized(&self.directory.to_string_lossy()).as_bytes());
         for arg in self.normalized_args(args) {
             field(arg.as_bytes());
@@ -394,7 +820,7 @@ impl Unit {
         field(b"environment");
         let lossy = |text: std::ffi::OsString| text.to_string_lossy().into_owned();
         let mut variables =
-            Vec::from_iter(env::vars_os().map(|(name, value)| (lossy(name), lossy(value))));
+            Vec::from_iter(environment.map(|(name, value)| (lossy(name), lossy(value))));
         variables.sort();
         for (name, value) in variables.iter().filter(|(name, _)| is_keyed(name)) {
             field(name.as_bytes());
@@ -423,20 +849,23 @@ impl Unit {
         }
         libraries.sort();
         libraries.dedup();
-        for library in &libraries {
+        for (library, hash) in libraries.iter().zip(file_hashes(&libraries, &store.join("hashes"))?)
+        {
             field(library.file_name().unwrap_or_default().as_encoded_bytes());
-            field(file_hash(library)?.as_bytes());
+            field(hash.as_bytes());
         }
         field(b"trees");
         for tree in &self.trees {
             field(self.roots.normalized(tree).as_bytes());
             if tree.starts_with(&self.roots.target) {
-                hash_tree(Path::new(tree), Path::new(tree), &mut field)?;
+                hash_tree(&self.roots, Path::new(tree), &store.join("hashes"), &mut field)?;
             }
         }
         for link in &self.links {
             field(link.as_bytes());
-            let library = self.native_library(link).map(|path| file_hash(&path)).transpose()?;
+            let memos = store.join("hashes");
+            let library = self.native_library(link).map(|path| remembered_hash(&path, &memos));
+            let library = library.transpose()?;
             field(library.as_ref().map_or(b"default".as_slice(), |hash| hash.as_bytes()));
         }
         Ok(hasher.finalize().to_hex().to_string())
@@ -465,9 +894,9 @@ impl Unit {
 
     /// Rewrites dep-info through the placeholders, and lists what the crate read that the key does not cover.
     ///
-    /// The list names each unkeyed environment variable and each file under OUT_DIR or the worktree, by its path
-    /// resolved against the working directory. Returns `None` where the crate read a file elsewhere outside
-    /// CARGO_HOME and the hashed trees, or a path with a control character, which no entry can cover.
+    /// The list names every unkeyed environment variable and every file under OUT_DIR or the worktree, by its path
+    /// resolved against the working directory. Returns `None` where the crate read a path with a control character, or
+    /// a file elsewhere outside CARGO_HOME and the hashed trees, because an entry cannot cover it.
     pub fn portable_dep_info(&self, dep_info: &str) -> Option<(String, String)> {
         let directory =
             |path: &str| self.roots.normalized(&format!("{}/", path.trim_end_matches('/')));
@@ -498,6 +927,19 @@ impl Unit {
                 }
             }
         }
+        // A proc macro may read a file of the package or the workspace root, as sqlx reads `.sqlx`, without declaring it,
+        // or list a directory of the files that it declares, as `sqlx::migrate!` does.
+        if self.roots.worktree.is_some() && !self.proc_macros().is_empty() {
+            for (kind, directory) in self.packages() {
+                let path = self.roots.normalized(&lexical(directory).to_string_lossy());
+                if path != WORKTREE && !path.starts_with(&format!("{WORKTREE}/")) {
+                    return None;
+                }
+                reads.push(format!("{kind} {path}"));
+            }
+            let declared = reads.iter().filter_map(|read| read.strip_prefix("file "));
+            reads.extend(self.listed(declared));
+        }
         reads.sort();
         reads.dedup();
         Some((self.roots.dep_info(dep_info, Roots::normalized), reads.join("\n")))
@@ -506,20 +948,53 @@ impl Unit {
     /// The name of the entry of `key` for the current value of each of `reads`, which an earlier compile read.
     ///
     /// A compile that finds every one of them unchanged reads nothing else, because what it reads next follows from
-    /// what it has read.
-    pub fn variant(&self, key: &str, reads: &str) -> String {
+    /// what it has read. `started` is the start of the compile that `reads` come from, where they are to be stored.
+    ///
+    /// Fails, so that the compile is neither looked up nor stored, where:
+    /// - an own crate read no source of its worktree;
+    /// - a file of `reads` cannot be hashed;
+    /// - a source of the worktree changed less than [`SETTLED`] before `started`, or after it, because rustc may then
+    ///   have read other contents than those hashed.
+    pub fn variant(
+        &self,
+        key: &str,
+        reads: &str,
+        started: Option<SystemTime>,
+    ) -> Result<String, &'static str> {
+        let source = format!("file {WORKTREE}/");
+        if self.roots.worktree.is_some() && !reads.lines().any(|read| read.starts_with(&source)) {
+            return Err("no-source-read");
+        }
         let mut hasher = blake3::Hasher::new();
         hasher.update(key.as_bytes());
+        let declared = reads.lines().filter_map(|read| read.strip_prefix("file "));
+        let declared = declared.map(|path| PathBuf::from(self.roots.localized(path))).collect();
         for read in reads.lines() {
             let value = match read.split_once(' ') {
-                Some(("file", path)) => file_hash(Path::new(&self.roots.localized(path)))
-                    .ok()
-                    .map(|hash| hash.to_hex().to_string()),
-                Some((_, name)) => env::var(name).ok().map(|value| self.roots.normalized(&value)),
-                None => None,
+                Some((kind @ ("tree" | "top" | "dir"), path)) => {
+                    let root = PathBuf::from(self.roots.localized(path));
+                    Some(self.package_hash(&root, kind, &declared, started)?)
+                }
+                Some(("file", path)) => {
+                    let file = PathBuf::from(self.roots.localized(path));
+                    let hash = file_hash(&file).map_err(|_| "unreadable-read")?;
+                    // The mtime is read after the hash, so that a write during the hash is seen.
+                    if let Some(started) = started.filter(|_| path.starts_with(WORKTREE)) {
+                        let modified = fs::metadata(&file).and_then(|metadata| metadata.modified());
+                        let age = started.duration_since(modified.map_err(|_| "unreadable-read")?);
+                        if age.map_or(true, |age| age < SETTLED) {
+                            return Err("changed-source");
+                        }
+                    }
+                    Some(hash.to_hex().to_string())
+                }
+                Some(("env", name)) => {
+                    env::var(name).ok().map(|value| self.roots.normalized(&value))
+                }
+                _ => return Err("unreadable-read"),
             };
             hasher.update(format!("\n{read}={value:?}").as_bytes());
         }
-        if reads.is_empty() { key.to_string() } else { hasher.finalize().to_hex().to_string() }
+        Ok(if reads.is_empty() { key.to_string() } else { hasher.finalize().to_hex().to_string() })
     }
 }
