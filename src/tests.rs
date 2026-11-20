@@ -276,7 +276,7 @@ fn dep_info_is_rewritten_unless_it_names_an_unkeyed_file() {
 
     let read = format!("{dep_info}# env-dep:PATH=/bin\n# env-dep:HOME=/home/dev\n");
     assert_eq!(unit.portable_dep_info(&read).unwrap().1, "env HOME\nenv PATH");
-    let variant = |reads| unit.variant("key", reads, None).unwrap();
+    let variant = |reads| unit.variant("key", reads, None, &fixture.root.join("hashes")).unwrap();
     assert_eq!(variant(""), "key");
     assert_ne!(variant("env HOME\nenv PATH"), variant("env PATH"));
     assert_eq!(variant("env PATH"), variant("env PATH"));
@@ -302,7 +302,8 @@ fn entry_follows_the_generated_files_that_rustc_read_and_no_others() {
     assert_eq!(reads, format!("file {TARGET}debug/build/foo/run/out/read.rs"));
 
     let (same, _) = fixture.generated(&second, "const N: u8 = 1;", "the second worktree");
-    let variant = |unit: &Unit| unit.variant("key", &reads, None).unwrap();
+    let variant =
+        |unit: &Unit| unit.variant("key", &reads, None, &fixture.root.join("hashes")).unwrap();
     assert_eq!(variant(&unit), variant(&same));
     let (changed, _) = fixture.generated(&second, "const N: u8 = 2;", "the second worktree");
     assert_ne!(variant(&unit), variant(&changed));
@@ -1762,6 +1763,36 @@ fn own_crate_whose_source_changes_while_it_compiles_is_never_stored() {
 }
 
 #[test]
+fn walk_of_a_settled_package_is_remembered_until_one_of_its_files_changes() {
+    let fixture = own("walk");
+    let root = fixture.root.join("a");
+    let args = fixture.args(&fixture.worktree("a", "metadata"));
+    let worktree = Some(root.display().to_string());
+    let mut unit = Unit::model(&args, fixture.cargo_home.clone(), None, worktree).unwrap();
+    unit.package = Some(root.clone());
+    fs::create_dir_all(root.join("tests/data")).unwrap();
+    write_source(&root.join("lib.rs"), "pub fn a() {}");
+    write_source(&root.join("tests/data/case.txt"), "one");
+    let (memos, reads) =
+        (fixture.root.join("hashes"), format!("file {WORKTREE}/lib.rs\ntree {WORKTREE}"));
+    let variant = || unit.variant("key", &reads, None, &memos).unwrap();
+    let first = variant();
+    assert!(!memos.exists(), "a file whose ctime is new is not remembered");
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(variant(), first);
+    let memo = Vec::from_iter(fs::read_dir(&memos).unwrap().map(|entry| entry.unwrap().path()));
+    assert_eq!(memo.len(), 1);
+    fs::write(&memo[0], [7; 32]).unwrap();
+    let recalled = variant();
+    assert_ne!(recalled, first, "a walk that finds the same entries reads its memo");
+
+    // The write keeps the length and the mtime of a minute ago, but sets the ctime.
+    write_source(&root.join("tests/data/case.txt"), "two");
+    let changed = variant();
+    assert!(changed != first && changed != recalled);
+}
+
+#[test]
 fn own_crate_is_selected_only_by_sources_that_exist_and_were_read() {
     let fixture = own("unread");
     let root = fixture.root.join("a");
@@ -1774,12 +1805,23 @@ fn own_crate_is_selected_only_by_sources_that_exist_and_were_read() {
     .unwrap();
     write_source(&root.join("lib.rs"), "pub fn a() {}");
     let source = format!("file {WORKTREE}/lib.rs");
-    assert!(unit.variant("key", &source, Some(SystemTime::now())).is_ok());
-    assert_eq!(unit.variant("key", "", None), Err("no-source-read"));
-    assert_eq!(unit.variant("key", "env PATH", None), Err("no-source-read"));
+    assert!(
+        unit.variant("key", &source, Some(SystemTime::now()), &fixture.root.join("hashes")).is_ok()
+    );
+    assert_eq!(unit.variant("key", "", None, &fixture.root.join("hashes")), Err("no-source-read"));
+    assert_eq!(
+        unit.variant("key", "env PATH", None, &fixture.root.join("hashes")),
+        Err("no-source-read")
+    );
     let missing = format!("{source}\nfile {WORKTREE}/missing.rs");
-    assert_eq!(unit.variant("key", &missing, None), Err("unreadable-read"));
-    assert_eq!(unit.variant("key", &format!("{source}\nfile"), None), Err("unreadable-read"));
+    assert_eq!(
+        unit.variant("key", &missing, None, &fixture.root.join("hashes")),
+        Err("unreadable-read")
+    );
+    assert_eq!(
+        unit.variant("key", &format!("{source}\nfile"), None, &fixture.root.join("hashes")),
+        Err("unreadable-read")
+    );
 
     // An entry stored under its bare key, as one that read no source is, is never restored for an own crate.
     assert_eq!(own_build(&fixture, "b", "pub fn a() {}").0, Ok(("miss".to_string(), 0)));
@@ -2804,46 +2846,50 @@ fn a_remembered_hash_is_read_from_its_memo_until_the_file_changes() {
 }
 
 #[test]
-fn a_tree_hashes_as_it_did_sequentially_and_remembers_only_a_file_that_is_not_utf8() {
+fn a_tree_hashes_alike_under_its_roots_and_is_remembered_under_its_listing() {
     let fixture = own("tree");
-    let tree = fixture.root.join("target/debug/build/dep/out");
-    let roots = Roots {
-        target: format!("{}/", fixture.root.join("target").display()),
-        cargo_home: "/home/dev/.cargo/".to_string(),
-        worktree: None,
+    let tree_in = |target: &Path| {
+        let tree = target.join("debug/build/dep/out");
+        fs::create_dir_all(tree.join("lib")).unwrap();
+        fs::write(tree.join("lib/libnative.a"), [0xff_u8, 0, 1, 2]).unwrap();
+        fs::write(tree.join("lib/native.pc"), format!("prefix={}", tree.display())).unwrap();
+        std::os::unix::fs::symlink("lib/libnative.a", tree.join("link")).unwrap();
+        let roots = Roots {
+            target: format!("{}/", target.display()),
+            cargo_home: "/home/dev/.cargo/".to_string(),
+            worktree: None,
+        };
+        (tree, roots)
     };
-    fs::create_dir_all(tree.join("lib")).unwrap();
-    fs::write(tree.join("lib/libnative.a"), [0xff_u8, 0, 1, 2]).unwrap();
-    fs::write(tree.join("lib/native.pc"), format!("prefix={}", tree.display())).unwrap();
-    std::os::unix::fs::symlink("lib/libnative.a", tree.join("link")).unwrap();
-    let fed = |memos: &Path| {
+    let fed = |(tree, roots): &(PathBuf, Roots), memos: &Path| {
         let mut fields = Vec::new();
-        unit::hash_tree(&roots, &tree, memos, &mut |bytes| fields.push(bytes.to_vec())).unwrap();
+        unit::hash_tree(roots, tree, memos, &mut |bytes| fields.push(bytes.to_vec())).unwrap();
         fields
     };
-    let text = roots.normalized(&format!("prefix={}", tree.display()));
-    let (binary, text) = (blake3::hash(&[0xff, 0, 1, 2]), blake3::hash(text.as_bytes()));
-    let sequential = [
-        &b"lib"[..],
-        b"lib/libnative.a",
-        binary.as_bytes(),
-        b"lib/native.pc",
-        text.as_bytes(),
-        b"link",
-        b"lib/libnative.a",
-    ];
+    let (first, other) =
+        (tree_in(&fixture.root.join("target")), tree_in(&fixture.root.join("other")));
     let memos = fixture.root.join("memos");
-    assert_eq!(fed(&memos), sequential);
-    assert!(!memos.exists(), "a file that changed in the last second is not remembered");
+    let hashed = fed(&first, &memos);
+    assert_eq!(hashed.len(), 1);
+    assert!(!memos.exists(), "a tree that changed in the last second is not remembered");
+    assert_eq!(
+        fed(&other, &fixture.root.join("other-memos")),
+        hashed,
+        "the roots enter as placeholders"
+    );
     thread::sleep(Duration::from_secs(2));
-    assert_eq!(fed(&memos), sequential);
-    let memo = Vec::from_iter(fs::read_dir(&memos).unwrap().flatten());
-    assert_eq!(memo.len(), 1, "only the file that is not UTF-8 is remembered");
-    fs::write(memo[0].path(), blake3::hash(b"remembered").as_bytes()).unwrap();
-    assert_eq!(fed(&memos)[2], blake3::hash(b"remembered").as_bytes());
+    assert_eq!(fed(&first, &memos), hashed);
+    let remembered = Vec::from_iter(fs::read_dir(&memos).unwrap().flatten());
+    assert_eq!(remembered.len(), 2, "the tree and the file that is not UTF-8 are remembered");
+    for memo in &remembered {
+        fs::write(memo.path(), blake3::hash(b"remembered").as_bytes()).unwrap();
+    }
+    assert_eq!(fed(&first, &memos), [blake3::hash(b"remembered").as_bytes()]);
     thread::sleep(Duration::from_millis(20));
-    fs::write(tree.join("lib/libnative.a"), [0xff_u8, 3]).unwrap();
-    assert_eq!(fed(&memos)[2], blake3::hash(&[0xff, 3]).as_bytes());
+    fs::write(first.0.join("lib/native.pc"), "prefix=/elsewhere").unwrap();
+    let changed = fed(&first, &memos);
+    assert_ne!(changed, [blake3::hash(b"remembered").as_bytes()]);
+    assert_ne!(changed, hashed);
 }
 
 /// A fixture whose stand-in writes the source that it compiles into the `.rlib`.

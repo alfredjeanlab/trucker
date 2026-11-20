@@ -150,18 +150,20 @@ impl Files {
 
     /// Writes the tree of `from` into `to` through [`Files::duplicate`], so a file of `to` is a snapshot that a write
     /// in place to the other tree never reaches.
+    ///
+    /// The files are duplicated on every core, because a session holds an object for each codegen unit, and the first
+    /// compile of a crate in a worktree waits for its session.
     #[cfg(unix)]
     pub fn duplicate_tree(self, from: &Path, to: &Path) -> io::Result<()> {
         fs::create_dir_all(to)?;
-        for (path, kind) in tree(from)? {
-            let (source, destination) = (from.join(&path), to.join(&path));
-            if kind.is_dir() {
-                fs::create_dir_all(destination)
-            } else {
-                self.duplicate(&source, &destination)
-            }?;
+        let (directories, files): (Vec<_>, Vec<_>) =
+            tree(from)?.into_iter().partition(|(_, kind)| kind.is_dir());
+        for (path, _) in directories {
+            fs::create_dir_all(to.join(path))?;
         }
-        Ok(())
+        let duplicate =
+            |(path, _): &(PathBuf, fs::FileType)| self.duplicate(&from.join(path), &to.join(path));
+        crate::unit::on_every_core(&files, duplicate).map(drop)
     }
 }
 
@@ -346,7 +348,12 @@ pub fn publish(
 ) -> Result<(), &'static str> {
     let staging = entries.join(format!("{key}.{}", std::process::id()));
     let stored = stage(unit, &staging, stderr, record, files).and_then(|reads| {
-        let entry = entries.join(unit.variant(key, &reads, Some(started))?);
+        let entry = entries.join(unit.variant(
+            key,
+            &reads,
+            Some(started),
+            &entries.with_file_name("hashes"),
+        )?);
         commit(entries, key, &reads, &staging, &entry)
     });
     let _ = fs::remove_dir_all(&staging);

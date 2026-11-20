@@ -457,6 +457,12 @@ pub mod session {
     /// Does nothing, because no compile on Windows runs its linker through trucker.
     pub fn link() {}
 
+    /// Does nothing, because no reader is started on Windows.
+    pub fn read() {}
+
+    /// Does nothing, because the page cache of a clone on Windows is not measured.
+    pub fn read_later(_: &Unit, _: &Path) {}
+
     /// Whether a compile of an own crate would be carried but for ThinLTO, which never holds without sessions.
     pub fn local_thin_lto(_: &[String]) -> bool {
         false

@@ -41,6 +41,7 @@ use unit::Unit;
 
 fn main() {
     script::dispatch();
+    session::read();
     session::link();
     let args = Vec::from_iter(env::args_os().skip(1));
     let Some((rustc, rest)) = args.split_first() else { usage() };
@@ -137,7 +138,11 @@ fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
     let remap = unit.as_ref().map_or_else(|_| Vec::new(), Unit::remap);
     let outcome = match unit {
         _ if local.is_some() && worktree.is_none() => Err("no-repository"),
-        Ok(unit) => cached(rustc, args, store, &unit, &mut io::stderr()),
+        Ok(unit) => cached(rustc, args, store, &unit, &mut io::stderr()).inspect(|(outcome, _)| {
+            if outcome.starts_with("hit") {
+                session::read_later(&unit, store);
+            }
+        }),
         Err(reason) => Err(reason),
     };
     let (outcome, code) = outcome.unwrap_or_else(|reason| {
@@ -191,7 +196,7 @@ fn cached(
     let key = unit.key(rustc, args, store, env::vars_os()).map_err(|_| "unreadable-input")?;
     let current_entry = || {
         let reads = fs::read_to_string(store::reads_of(&entries, &key)).unwrap_or_default();
-        unit.variant(&key, &reads, None).ok().map(|name| entries.join(name))
+        unit.variant(&key, &reads, None, &store.join("hashes")).ok().map(|name| entries.join(name))
     };
     let mut entry = current_entry();
     // A process that finds no entry compiles under the key's lock, so that every worktree stores the same bytes.

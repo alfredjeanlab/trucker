@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -149,8 +150,9 @@ impl Slot {
             _lock: lock,
         };
         slot.mirror().ok()?;
+        let mut ahead = Vec::new();
         if slot.links {
-            slot.share_libraries(args).ok()?;
+            ahead = slot.share_libraries(args).ok()?;
         }
         let input = args.iter().find(|arg| arg.ends_with(".rs") && !arg.starts_with('-'))?;
         let mirrored = |path: &str| slot.directory.join(slot.rewrite(path)).exists();
@@ -166,6 +168,13 @@ impl Slot {
                 .and_then(|()| fs::write(slot.sessions.join(SLOT), number.to_string()));
             written.ok()?;
         }
+        // A carried session is a clone, and rustc reads it from the start of the compile, so it is read first.
+        if slot.restored {
+            let session = crate::store::tree(&slot.sessions).unwrap_or_default().into_iter();
+            let files = session.filter(|(_, kind)| kind.is_file());
+            ahead.splice(0..0, files.map(|(path, _)| slot.sessions.join(path)));
+        }
+        read_ahead(ahead);
         Some(slot)
     }
 
@@ -215,7 +224,7 @@ impl Slot {
     }
 
     /// Makes [`LIBRARIES`] share only the libraries in the worktree directories that `args` search or name with
-    /// `--extern`.
+    /// `--extern`, and returns those that it shared anew.
     ///
     /// AGENTS.md says why a linking session needs them and why a hard link is safe. [`Slot::links_libraries`] says
     /// where they are hard-linked rather than cloned. The libraries stay between compiles, so a replaced library stays
@@ -227,7 +236,7 @@ impl Slot {
     /// libraries are removed where it is missing.
     /// A clone also stays where its remembered hash matches that of its library, as after a new worktree restores the
     /// libraries, because a new clone is read from disk again.
-    fn share_libraries(&self, args: &[String]) -> io::Result<()> {
+    fn share_libraries(&self, args: &[String]) -> io::Result<Vec<PathBuf>> {
         let (prefix, started) = (format!("{}/", self.worktree), crate::now() as i64);
         let directories =
             args.iter().enumerate().filter_map(|(at, arg)| match arg.split_once('=') {
@@ -240,10 +249,6 @@ impl Slot {
         let mut directories = Vec::from_iter(directories.filter_map(|d| d.strip_prefix(&prefix)));
         directories.sort();
         directories.dedup();
-        let library = |path: &Path| {
-            path.extension()
-                .is_some_and(|kind| ["rlib", "rmeta", "so", "dylib"].iter().any(|k| kind == *k))
-        };
         let libraries = Path::new(&self.path).join(LIBRARIES);
         let manifest = self.pool.join(format!("{}.libraries", self.number));
         let text = fs::read_to_string(&manifest);
@@ -257,7 +262,7 @@ impl Slot {
             Some(kept) => kept,
             None => absent(fs::remove_dir_all(&libraries)).map(|()| HashMap::new())?,
         };
-        let mut written = String::new();
+        let (mut written, mut shared) = (String::new(), Vec::new());
         let record = |name: &Path, file: &fs::Metadata, copy: &Path| -> io::Result<String> {
             Ok(match file.ctime().saturating_add(1) < started {
                 true => format!("{}\t{}\t{}\n", name.display(), identity_of(file), identity(copy)?),
@@ -273,7 +278,7 @@ impl Slot {
                 let copy = libraries.join(&name);
                 // A file that another compile removes meanwhile is not a library of this one.
                 let file = match fs::metadata(&path) {
-                    Ok(file) if library(&path) => file,
+                    Ok(file) if is_library(&path) => file,
                     Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
                     _ => continue,
                 };
@@ -299,8 +304,9 @@ impl Slot {
                     absent(fs::remove_file(&copy))?;
                     match self.share_library(&file, &path, &copy) {
                         Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                        shared => shared?,
+                        result => result?,
                     }
+                    shared.push(copy.clone());
                 }
                 written += &record(&name, &file, &copy)?;
                 named.insert(copy);
@@ -317,7 +323,8 @@ impl Slot {
             absent(fs::remove_file(libraries.join(name)))?;
         }
         let staging = self.pool.join(format!("{}.libraries.{}", self.number, std::process::id()));
-        fs::write(&staging, written).and_then(|()| fs::rename(&staging, &manifest))
+        fs::write(&staging, written).and_then(|()| fs::rename(&staging, &manifest))?;
+        Ok(shared)
     }
 
     /// Whether the slot hard-links its libraries rather than cloning them.
@@ -639,6 +646,77 @@ fn link_remembered(library: &Path, copy: &Path, memos: &Path) -> io::Result<()> 
         let _ = crate::unit::remember(memos, &identity_of(&after), &hash);
     }
     Ok(())
+}
+
+/// Reads `files` on threads of their own while rustc runs, so that rustc and the link find them in the page cache.
+///
+/// AGENTS.md says why a restored library or session is not in the page cache. The threads only read, and end with the
+/// process.
+fn read_ahead(files: Vec<PathBuf>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if files.is_empty() {
+        return;
+    }
+    let (files, next) = (Arc::new(files), Arc::new(AtomicUsize::new(0)));
+    for _ in 0..READ_AHEAD_THREADS.min(files.len()) {
+        let (files, next) = (Arc::clone(&files), Arc::clone(&next));
+        let _ = std::thread::Builder::new().spawn(move || {
+            let mut buffer = vec![0; 1 << 20];
+            while let Some(file) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                read_through(file, &mut buffer);
+            }
+        });
+    }
+}
+
+/// The number of threads that [`read_ahead`] reads on, which leaves the other cores to rustc.
+const READ_AHEAD_THREADS: usize = 4;
+
+fn read_through(path: &Path, buffer: &mut [u8]) {
+    use std::io::Read;
+    if let Ok(mut file) = fs::File::open(path) {
+        while file.read(buffer).is_ok_and(|read| read > 0) {}
+    }
+}
+
+/// The variable that names the files to read, one per line, when this program runs as the reader that [`read_later`]
+/// starts.
+const READER: &str = "TRUCKER_READ";
+
+/// Starts this program in the background to read the libraries that a hit restored for `unit`, where the store in
+/// `store` clones them.
+///
+/// A clone has a page cache of its own, so the first link in a new worktree would read every library from disk again,
+/// as AGENTS.md says. The reader only reads, and neither the hit nor cargo waits for it.
+pub fn read_later(unit: &Unit, store: &Path) {
+    use std::process::Stdio;
+    let outputs = unit.outputs().unwrap_or_default().into_iter().filter(|path| is_library(path));
+    let paths = Vec::from_iter(outputs.map(|path| path.into_os_string().into_vec()));
+    if paths.is_empty() || crate::store::Files::probe(store) != Files::Clones {
+        return;
+    }
+    let Ok(wrapper) = env::current_exe() else { return };
+    let list = OsString::from_vec(paths.join(&b'\n'));
+    let mut command = Command::new(wrapper);
+    command.env(READER, list).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let _ = command.spawn();
+}
+
+/// Reads the files that [`READER`] names and exits, where [`read_later`] started this process.
+pub fn read() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(list) = env::var_os(READER) else { return };
+    let mut buffer = vec![0; 1 << 20];
+    for path in list.as_bytes().split(|byte| *byte == b'\n') {
+        read_through(Path::new(std::ffi::OsStr::from_bytes(path)), &mut buffer);
+    }
+    std::process::exit(0)
+}
+
+/// Whether `path` names a library that rustc or the linker reads.
+fn is_library(path: &Path) -> bool {
+    path.extension().is_some_and(|kind| ["rlib", "rmeta", "so", "dylib"].iter().any(|k| kind == *k))
 }
 
 /// The marker in `out/` of `store` that keeps the crate compiled with `args` from being carried in any of its pools.

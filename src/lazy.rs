@@ -264,7 +264,7 @@ pub fn record(
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         files.push((name, text.into_bytes()));
     }
-    let variant = unit.variant(key, &reads, Some(started))?;
+    let variant = unit.variant(key, &reads, Some(started), &entries.with_file_name("hashes"))?;
     let printable =
         outputs.iter().all(|output| output.to_str().is_some_and(|text| !text.contains('\n')));
     let shapes = outputs.iter().map(|output| shape(output)).collect::<Option<Vec<_>>>();
