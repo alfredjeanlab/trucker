@@ -1,0 +1,24 @@
+mbx · since 2026-11-21
+store: /home/ops/trucker-bench/cache/mbx/actions
+
+compiler time avoided    3m 58s (estimated)
+builds                   16
+cache hits               208
+compilations             208 hits, 69 misses, 3661 not looked up, 323 bypassed since 2026-11-21
+pruned by mbx            0 B logical
+  targets / cache        0 B logical / 0 B logical
+automatically pruned     0 B logical since 2026-11-21
+requested removals       0 B logical
+copying avoided          1013.0 MiB (cumulative)
+
+shared cache             6.0 GiB in 9252 objects
+managed targets          4 (55.7 GiB)
+live workspaces          1
+with separate caches     4.8 GiB
+duplication avoided      at least 0 B (estimated)
+
+Sharing is a lower-bound estimate of logical cache bytes, excluding targets.
+Pruned totals are logical file sizes, not physical space reclaimed; requested removals are separate.
+Compiler time and copying avoided are cumulative, not wall time or current disk savings.
+
+208 compilations served reheated. rustc can finish its coffee.

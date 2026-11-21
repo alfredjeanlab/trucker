@@ -1,0 +1,94 @@
+# Sourced by bench/sentinel: sqlx's query! macro in offline mode, which reads the description of each query from
+# `.sqlx/query-<hash>.json` instead of a database. The macro reads that file without declaring it to cargo, so a
+# change of the file alone is plain cargo's own blind spot. Worktrees A and B have the same Rust sources, but B's
+# commit makes a column nullable in `.sqlx`, which changes the type that the macro generates. Each of A and B builds
+# with trucker and with plain cargo in a worktree of its own, P and Q, and a third worktree C of A's commit builds
+# with trucker after B. Then A and P change `.sqlx` in place as B's
+# commit does, and build again. The program prints the type and value of the column from an in-memory database.
+# shellcheck shell=bash disable=SC2154
+rm -rf "$work"
+mkdir -p "$work/repo/src" "$work/repo/.sqlx"
+query="SELECT id, name FROM users"
+hash=$(printf '%s' "$query" | sha256sum | cut -d' ' -f1)
+cat > "$work/repo/Cargo.toml" << 'EOF'
+[package]
+name = "sentinel-sqlx"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "macros", "runtime-tokio"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+EOF
+cat > "$work/repo/src/main.rs" << 'EOF'
+// The type that query! gives the name column follows the nullability that `.sqlx` records for it.
+fn type_of<T>(_: &T) -> &'static str {
+    std::any::type_name::<T>()
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::query("CREATE TABLE users (id INTEGER NOT NULL, name TEXT NOT NULL)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO users VALUES (1, 'sentinel')").execute(&pool).await.unwrap();
+    let row = sqlx::query!("SELECT id, name FROM users").fetch_one(&pool).await.unwrap();
+    println!("name: {} = {:?}", type_of(&row.name), row.name);
+}
+EOF
+# The description that sqlx prepare writes, with the name column's nullability as $1.
+describe() {
+  printf '{\n  "db_name": "SQLite",\n  "query": "%s",\n  "describe": {\n    "columns": [\n' "$query"
+  printf '      {"name": "id", "ordinal": 0, "type_info": "Integer"},\n'
+  printf '      {"name": "name", "ordinal": 1, "type_info": "Text"}\n    ],\n'
+  printf '    "parameters": {"Right": 0},\n    "nullable": [false, %s]\n  },\n  "hash": "%s"\n}\n' "$1" "$hash"
+}
+describe false > "$work/repo/.sqlx/query-$hash.json"
+git -C "$work/repo" init -q
+ONLINE=1 cargo_with none "$work/repo" generate-lockfile -q
+ONLINE=1 cargo_with none "$work/repo" fetch -q
+git -C "$work/repo" add -A
+fixed_git -C "$work/repo" commit -q -m "The sentinel"
+git -C "$work/repo" branch -q a
+describe true > "$work/repo/.sqlx/query-$hash.json"
+fixed_git -C "$work/repo" commit -qam "A nullable name"
+git -C "$work/repo" branch -q b
+cp "$work/repo/Cargo.lock" "$out/logs/sentinel.$name.Cargo.lock"
+for w in a:a p:a b:b q:b c:a; do
+  git -C "$work/repo" -c advice.detachedHead=false worktree add -q --detach "$work/${w%%:*}" "${w##*:}"
+done
+EXTRA_ENV=(SQLX_OFFLINE=true)
+sleep 1.5
+sqlx_output() { "$1/target/debug/sentinel-sqlx" 2>&1 || echo "exit $?"; }
+step a-cold trucker "$work/a" build
+step a-cold none "$work/p" build
+step b-cross trucker "$work/b" build
+step b-cross none "$work/q" build
+step c-same trucker "$work/c" build
+c0=$(sqlx_output "$work/c")
+# C's lines of the store's log, which the record of its step names.
+read -r first last < <(tail -n 1 "$out/sentinels.jsonl" | python3 -I -c 'import json, sys; print(*json.load(sys.stdin)["store_lines"])')
+c_misses=$(awk -v a="$first" -v b="$last" 'NR >= a && NR <= b' "$out/logs/sentinel.$name.store.log" | grep -c ' miss' || true)
+a0=$(sqlx_output "$work/a"); p0=$(sqlx_output "$work/p"); b0=$(sqlx_output "$work/b"); q0=$(sqlx_output "$work/q")
+for d in "$work/a" "$work/p"; do describe true > "$d/.sqlx/query-$hash.json"; done
+sleep 1.5
+step a-edited trucker "$work/a" build
+step a-edited none "$work/p" build
+a1=$(sqlx_output "$work/a"); p1=$(sqlx_output "$work/p")
+EXTRA_ENV=()
+printf 'A (trucker):\n%s\nP (plain, as A):\n%s\nB (trucker, nullable):\n%s\nQ (plain, as B):\n%s\nC (trucker, as A):\n%s\nA after the edit of .sqlx:\n%s\nP after the edit of .sqlx:\n%s\n' \
+  "$a0" "$p0" "$b0" "$q0" "$c0" "$a1" "$p1" > "$out/logs/sentinel.$name.outputs"
+problems=()
+[ "$a0" = "$p0" ] || problems+=("A's output differs from plain cargo's")
+[ "$b0" = "$q0" ] || problems+=("B's output differs from plain cargo's: trucker gave '$b0', plain cargo '$q0'")
+[ "$b0" != "$a0" ] || problems+=("B gave A's output")
+[ "$c0" = "$a0" ] || problems+=("C's output differs from A's")
+[ "$a1" = "$p1" ] || problems+=("after the edit of .sqlx, A's output differs from plain cargo's")
+case $a0$b0$q0 in *"exit "* | *rror*) problems+=("a program failed") ;; esac
+blind="plain cargo after the edit of .sqlx in place: $([ "$p1" = "$p0" ] && echo "unchanged, its blind spot" || echo "changed")"
+if [ ${#problems[@]} -eq 0 ]; then
+  verdict pass "B gave '$b0' as plain cargo did, A '$a0'; C as A with $c_misses misses; $blind"
+else
+  verdict fail "$(IFS='; '; echo "${problems[*]}"); $blind"
+fi
+XDG_CACHE_HOME="$work/cache" "$trucker" stats > "$out/logs/sentinel.$name.stats" 2>&1 || true

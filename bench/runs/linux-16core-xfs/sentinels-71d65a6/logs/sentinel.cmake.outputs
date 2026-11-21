@@ -1,0 +1,14 @@
+A cold:
+zlib-ng round trip: sentinel built through cmake (36 bytes)
+P cold:
+zlib-ng round trip: sentinel built through cmake (36 bytes)
+B fresh:
+zlib-ng round trip: sentinel built through cmake (36 bytes)
+B changed:
+edited
+zlib-ng round trip: sentinel built through cmake (36 bytes)
+P changed:
+edited
+zlib-ng round trip: sentinel built through cmake (36 bytes)
+A after:
+zlib-ng round trip: sentinel built through cmake (36 bytes)

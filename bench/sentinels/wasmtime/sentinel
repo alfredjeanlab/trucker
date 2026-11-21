@@ -1,0 +1,42 @@
+# Sourced by bench/sentinel: wasmtime's repository at a release, whose build scripts generate Cranelift's code. The
+# CLI builds in A, P and B, and B and P then edit a source file of the wasmtime crate.
+# shellcheck shell=bash disable=SC2154
+release_tag=v50.0.2
+mirror=$fs/sentinel-src/wasmtime
+if [ ! -d "$mirror" ]; then
+  git clone -q --depth 1 --branch "$release_tag" https://github.com/bytecodealliance/wasmtime "$mirror"
+fi
+rm -rf "$work"
+mkdir -p "$work"
+git clone -q --shared "$mirror" "$work/repo"
+ONLINE=1 cargo_with none "$work/repo" fetch -q
+worktree "$work/a"
+worktree "$work/p"
+sleep 1.5
+echo '(module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))' > "$work/add.wat"
+wasmtime_output() {
+  "$1/target/debug/wasmtime" --version 2>&1 | sed 's/ (.*//'
+  "$1/target/debug/wasmtime" run --invoke add "$work/add.wat" 2 3 2>&1 || echo "exit $?"
+}
+step cold trucker "$work/a" build
+step cold none "$work/p" build
+a0=$(wasmtime_output "$work/a")
+p0=$(wasmtime_output "$work/p")
+worktree "$work/b"
+sleep 1.5
+step fresh trucker "$work/b" build
+b0=$(wasmtime_output "$work/b")
+for d in "$work/b" "$work/p"; do printf '\n#[allow(dead_code)]\nfn _sentinel_edit() {}\n' >> "$d/crates/wasmtime/src/lib.rs"; done
+sleep 1.5
+step changed trucker "$work/b" build
+step changed none "$work/p" build
+b1=$(wasmtime_output "$work/b")
+p1=$(wasmtime_output "$work/p")
+printf 'A cold:\n%s\nP cold:\n%s\nB fresh:\n%s\nB changed:\n%s\nP changed:\n%s\n' "$a0" "$p0" "$b0" "$b1" "$p1" \
+  > "$out/logs/sentinel.$name.outputs"
+if [ "$a0" = "$p0" ] && [ "$b0" = "$p0" ] && [ "$b1" = "$p1" ] && [[ $b1 == *5* ]] && [[ $b1 != *exit* ]]; then
+  verdict pass "$(echo "$b1" | tr '\n' ' ') at $release_tag"
+else
+  verdict fail "outputs differ or the CLI failed at $release_tag"
+fi
+XDG_CACHE_HOME="$work/cache" "$trucker" stats > "$out/logs/sentinel.$name.stats" 2>&1 || true

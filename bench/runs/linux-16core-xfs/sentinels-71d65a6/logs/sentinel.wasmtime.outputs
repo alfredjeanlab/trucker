@@ -1,0 +1,25 @@
+A cold:
+wasmtime 50.0.2
+warning: using `--invoke` with a function that takes arguments is experimental and may break in the future
+warning: using `--invoke` with a function that returns values is experimental and may break in the future
+5
+P cold:
+wasmtime 50.0.2
+warning: using `--invoke` with a function that takes arguments is experimental and may break in the future
+warning: using `--invoke` with a function that returns values is experimental and may break in the future
+5
+B fresh:
+wasmtime 50.0.2
+warning: using `--invoke` with a function that takes arguments is experimental and may break in the future
+warning: using `--invoke` with a function that returns values is experimental and may break in the future
+5
+B changed:
+wasmtime 50.0.2
+warning: using `--invoke` with a function that takes arguments is experimental and may break in the future
+warning: using `--invoke` with a function that returns values is experimental and may break in the future
+5
+P changed:
+wasmtime 50.0.2
+warning: using `--invoke` with a function that takes arguments is experimental and may break in the future
+warning: using `--invoke` with a function that returns values is experimental and may break in the future
+5

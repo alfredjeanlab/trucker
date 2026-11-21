@@ -1,0 +1,9 @@
+[package]
+name = "sentinel-jemalloc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tikv-jemallocator = "0.7"
+tikv-jemalloc-ctl = "0.7"

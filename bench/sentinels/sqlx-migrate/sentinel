@@ -1,0 +1,71 @@
+# Sourced by bench/sentinel: sqlx's migrate! macro, which embeds the migrations of a directory at the workspace root
+# into a member crate. Worktrees A and B have the same Rust sources, but B's commit adds a migration. Each builds with
+# trucker and with plain cargo in a worktree of its own, P and Q. The program prints each embedded migration. The
+# verdict also says whether rustc's dep-info of the crate names the migration files, that is whether sqlx declares
+# them to cargo.
+# shellcheck shell=bash disable=SC2154
+rm -rf "$work"
+r=$work/repo
+mkdir -p "$r/crates/app/src" "$r/migrations"
+cat > "$r/Cargo.toml" << 'EOF'
+[workspace]
+members = ["crates/app"]
+resolver = "2"
+EOF
+cat > "$r/crates/app/Cargo.toml" << 'EOF'
+[package]
+name = "sentinel-migrate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "macros", "migrate"] }
+EOF
+cat > "$r/crates/app/src/main.rs" << 'EOF'
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+fn main() {
+    for m in MIGRATOR.iter() {
+        let checksum: String = m.checksum.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        println!("{} {} {checksum}", m.version, m.description);
+    }
+    println!("{} migrations", MIGRATOR.iter().count());
+}
+EOF
+echo "CREATE TABLE users (id INTEGER NOT NULL, name TEXT NOT NULL);" > "$r/migrations/20260101000000_users.sql"
+git -C "$r" init -q
+ONLINE=1 cargo_with none "$r" generate-lockfile -q
+ONLINE=1 cargo_with none "$r" fetch -q
+git -C "$r" add -A
+fixed_git -C "$r" commit -q -m "The sentinel"
+git -C "$r" branch -q a
+echo "ALTER TABLE users ADD COLUMN email TEXT;" > "$r/migrations/20260102000000_email.sql"
+git -C "$r" add -A
+fixed_git -C "$r" commit -q -m "A second migration"
+git -C "$r" branch -q b
+cp "$r/Cargo.lock" "$out/logs/sentinel.$name.Cargo.lock"
+for w in a:a p:a b:b q:b; do
+  git -C "$r" -c advice.detachedHead=false worktree add -q --detach "$work/${w%%:*}" "${w##*:}"
+done
+EXTRA_ENV=(SQLX_OFFLINE=true)
+migrate_output() { "$1/target/debug/sentinel-migrate" 2>&1 || echo "exit $?"; }
+sleep 1.5
+step a-cold trucker "$work/a" build
+step a-cold none "$work/p" build
+step b-cross trucker "$work/b" build
+step b-cross none "$work/q" build
+EXTRA_ENV=()
+a0=$(migrate_output "$work/a"); p0=$(migrate_output "$work/p"); b0=$(migrate_output "$work/b"); q0=$(migrate_output "$work/q")
+# The dep-info that rustc wrote for the crate in Q, which plain cargo built.
+deps=$(find "$work/q/target/debug" -name 'sentinel_migrate*.d' -exec grep -ho 'migrations/[^ :]*' {} + 2> /dev/null | sort -u | tr '\n' ' ')
+printf 'A (trucker):\n%s\nP (plain, as A):\n%s\nB (trucker, a second migration):\n%s\nQ (plain, as B):\n%s\ndep-info of Q names: %s\n' \
+  "$a0" "$p0" "$b0" "$q0" "${deps:-no migration file}" > "$out/logs/sentinel.$name.outputs"
+problems=()
+[ "$a0" = "$p0" ] || problems+=("A's output differs from plain cargo's")
+[ "$b0" = "$q0" ] || problems+=("B's output differs from plain cargo's: trucker gave '$(echo "$b0" | tail -1)', plain cargo '$(echo "$q0" | tail -1)'")
+case $a0$b0$q0 in *"exit "* | *rror*) problems+=("a program failed") ;; esac
+declared="the dep-info names ${deps:-no migration file}"
+if [ ${#problems[@]} -eq 0 ]; then verdict pass "B gave '$(echo "$b0" | tail -1)' as plain cargo did; $declared"
+else verdict fail "$(IFS='; '; echo "${problems[*]}"); $declared"; fi
+XDG_CACHE_HOME="$work/cache" "$trucker" stats > "$out/logs/sentinel.$name.stats" 2>&1 || true

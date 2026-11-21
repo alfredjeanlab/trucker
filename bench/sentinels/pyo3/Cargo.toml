@@ -1,0 +1,12 @@
+[package]
+name = "sentinel-pyo3"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "sentinel_pyo3"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["extension-module"] }

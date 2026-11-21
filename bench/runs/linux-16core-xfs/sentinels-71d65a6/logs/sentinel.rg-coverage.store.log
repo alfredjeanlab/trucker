@@ -1,0 +1,58 @@
+1795247378 - 23 passthrough no-crate-name
+1795247379 itoa 107 miss
+1795247379 log 109 miss
+1795247379 build_script_build 131 miss
+1795247379 serde_json/build-script 4 miss
+1795247379 build_script_build 146 miss
+1795247379 build_script_build 162 miss
+1795247379 zmij/build-script 14 miss
+1795247379 serde_core/build-script 13 miss
+1795247379 build_script_build 179 miss
+1795247379 libc/build-script 19 miss
+1795247379 termcolor 206 miss
+1795247379 glob 240 miss
+1795247379 zmij 179 miss
+1795247379 memchr 389 miss
+1795247379 grep_matcher 103 passthrough coverage
+1795247379 libc 502 miss
+1795247379 aho_corasick 779 miss
+1795247380 regex_syntax 1295 miss
+1795247380 serde_core 1210 miss
+1795247380 serde_json 614 miss
+1795247381 regex 269 miss
+1795247381 bstr 441 miss
+1795247381 regex_automata 1856 miss
+1795247382 grep_matcher 321 passthrough coverage
+1795247382 globset 518 passthrough coverage
+1795247382 integration 339 passthrough coverage
+1795247382 grep_cli 390 passthrough coverage
+1795247383 globset 1396 passthrough coverage
+1795247388 - 22 passthrough no-crate-name
+1795247388 build_script_build 3 hit
+1795247388 build_script_build 2 hit
+1795247388 log 5 hit
+1795247388 build_script_build 2 hit
+1795247388 memchr 12 hit
+1795247388 build_script_build 3 hit
+1795247388 itoa 8 hit
+1795247388 glob 10 hit
+1795247388 regex_syntax 19 hit
+1795247388 termcolor 8 hit
+1795247388 aho_corasick 16 hit
+1795247388 serde_json/build-script 32 hit
+1795247388 zmij/build-script 36 hit
+1795247388 regex_automata 21 hit
+1795247388 libc/build-script 27 hit
+1795247388 serde_core/build-script 29 hit
+1795247388 zmij 8 hit
+1795247388 regex 10 hit
+1795247388 bstr 13 hit
+1795247388 libc 14 hit
+1795247388 serde_core 14 hit
+1795247388 serde_json 9 hit
+1795247388 grep_matcher 140 passthrough coverage
+1795247389 grep_matcher 294 passthrough coverage
+1795247389 integration 362 passthrough coverage
+1795247389 globset 504 passthrough coverage
+1795247389 grep_cli 424 passthrough coverage
+1795247390 globset 1288 passthrough coverage

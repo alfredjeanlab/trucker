@@ -1,0 +1,2 @@
+project cargo-vendored: 3acc79c0c841844675bc53a605922dbfc441e750
+project zed: 2de9e435a5d98657f35c260b5f4dd0979df659e6

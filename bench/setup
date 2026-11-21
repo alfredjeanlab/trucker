@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Installs the tools that bench/run compares and fetches the projects that it builds, so that each timed build runs
+# offline:
+#
+#   bench/setup <root> [<locks>]
+#
+# - <root>/bin gets sccache, mbx and kache, each from its release with the published checksum, and trucker built from
+#   the commit of this repository that is checked out.
+# - <root>/src gets each project as a repository of its own with a branch named bench, at the release or commit that
+#   the published results used. cargo-vendored is a clone of cargo, which bench/run builds with a vendored OpenSSL.
+# - The crate sentinels, sqlx and wasm become projects too, each committed with fixed dates. <locks> is a directory of
+#   `<name>.Cargo.lock`, as a run's `locks/` keeps them, so that each commit is the one that the run built.
+# - <root>/cargo gets every crate that the projects depend on.
+set -euo pipefail
+
+here=$(realpath "$(dirname "$0")")
+repo=$(git -C "$here" rev-parse --show-toplevel)
+mkdir -p "$1/bin" "$1/download" "$1/src" "$1/cargo"
+root=$(realpath "$1")
+locks=${2:+$(realpath "$2")}
+toolchain=${RUSTUP_TOOLCHAIN:-1.100.0}
+
+sccache=v0.19.0
+mbx=v1.30.0
+kache=v2.2.0
+
+# Each archive is checked against its release's checksum before anything is extracted from it.
+cd "$root/download"
+if [ ! -x "$root/bin/sccache" ]; then
+  archive=sccache-$sccache-x86_64-unknown-linux-musl.tar.gz
+  curl -sSfLO "https://github.com/mozilla/sccache/releases/download/$sccache/$archive"
+  curl -sSfLO "https://github.com/mozilla/sccache/releases/download/$sccache/$archive.sha256"
+  echo "$(cat "$archive.sha256")  $archive" | sha256sum --check --strict -
+  tar -xzf "$archive" --strip-components 1 -C "$root/bin" "${archive%.tar.gz}/sccache"
+fi
+if [ ! -x "$root/bin/mbx" ]; then
+  archive=mbx-x86_64-unknown-linux-gnu.tar.gz
+  curl -sSfLO "https://github.com/jdx/mr-boxington/releases/download/$mbx/$archive"
+  curl -sSfLO "https://github.com/jdx/mr-boxington/releases/download/$mbx/SHA256SUMS"
+  grep "  $archive$" SHA256SUMS | sha256sum --check --strict -
+  tar -xzf "$archive" -C "$root/bin" mbx
+fi
+if [ ! -x "$root/bin/kache" ]; then
+  archive=kache-x86_64-unknown-linux-musl.tar.gz
+  curl -sSfLO "https://github.com/kunobi-ninja/kache/releases/download/$kache/$archive"
+  curl -sSfLO "https://github.com/kunobi-ninja/kache/releases/download/$kache/$archive.sha256"
+  sha256sum --check --strict "$archive.sha256"
+  tar -xzf "$archive" -C "$root/bin" kache kache-engine
+fi
+# The rg-coverage sentinel runs cargo llvm-cov, which bench/sentinel finds in ~/.cargo/bin.
+if ! cargo llvm-cov --version > /dev/null 2>&1; then
+  RUSTC_WRAPPER= cargo install -q --locked cargo-llvm-cov --version 0.9.2
+  rustup component add --toolchain "$toolchain" llvm-tools-preview
+fi
+# trucker is built without itself, so that its own store starts empty.
+RUSTC_WRAPPER= CARGO_TARGET_DIR="$root/download/trucker-target" RUSTUP_TOOLCHAIN=$toolchain \
+  cargo build --release --locked --manifest-path "$repo/Cargo.toml" -q
+cp "$root/download/trucker-target/release/trucker" "$root/bin/trucker"
+
+# A depth of 40 keeps enough history for the build of an older commit.
+cd "$root/src"
+clone() {
+  local name=$1 url=$2 commit=$3 depth=${4:-40}
+  [ -d "$name" ] && return
+  git init -q "$name"
+  git -C "$name" fetch -q --depth "$depth" "$url" "$commit"
+  git -C "$name" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  git -C "$name" branch -q bench
+}
+clone ripgrep https://github.com/BurntSushi/ripgrep e89fff89ac9af12e8d4ce9d5fd07beb408ca730f &      # 15.2.0
+clone cargo https://github.com/rust-lang/cargo 3acc79c0c841844675bc53a605922dbfc441e750 &           # 0.101.0
+clone serde https://github.com/serde-rs/serde 7fc3b4c30c94f73a96ebd1553f2b090d928fc3a8 &            # v1.0.229
+clone rust https://github.com/rust-lang/rust 6b503e798d0cc01ca1052eeefaccee43893b0ff6 1 &           # 1.100.0
+clone ruff https://github.com/astral-sh/ruff c91de8a012cb87efe279b762020a0d28dd75ddb5 &             # 0.17.5
+clone sccache https://github.com/mozilla/sccache 965c01943a40c9df96264474bbe28ba98f2e1487 &         # v0.19.0
+clone mr-boxington https://github.com/jdx/mr-boxington 2299ea69519d142d85b5903cbd0e2690419b7bed &   # v1.30.0
+clone nushell https://github.com/nushell/nushell a4819256a2d875ca42c8600242388da291f3beaa &         # 0.117.0
+clone uv https://github.com/astral-sh/uv 6b2d39dcc390293d51c9c0d2bbcd650f4bcbfdce &                 # 0.13.9
+clone zed https://github.com/zed-industries/zed 2de9e435a5d98657f35c260b5f4dd0979df659e6 1 &        # 1.29.2
+clone trucker "file://$repo" 2badd3cdaea8feb1a9dae6014f5d41c0cff44396 &     # the initial commit, which later rewrites keep
+wait
+[ -d cargo-vendored ] || git clone -q --branch bench cargo cargo-vendored
+if [ ! -d wasmtime ]; then
+  git clone -q --depth 1 --branch v50.0.2 https://github.com/bytecodealliance/wasmtime wasmtime
+  git -C wasmtime branch -q bench
+fi
+
+# The rust repository is built only in src/tools/rust-analyzer, which is a cargo workspace of its own. Its bootstrap
+# passes an outer RUSTC_WRAPPER on through RUSTC_WRAPPER_REAL, but compiles the compiler with its stage0 rustc, 1.99
+# for the 1.100.0 release, which trucker runs untouched, and mbx works only through `mbx build`.
+export CARGO_HOME=$root/cargo RUSTUP_TOOLCHAIN=$toolchain RUSTC_WRAPPER=
+# Scenario 3 of bench/run also builds the six commits before each release, so their crates are fetched too.
+for workspace in ripgrep cargo serde rust/src/tools/rust-analyzer ruff sccache mr-boxington trucker nushell uv; do
+  (
+    cd "$workspace"
+    for commit in $(git rev-list --first-parent -n 7 HEAD); do
+      git -c advice.detachedHead=false checkout -q "$commit"
+      cargo fetch --locked -q || cargo fetch -q || echo "cannot fetch $workspace at $commit" >&2
+    done
+    git checkout -q bench
+  )
+done
+for workspace in zed wasmtime; do (cd "$workspace" && cargo fetch --locked -q); done
+
+# The helpers of bench/sentinel that the head of a sentinel's script calls. A lockfile comes from <locks> where it has
+# one for the project in $lock.
+fixed_git() {
+  GIT_AUTHOR_NAME=bench GIT_AUTHOR_EMAIL=bench@localhost GIT_COMMITTER_NAME=bench GIT_COMMITTER_EMAIL=bench@localhost \
+    GIT_AUTHOR_DATE=2026-11-19T00:00:00Z GIT_COMMITTER_DATE=2026-11-19T00:00:00Z git "$@"
+}
+cargo_with() {
+  local dir=$2
+  shift 2
+  if [ "$1" = generate-lockfile ] && [ -f "$lock" ]; then
+    cp "$lock" "$dir/Cargo.lock"
+  else
+    env -C "$dir" cargo "$@"
+  fi
+}
+for n in bevy cmake cxx embed jemalloc openssl prost pyo3 rocksdb rustls vergen; do
+  [ -d "$n" ] && continue
+  lock=${locks:-/nonexistent}/$n.Cargo.lock
+  cp -r "$here/sentinels/$n" "$n"
+  git -C "$n" init -q
+  cargo_with none "$n" generate-lockfile -q
+  git -C "$n" add -A
+  fixed_git -C "$n" commit -q -m "The sentinel"
+  git -C "$n" branch -q bench
+  cargo_with none "$n" fetch --locked -q
+done
+# sqlx and wasm are the repositories that the head of their sentinel's script makes, up to its first commit.
+for n in sqlx wasm; do
+  [ -d "$n" ] && continue
+  lock=${locks:-/nonexistent}/$n.Cargo.lock
+  work=$root/setup-$n
+  # shellcheck source=/dev/null
+  . <(sed '/commit -q -m "The sentinel"/q' "$here/sentinels/$n/sentinel")
+  mv "$work/repo" "$n"
+  git -C "$n" branch -q bench
+  rm -rf "$work"
+  cargo_with none "$n" fetch -q
+done
+for n in ripgrep cargo cargo-vendored rust zed prost vergen pyo3 embed rustls bevy openssl jemalloc cxx cmake sqlx \
+  wasm rocksdb wasmtime; do
+  echo "project $n: $(git -C "$n" rev-parse bench)"
+done

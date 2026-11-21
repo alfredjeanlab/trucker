@@ -1,0 +1,14 @@
+A (trucker):
+name: alloc::string::String = "sentinel"
+P (plain, as A):
+name: alloc::string::String = "sentinel"
+B (trucker, nullable):
+name: core::option::Option<alloc::string::String> = Some("sentinel")
+Q (plain, as B):
+name: core::option::Option<alloc::string::String> = Some("sentinel")
+C (trucker, as A):
+name: alloc::string::String = "sentinel"
+A after the edit of .sqlx:
+name: alloc::string::String = "sentinel"
+P after the edit of .sqlx:
+name: alloc::string::String = "sentinel"

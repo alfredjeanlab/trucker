@@ -1,0 +1,5 @@
+     29       0.6 s  hit
+     29      16.1 s  miss
+      1       0.3 s  miss session
+49.2% of the cached invocations hit
+the store held 0.0 GB at its last gc, of a cap of 33.4 GB computed from its filesystem, both counting the length of its files, which clones may share

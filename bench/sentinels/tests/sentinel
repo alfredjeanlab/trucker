@@ -1,0 +1,46 @@
+# Sourced by bench/sentinel: ripgrep's tests. A builds them cold with `cargo test --no-run` with trucker, P with plain
+# cargo, then a new worktree B with trucker. B and P run every test, edit the most depended-on crate, build the tests
+# again and run them again, and then run the doctests, which rustdoc compiles without RUSTC_WRAPPER. The output is the
+# summary of each test binary, without its times. ripgrep's integration tests look for `rg` beside their own
+# executable, which cargo's layout of a unit directory each does not give, so they fail in P as well.
+# shellcheck shell=bash disable=SC2154
+rm -rf "$work"
+mkdir -p "$work"
+git clone -q --shared "$root/src/ripgrep" "$work/repo"
+git -C "$work/repo" checkout -q bench
+ONLINE=1 cargo_with none "$work/repo" fetch -q
+for w in a p b; do git -C "$work/repo" -c advice.detachedHead=false worktree add -q --detach "$work/$w" bench; done
+# Every test's result, in an order that does not depend on the threads that ran them.
+results() {
+  { cargo_with "$1" "$2" test "${@:3}" -- --test-threads 4 2>&1 || true; } |
+    { grep -E '^test .* \.\.\. |^test result:' || true; } | sed 's/; finished in .*//' | sort
+}
+edit_tests() { printf '\n#[allow(dead_code)]\nfn _sentinel_edit() {}\n' >> "$1/crates/matcher/src/lib.rs"; }
+sleep 1.5
+step test-cold trucker "$work/a" test --no-run
+step test-cold none "$work/p" test --no-run
+step test-fresh trucker "$work/b" test --no-run
+b0=$(results trucker "$work/b"); p0=$(results none "$work/p")
+edit_tests "$work/b"; edit_tests "$work/p"
+sleep 1.5
+step test-changed trucker "$work/b" test --no-run
+step test-changed none "$work/p" test --no-run
+b1=$(results trucker "$work/b"); p1=$(results none "$work/p")
+step doc trucker "$work/b" test --doc --workspace
+step doc none "$work/p" test --doc --workspace
+bd=$(results trucker "$work/b" --doc --workspace); pd=$(results none "$work/p" --doc --workspace)
+count() { grep -c " \.\.\. $2\$" <<< "$1" || true; }
+printf 'B fresh:\n%s\nP cold:\n%s\nB changed:\n%s\nP changed:\n%s\nB doc:\n%s\nP doc:\n%s\n' \
+  "$b0" "$p0" "$b1" "$p1" "$bd" "$pd" > "$out/logs/sentinel.$name.outputs"
+problems=()
+[ "$b0" = "$p0" ] || problems+=("B's fresh results differ from plain cargo's")
+[ "$b1" = "$p1" ] || problems+=("B's results after the edit differ from plain cargo's")
+[ "$bd" = "$pd" ] || problems+=("B's doctests differ from plain cargo's")
+[ "$(count "$b0" ok)" -gt 0 ] || problems+=("no test passed")
+[ "$(count "$bd" ok)" -gt 0 ] || problems+=("no doctest passed")
+if [ ${#problems[@]} -eq 0 ]; then
+  verdict pass "B as P: $(count "$b0" ok) tests pass and $(count "$b0" FAILED) fail, $(count "$b1" ok) and $(count "$b1" FAILED) after the edit, $(count "$bd" ok) doctests pass"
+else
+  verdict fail "$(IFS='; '; echo "${problems[*]}")"
+fi
+XDG_CACHE_HOME="$work/cache" "$trucker" stats > "$out/logs/sentinel.$name.stats" 2>&1 || true

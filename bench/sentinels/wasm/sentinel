@@ -1,0 +1,119 @@
+# Sourced by bench/sentinel: a workspace with a proc macro and a library whose build script generates code, built for
+# wasm32-unknown-unknown and natively into the same target directory. A builds cold with trucker and P with plain
+# cargo, then a new worktree B with trucker, then B and P edit the library and build again. The output is the hash
+# of each wasm module and the output of the native program. The dev profile carries no debug info, so that the
+# module holds no path of its worktree.
+# shellcheck shell=bash disable=SC2154
+rm -rf "$work"
+r=$work/repo
+mkdir -p "$r/macros/src" "$r/lib/src" "$r/app/src"
+cat > "$r/Cargo.toml" << 'EOF'
+[workspace]
+members = ["macros", "lib", "app"]
+resolver = "2"
+
+[profile.dev]
+debug = false
+EOF
+cat > "$r/macros/Cargo.toml" << 'EOF'
+[package]
+name = "sentinel-wasm-macros"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+proc-macro = true
+EOF
+cat > "$r/macros/src/lib.rs" << 'EOF'
+use proc_macro::TokenStream;
+
+/// A function that returns the length of the item that the attribute decorates, as the macro saw it.
+#[proc_macro_attribute]
+pub fn measured(_: TokenStream, item: TokenStream) -> TokenStream {
+    let length = item.to_string().len();
+    format!("{item}\n#[no_mangle] pub extern \"C\" fn measured_length() -> u32 {{ {length} }}").parse().unwrap()
+}
+EOF
+cat > "$r/lib/Cargo.toml" << 'EOF'
+[package]
+name = "sentinel-wasm-lib"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sentinel-wasm-macros = { path = "../macros" }
+EOF
+cat > "$r/lib/build.rs" << 'EOF'
+fn main() {
+    let target = std::env::var("TARGET").unwrap();
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("generated.rs");
+    std::fs::write(out, format!("pub const BUILT_FOR: &str = {target:?};\n")).unwrap();
+}
+EOF
+cat > "$r/lib/src/lib.rs" << 'EOF'
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+#[sentinel_wasm_macros::measured]
+#[no_mangle]
+pub extern "C" fn answer() -> u32 {
+    42
+}
+EOF
+cat > "$r/app/Cargo.toml" << 'EOF'
+[package]
+name = "sentinel-wasm-app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sentinel-wasm-lib = { path = "../lib" }
+EOF
+cat > "$r/app/src/main.rs" << 'EOF'
+fn main() {
+    let lib = sentinel_wasm_lib::answer();
+    println!("{} {} {}", sentinel_wasm_lib::BUILT_FOR, lib, sentinel_wasm_lib::measured_length());
+}
+EOF
+git -C "$r" init -q
+ONLINE=1 cargo_with none "$r" generate-lockfile -q
+git -C "$r" add -A
+fixed_git -C "$r" commit -q -m "The sentinel"
+for w in a p b; do git -C "$r" -c advice.detachedHead=false worktree add -q --detach "$work/$w" HEAD; done
+wasm=(build --target wasm32-unknown-unknown -p sentinel-wasm-lib)
+wasm_output() {
+  sha256sum "$1/target/wasm32-unknown-unknown/debug/sentinel_wasm_lib.wasm" 2>&1 | cut -d' ' -f1
+  "$1/target/debug/sentinel-wasm-app" 2>&1 || echo "exit $?"
+}
+edit_wasm() { sed -i 's/    42$/    43/' "$1/lib/src/lib.rs"; }
+sleep 1.5
+step wasm-cold trucker "$work/a" "${wasm[@]}"
+step native-cold trucker "$work/a" build
+step wasm-cold none "$work/p" "${wasm[@]}"
+step native-cold none "$work/p" build
+step wasm-fresh trucker "$work/b" "${wasm[@]}"
+step native-fresh trucker "$work/b" build
+b0=$(wasm_output "$work/b"); p0=$(wasm_output "$work/p"); a0=$(wasm_output "$work/a")
+edit_wasm "$work/b"; edit_wasm "$work/p"
+sleep 1.5
+step wasm-changed trucker "$work/b" "${wasm[@]}"
+step native-changed trucker "$work/b" build
+step wasm-changed none "$work/p" "${wasm[@]}"
+step native-changed none "$work/p" build
+b1=$(wasm_output "$work/b"); p1=$(wasm_output "$work/p")
+printf 'A cold:\n%s\nP cold:\n%s\nB fresh:\n%s\nB changed:\n%s\nP changed:\n%s\n' "$a0" "$p0" "$b0" "$b1" "$p1" \
+  > "$out/logs/sentinel.$name.outputs"
+problems=()
+[ "$a0" = "$p0" ] || problems+=("A's output differs from plain cargo's")
+[ "$b0" = "$p0" ] || problems+=("B's fresh output differs from plain cargo's")
+[ "$b1" = "$p1" ] || problems+=("B's changed output differs from plain cargo's")
+[ "$b1" != "$b0" ] || problems+=("B's output did not change")
+case $b0$b1$p0 in *"exit "* | *"No such"*) problems+=("a build or program failed") ;; esac
+if [ ${#problems[@]} -eq 0 ]; then verdict pass "$(echo "$b1" | tr '\n' ' ')"
+else verdict fail "$(IFS='; '; echo "${problems[*]}")"; fi
+XDG_CACHE_HOME="$work/cache" "$trucker" stats > "$out/logs/sentinel.$name.stats" 2>&1 || true

@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Builds and tests the most downloaded crates of crates.io with plain cargo and with trucker, and checks that trucker's
+# builds succeed where plain cargo's do and that their tests have the outcomes of plain cargo's:
+#
+#   bench/sweep <phase> <root> <fs> [<out>]
+#
+# The phases run in this order, and `all` runs every one:
+#
+# - list writes <out>/crates.txt, the top N crates by recent downloads, each at its newest stable version.
+# - fetch unpacks each crate into a repository of <root>/sweep/src and downloads its dependencies into
+#   <root>/sweep/cargo, and writes <out>/fetch.txt.
+# - run builds and tests each crate offline into <out>/sweep.jsonl and <out>/logs/<crate>/.
+# - report writes <out>/report.md from them.
+#
+# For each crate, worktree P builds with plain cargo, tests, then builds an edit. Worktree A builds cold with trucker
+# into the store of the sweep, then a new worktree B builds and tests, and E is B after the edit. Each build is
+# `cargo build --all-targets` and each test `cargo test --no-fail-fast`, and each is killed after TIMEOUT seconds. N
+# (100) sets the crates, JOBS (4) the crates that run at once, and TRUCKER and RUSTUP_TOOLCHAIN as in bench/run.
+set -euo pipefail
+
+cpus=${CPUS:-1-15}
+if [ -z "${BENCH_PINNED:-}" ] && command -v taskset > /dev/null; then
+  BENCH_PINNED=1 exec taskset -c "$cpus" "$0" "$@"
+fi
+
+phase=$1
+here=$(cd "$(dirname "$0")" && pwd -P)
+mkdir -p "$2" "$3"
+root=$(cd "$2" && pwd -P)
+fs=$(cd "$3" && pwd -P)
+cores=$(getconf _NPROCESSORS_ONLN)
+out=${4:-$here/runs/$(date -u +%F)-$(uname -s | tr '[:upper:]' '[:lower:]')-${cores}core/sweep}
+mkdir -p "$out/logs"
+out=$(cd "$out" && pwd -P)
+trucker=${TRUCKER:-$root/bin/trucker}
+toolchain=${RUSTUP_TOOLCHAIN:-1.100.0}
+jobs=${JOBS:-4}
+limit=${TIMEOUT:-600}
+cargo_home=$root/sweep/cargo
+src=$root/sweep/src
+cache=$fs/sweep/cache
+helper() { python3 -I "$here/sweep.py" "$@"; }
+
+ledger=$HOME/ledger
+lname=trucker-sweep-$$
+claim() {
+  [ -e "$ledger" ] || return 0
+  while true; do
+    local now held load
+    now=$(date +%s)
+    # BENCH_HOLD names a line that a script running several of these holds for all of them, as in bench/run.
+    held=$(awk -v now="$now" -v me="$lname" -v hold="${BENCH_HOLD:-}" \
+      '$1 != me && $1 != hold && $3 > now {n += $2} END {print n + 0}' "$ledger")
+    load=$(cut -d' ' -f1 /proc/loadavg)
+    if [ "$held" -eq 0 ] && awk -v l="$load" -v c="$cores" 'BEGIN {exit !(l < c)}'; then break; fi
+    echo "waiting: $held cores held, load $load" >&2
+    sleep 60
+  done
+  release
+  printf '%s\t%s\t%s\n' "$lname" "$(( cores - 1 ))" "$(( $(date +%s) + 12 * 3600 ))" >> "$ledger"
+}
+release() {
+  [ -e "$ledger" ] || return 0
+  local rest
+  rest=$(grep -v "^$lname	" "$ledger" || true)
+  printf '%s' "${rest:+$rest$'\n'}" > "$ledger"
+}
+trap release EXIT
+
+# Git with fixed dates, so that the same commit in two worktrees has the same hash.
+fixed_git() {
+  GIT_AUTHOR_NAME=bench GIT_AUTHOR_EMAIL=bench@localhost GIT_COMMITTER_NAME=bench GIT_COMMITTER_EMAIL=bench@localhost \
+    GIT_AUTHOR_DATE=2026-11-19T00:00:00Z GIT_COMMITTER_DATE=2026-11-19T00:00:00Z git "$@"
+}
+
+# cargo $3... in directory $2 with tool $1, online only where ONLINE is set.
+cargo_with() {
+  local tool=$1 dir=$2
+  shift 2
+  local env=(
+    env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_TARGET_DIR -u RUSTFLAGS CARGO_HOME="$cargo_home"
+    RUSTUP_TOOLCHAIN="$toolchain" CARGO_TERM_COLOR=never PATH="$HOME/.cargo/bin:$PATH"
+  )
+  [ -n "${ONLINE:-}" ] || env+=(CARGO_NET_OFFLINE=true)
+  case $tool in
+    none) env+=(RUSTC_WRAPPER=) ;;
+    trucker) env+=(RUSTC_WRAPPER="$trucker" XDG_CACHE_HOME="$cache") ;;
+  esac
+  (cd "$dir" && timeout -k 10 "$limit" "${env[@]}" cargo "$@")
+}
+
+# Runs jobs in the background, at most JOBS at once.
+spawn() {
+  while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n || true; done
+  "$@" < /dev/null &
+}
+
+crates() { grep -v '^#' "$out/crates.txt"; }
+
+list() {
+  helper list "${N:-100}" "$out/crates.txt"
+  echo "listed $(crates | wc -l | tr -d ' ') crates into $out/crates.txt" >&2
+}
+
+# One crate as a repository on its branch bench, with a lockfile that pins its dependencies. A tarball without a
+# lockfile gets one generated now, so that the commit pins what every build resolves.
+fetch_one() {
+  local name=$1 version=$2 dir=$src/$1 lockfile=published status=ok
+  local log=$out/logs/$name/fetch.log
+  mkdir -p "$out/logs/$name"
+  rm -rf "$dir" "$dir.crate"
+  mkdir -p "$dir"
+  {
+    curl -sSfL -A trucker-bench-sweep -o "$dir.crate" "https://static.crates.io/crates/$name/$name-$version.crate" &&
+      tar -xzf "$dir.crate" -C "$dir" --strip-components 1 && rm "$dir.crate"
+  } > "$log" 2>&1 || status=download
+  if [ $status = ok ] && [ ! -e "$dir/Cargo.lock" ]; then
+    lockfile=generated
+    ONLINE=1 cargo_with none "$dir" generate-lockfile >> "$log" 2>&1 || status=resolve
+  fi
+  [ $status != ok ] || ONLINE=1 cargo_with none "$dir" fetch >> "$log" 2>&1 || status=fetch
+  if [ $status = ok ]; then
+    git -C "$dir" init -q -b bench
+    # The tarball's .gitignore may name its Cargo.lock.
+    git -C "$dir" add -Af .
+    fixed_git -C "$dir" commit -q -m "$name $version" > /dev/null
+  fi
+  echo "$name $version $lockfile $status" > "$out/logs/$name/fetch.txt"
+  echo "fetched $name $version: $lockfile lockfile, $status" >&2
+}
+
+fetch() {
+  mkdir -p "$src" "$cargo_home"
+  while read -r name version; do spawn fetch_one "$name" "$version"; done < <(crates)
+  wait
+  while read -r name _; do cat "$out/logs/$name/fetch.txt"; done < <(crates) > "$out/fetch.txt"
+}
+
+# One step of a crate: label $1 such as B.test, tool $2, worktree $3, cargo arguments after. Its log and the lines that
+# it added to the log of trucker's store go to logs/<crate>/, and its record to sweep.jsonl.
+step() {
+  local label=$1 tool=$2 dir=$3
+  shift 3
+  local log=$logs/$label.log status=0 start seconds before=0 after outcomes='{}'
+  [ -e "$cache/trucker/log" ] && before=$(wc -l < "$cache/trucker/log")
+  start=$EPOCHREALTIME
+  cargo_with "$tool" "$dir" "$@" -v > "$log" 2>&1 || status=$?
+  seconds=$(awk -v a="$start" -v b="$EPOCHREALTIME" 'BEGIN {printf "%.3f", b - a}')
+  echo "sweep: exit $status" >> "$log"
+  if [ "$tool" = trucker ]; then
+    after=$(wc -l < "$cache/trucker/log" 2> /dev/null || echo 0)
+    head -n "$after" "$cache/trucker/log" 2> /dev/null | tail -n "+$(( before + 1 ))" > "$log.store" || true
+    outcomes=$(helper outcomes "$log.store" "$log")
+  fi
+  printf '{"crate":"%s","step":"%s","tool":"%s","seconds":%s,"status":%s,"outcomes":%s}\n' \
+    "$name" "$label" "$tool" "$seconds" "$status" "$outcomes" >> "$out/sweep.jsonl"
+  echo "  $name $label ${seconds}s status $status $outcomes" >&2
+  return "$status"
+}
+
+edit() {
+  local file
+  file=$(cd "$1" && CARGO_HOME="$cargo_home" RUSTUP_TOOLCHAIN="$toolchain" helper source .) || return 0
+  printf '\n#[allow(dead_code)]\nfn _bench_sweep() {}\n' >> "$file"
+  # trucker stores no own crate whose sources changed in the second before its compile.
+  sleep 1.5
+}
+
+worktree() {
+  git -C "$src/$name" -c advice.detachedHead=false worktree add -q --detach "$1" bench
+  sleep 1.5
+}
+
+run_one() {
+  local name=$1 work=$fs/sweep/work/$1 logs=$out/logs/$1
+  echo "== $name $(date -u +%T)" >&2
+  chmod -R u+w "$work" 2> /dev/null || true
+  rm -rf "$work"
+  git -C "$src/$name" worktree prune
+  rm -f "$logs"/[A-Z]*.log "$logs"/[A-Z]*.log.store
+  worktree "$work/p"
+  worktree "$work/a"
+  if step P.build none "$work/p" build --all-targets; then
+    step P.test none "$work/p" test --no-fail-fast || true
+    edit "$work/p"
+    step P.edit none "$work/p" build --all-targets || true
+    step A.build trucker "$work/a" build --all-targets || true
+    worktree "$work/b"
+    step B.build trucker "$work/b" build --all-targets || true
+    step B.test trucker "$work/b" test --no-fail-fast || true
+    edit "$work/b"
+    step E.build trucker "$work/b" build --all-targets || true
+    step E.test trucker "$work/b" test --no-fail-fast || true
+    # A test that differs once runs again under both, and is a mismatch only where it differs again.
+    if ! helper differ "$logs/P.test.log" "$logs/B.test.log" > /dev/null ||
+      ! helper differ "$logs/P.test.log" "$logs/E.test.log" > /dev/null; then
+      step P2.test none "$work/p" test --no-fail-fast || true
+      step T2.test trucker "$work/b" test --no-fail-fast || true
+    fi
+  fi
+  chmod -R u+w "$work" 2> /dev/null || true
+  rm -rf "$work"
+  git -C "$src/$name" worktree prune
+}
+
+run() {
+  {
+    echo "date: $(date -u +%FT%TZ)"
+    echo "os: $(uname -srm), $cores cores"
+    echo "rustc: $(RUSTUP_TOOLCHAIN=$toolchain rustc --version)"
+    echo "cargo: $(RUSTUP_TOOLCHAIN=$toolchain cargo --version)"
+    echo "trucker: ${TRUCKER_COMMIT:-$(git -C "$here/.." rev-parse HEAD)}"
+    echo "jobs: $jobs, timeout: ${limit}s"
+  } > "$out/environment.txt"
+  claim
+  # The store of the sweep starts empty, and every crate shares it.
+  chmod -R u+w "$cache" 2> /dev/null || true
+  rm -rf "$cache" "$out/sweep.jsonl"
+  mkdir -p "$cache"
+  while read -r name version lockfile status; do
+    [ "$status" = ok ] && spawn run_one "$name"
+  done < "$out/fetch.txt"
+  wait
+  release
+  cp "$cache/trucker/log" "$out/logs/store.log" 2> /dev/null || true
+  XDG_CACHE_HOME="$cache" "$trucker" stats > "$out/logs/store.stats" 2>&1 || true
+}
+
+report() {
+  helper report "$out" > "$out/report.md"
+  cat "$out/report.md"
+}
+
+case $phase in
+  list | fetch | run | report) $phase ;;
+  all) list && fetch && run && report ;;
+  *) echo "unknown phase $phase" >&2; exit 2 ;;
+esac

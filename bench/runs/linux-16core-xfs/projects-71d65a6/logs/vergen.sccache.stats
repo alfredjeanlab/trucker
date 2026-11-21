@@ -1,0 +1,36 @@
+Compile requests                    188
+Compile requests executed           100
+Cache hits                           69
+Cache hits (Rust)                    69
+Cache misses                         23
+Cache misses (Rust)                  23
+Cache hits rate                   75.00 %
+Cache hits rate (Rust)            75.00 %
+Cache timeouts                        0
+Cache read errors                     0
+Forced recaches                       0
+Cache write errors                    0
+Cache errors                          0
+Compilations                         23
+Compilation failures                  8
+Non-cacheable compilations            0
+Non-cacheable calls                  80
+Non-compilation calls                 8
+Unsupported compiler calls            0
+Average cache write               0.000 s
+Average compiler                  0.334 s
+Average cache read hit            0.000 s
+Failed distributed compilations       0
+
+Non-cacheable reasons:
+crate-type (bin)                     56
+crate-type (proc-macro)              12
+missing input                         8
+-                                     4
+
+Cache location                  Local disk: "/home/ops/trucker-bench/cache/sccache"
+Base directories                (none)
+Use direct/preprocessor mode?   yes
+Version (client)                0.19.0
+Cache size                           17 MiB
+Max cache size                       10 GiB

@@ -1,0 +1,12 @@
+A cold:
+Hello { name: "sentinel", count: 3 }
+P cold:
+Hello { name: "sentinel", count: 3 }
+B fresh:
+Hello { name: "sentinel", count: 3 }
+B changed:
+Hello { name: "sentinel", count: 3, extra: "" }
+P changed:
+Hello { name: "sentinel", count: 3, extra: "" }
+A after:
+Hello { name: "sentinel", count: 3 }

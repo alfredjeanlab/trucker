@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# Times new worktrees that build at once against a warm store, as when an agent starts in each of them:
+#
+#   bench/throughput <root> <fs> <out> [project]...
+#
+# <root>, <fs> and the projects are those of bench/run, cargo and zed by default. For each tool, a seed worktree warms
+# the store. Then WORKTREES new worktrees of the same commit build at once (1b), each edits its leaf crate and they
+# build at once (2c), then each edits its most depended-on crate (2a), and then edits it again (2b). Plain cargo has no
+# store, so its worktrees build cold, and edit with the incremental state of that build. Each step appends one record
+# to <out>/throughput.jsonl: the seconds until the last build ends and until each ends, what cargo ran, the bytes that
+# the block device read and wrote, by /proc/diskstats, and the peaks of the memory in use and of the page cache, by
+# /proc/meminfo each second. A record of trucker names its log in <out> in store_log, and the first and last line of
+# the step in it in store_lines, counted from 1. The worktrees of a step interleave their lines.
+#
+# TOOLS picks from none and trucker, both by default, and sccache, mbx, kache and shared for a one-off baseline.
+# WORKTREES lists the counts, 4 by default, such as "4 8". RUNS repeats each count, once by default. LEAF=0 skips 2c.
+# CPUS, TRUCKER, PROJECTS, BENCH_HOLD and MBX_OVERRIDE_WRAPPER are those of bench/run.
+set -euo pipefail
+
+cpus=${CPUS:-1-15}
+if [ -z "${BENCH_PINNED:-}" ] && command -v taskset > /dev/null; then
+  BENCH_PINNED=1 exec taskset -c "$cpus" "$0" "$@"
+fi
+
+root=$(realpath "$1")
+mkdir -p "$2" "$3"
+fs=$(realpath "$2")
+out=$(realpath "$3")
+shift 3
+here=$(realpath "$(dirname "$0")")
+bin=$root/bin
+trucker=${TRUCKER:-$bin/trucker}
+read -ra tools <<< "${TOOLS:-none trucker}"
+read -ra counts <<< "${WORKTREES:-4}"
+runs=${RUNS:-1}
+toolchain=${RUSTUP_TOOLCHAIN:-1.100.0}
+
+# The workspace, most depended-on crate and leaf crate of each project, as bench/run names them.
+declare -A workspace=([ripgrep]=. [cargo]=. [cargo-vendored]=. [rust]=src/tools/rust-analyzer [zed]=.)
+declare -A deep=(
+  [ripgrep]=crates/matcher/src/lib.rs [cargo]=crates/cargo-util/src/lib.rs [cargo-vendored]=crates/cargo-util/src/lib.rs
+  [rust]=crates/stdx/src/lib.rs [zed]=crates/collections/src/collections.rs
+)
+declare -A leaf=(
+  [ripgrep]=crates/core/main.rs [cargo]=src/bin/cargo/main.rs [cargo-vendored]=src/bin/cargo/main.rs
+  [rust]=crates/rust-analyzer/src/bin/main.rs [zed]=crates/zed/src/main.rs
+)
+declare -A extra=([cargo-vendored]="--features vendored-openssl")
+if [ -n "${PROJECTS:-}" ]; then
+  while read -r p w d l; do workspace[$p]=$w deep[$p]=$d leaf[$p]=$l; done < "$PROJECTS"
+fi
+
+# The ledger of bench/run, whose cores a run waits for and holds.
+ledger=$HOME/ledger
+name=trucker-throughput-$$
+claim() {
+  [ -e "$ledger" ] || return 0
+  while true; do
+    local held load
+    held=$(awk -v now="$(date +%s)" -v me="$name" -v hold="${BENCH_HOLD:-}" \
+      '$1 != me && $1 != hold && $3 > now {n += $2} END {print n + 0}' "$ledger")
+    load=$(cut -d' ' -f1 /proc/loadavg)
+    if [ "$held" -eq 0 ] && awk -v l="$load" -v c="$(nproc --all)" 'BEGIN {exit !(l < c)}'; then break; fi
+    echo "waiting: $held cores held, load $load" >&2
+    sleep 60
+  done
+  hold
+}
+# Holds the cores for three hours from now, which each count renews, because a build of Zed in eight worktrees is long.
+hold() {
+  [ -e "$ledger" ] || return 0
+  release
+  printf '%s\t%s\t%s\n' "$name" "$(( $(nproc --all) - 1 ))" "$(( $(date +%s) + 3 * 3600 ))" >> "$ledger"
+}
+release() {
+  [ -e "$ledger" ] || return 0
+  local rest
+  rest=$(grep -v "^$name	" "$ledger" || true)
+  printf '%s' "${rest:+$rest$'\n'}" > "$ledger"
+}
+trap release EXIT
+
+used() { sync; sleep 1.2; df --output=used -B1 "$fs" | tail -1; }
+cache() { echo "$fs/cache/$1"; }
+
+# The block device of the filesystem under test, then the one under its backing file where it is a loop device, by
+# the names of /proc/diskstats.
+devices() {
+  local dev
+  dev=$(basename "$(readlink -f "$(df --output=source "$fs" | tail -1)")")
+  echo "$dev"
+  if [ -r "/sys/block/$dev/loop/backing_file" ]; then
+    basename "$(readlink -f "$(df --output=source "$(cat "/sys/block/$dev/loop/backing_file")" | tail -1)")"
+  fi
+}
+# The bytes that each device of $devs read and wrote since the copy of /proc/diskstats in $1, as JSON. A sector of
+# /proc/diskstats is 512 bytes on every device.
+io() {
+  [ -r /proc/diskstats ] || { echo null; return; }
+  awk -v devs=" ${devs[*]} " 'NR == FNR {r[$3] = $6; w[$3] = $10; next}
+    index(devs, " " $3 " ") {printf "%s\"%s\":{\"read\":%.0f,\"written\":%.0f}", n++ ? "," : "{", $3, ($6 - r[$3]) * 512, ($10 - w[$3]) * 512}
+    END {print n ? "}" : "null"}' "$1" /proc/diskstats
+}
+# Writes the bytes of memory in use, MemTotal less MemAvailable, and of the page cache, Cached, each second to $1.
+sample() {
+  while [ -r /proc/meminfo ]; do
+    awk '$1 == "MemTotal:" {t = $2} $1 == "MemAvailable:" {a = $2} $1 == "Cached:" {c = $2} END {printf "%.0f %.0f\n", (t - a) * 1024, c * 1024}' /proc/meminfo
+    sleep 1
+  done > "$1"
+}
+
+# Builds the workspace in $2 with tool $1, with cargo's verbose output in $3, as bench/run does.
+build() {
+  local tool=$1 dir=$2 log=$3
+  local args=(-v ${extra[$project]:-})
+  local env=(
+    env -C "$dir" -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER CARGO_HOME="$root/cargo" CARGO_NET_OFFLINE=true
+    RUSTUP_TOOLCHAIN="$toolchain" CARGO_TERM_COLOR=never PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+  )
+  case $tool in
+    none) "${env[@]}" RUSTC_WRAPPER= cargo build "${args[@]}" ;;
+    trucker) "${env[@]}" RUSTC_WRAPPER="$trucker" XDG_CACHE_HOME="$(cache trucker)" cargo build "${args[@]}" ;;
+    sccache) "${env[@]}" RUSTC_WRAPPER="$bin/sccache" SCCACHE_DIR="$(cache sccache)" cargo build "${args[@]}" ;;
+    mbx) "${env[@]}" ${MBX_OVERRIDE_WRAPPER:+CARGO_BUILD_RUSTC_WRAPPER=} MBX_CACHE_DIR="$(cache mbx)" XDG_CONFIG_HOME="$fs/config" \
+      MBX_SUMMARY=short "$bin/mbx" build "${args[@]}" ;;
+    kache) "${env[@]}" RUSTC_WRAPPER="$bin/kache" KACHE_CACHE_DIR="$(cache kache)" KACHE_LOCAL_ONLY=1 cargo build "${args[@]}" ;;
+    shared) "${env[@]}" RUSTC_WRAPPER= CARGO_TARGET_DIR="$(cache shared)/$project" cargo build "${args[@]}" ;;
+  esac > "$log" 2>&1
+}
+
+edit() { printf '\n#[allow(dead_code)]\nfn _bench_%s() {}\n' "$(date +%s%N)" >> "$1"; }
+
+# A new worktree of the project's repository at path $1, at the pinned commit.
+worktree() {
+  git -C "$src" worktree remove --force "$1" 2> /dev/null || { chmod -R u+w "$1" 2> /dev/null || true; rm -rf "$1"; }
+  git -C "$src" worktree prune
+  git -C "$src" -c advice.detachedHead=false worktree add -q --detach "$1" bench
+}
+
+# Empties the store and the worktrees of $tool, and stops the servers of sccache and kache.
+reset() {
+  [ "$tool" = sccache ] && { SCCACHE_DIR="$(cache sccache)" "$bin/sccache" --stop-server > /dev/null 2>&1 || true; }
+  if [ "$tool" = kache ]; then
+    KACHE_CACHE_DIR="$(cache kache)" "$bin/kache" daemon stop > /dev/null 2>&1 || true
+    pkill -f "^$bin/kache-engine daemon" 2> /dev/null || true
+  fi
+  # mbx makes the files of its store read-only.
+  chmod -R u+w "$(cache "$tool")" "$work" 2> /dev/null || true
+  rm -rf "$(cache "$tool")" "$work"
+  git -C "$src" worktree prune
+  mkdir -p "$work"
+}
+
+# Times step $1 of run $3, in which the worktrees $work/p1 to p$2 each build at once, and appends its record.
+together() {
+  local step=$1 n=$2 run=$3 log=$out/logs/$project.$tool.$2x$1.$3.log before start end pids=() i sampler each lines=0
+  local memory cached m0 c0
+  before=$(used)
+  [ "$tool" = trucker ] && lines=$(wc -l < "$(cache trucker)/trucker/log" 2> /dev/null || echo 0)
+  cat /proc/diskstats > "$work/diskstats" 2> /dev/null || true
+  sample "$work/memory" &
+  sampler=$!
+  start=$(date +%s.%N)
+  for i in $(seq "$n"); do
+    { build "$tool" "$work/p$i/$ws" "$log.$i" || echo "build failed: $log.$i" >&2; date +%s.%N > "$work/p$i.end"; } &
+    pids+=($!)
+  done
+  wait "${pids[@]}"
+  end=$(date +%s.%N)
+  kill "$sampler" 2> /dev/null || true
+  wait "$sampler" 2> /dev/null || true
+  each=$(for i in $(seq "$n"); do awk -v a="$start" '{printf "%.3f\n", $1 - a}' "$work/p$i.end"; done | paste -sd, -)
+  read -r memory cached m0 c0 < <(awk 'NR == 1 {m0 = $1; c0 = $2} m < $1 {m = $1} c < $2 {c = $2}
+    END {if (NR) printf "%.0f %.0f %.0f %.0f\n", m, c, m0, c0; else print "null null null null"}' "$work/memory")
+  cat "$log".? "$log".?? > "$log" 2> /dev/null || true
+  # trucker's lines of this step, and the slot that each worktree's session of an own crate came from.
+  local store=
+  if [ "$tool" = trucker ]; then
+    store=$(printf ',"store_log":"logs/%s.trucker.store.log","store_lines":[%s,%s]' "$project" "$(( lines + 1 ))" \
+      "$(wc -l < "$(cache trucker)/trucker/log" 2> /dev/null || echo 0)")
+    for i in $(seq "$n"); do
+      for s in "$work/p$i/$ws"/target/debug/incremental/*-trucker.*/slot; do
+        [ -e "$s" ] && echo "p$i $(basename "$(dirname "$s")") $(cat "$s")"
+      done
+    done > "$log.slots"
+  fi
+  {
+    printf '{"fs":"%s","project":"%s","tool":"%s","worktrees":%s,"step":"%s","run":%s,"seconds":%s,"times":[%s],' \
+      "$fslabel" "$project" "$tool" "$n" "$step" "$run" "$(awk -v a="$start" -v b="$end" 'BEGIN {printf "%.3f", b - a}')" "$each"
+    printf '"rustc":%s,"restored":%s,"added":%s,"device":"%s","io":%s,"memory":%s,"cached":%s,' \
+      "$(grep -c '^ *Running `' "$log" || true)" \
+      "$(tail -n "+$(( lines + 1 ))" "$(cache trucker)/trucker/log" 2> /dev/null | awk '$4 == "hit"' | wc -l)" \
+      "$(( $(used) - before ))" "${devs[0]:-}" "$(io "$work/diskstats")" "$memory" "$cached"
+    printf '"memory_before":%s,"cached_before":%s,"ok":%s%s}\n' "$m0" "$c0" \
+      "$(grep -q '^error' "$log" && echo false || echo true)" "$store"
+  } >> "$out/throughput.jsonl"
+}
+
+fslabel=$(df --output=fstype "$fs" | tail -1)
+mapfile -t devs < <(devices)
+mkdir -p "$out/logs"
+{
+  echo "kernel: $(uname -sr)"
+  echo "cpus: $cpus of $(nproc --all)"
+  echo "memory: $(awk '$1 == "MemTotal:" {printf "%.0fG", $2 / 1048576}' /proc/meminfo 2> /dev/null)"
+  echo "filesystem: $fs, $fslabel, devices ${devs[*]}"
+  echo "rustc: $(RUSTUP_TOOLCHAIN=$toolchain rustc --version)"
+  echo "trucker: ${TRUCKER_COMMIT:-$(git -C "$here/.." rev-parse HEAD)}"
+} > "$out/environment.$fslabel.txt"
+
+projects=("$@")
+[ ${#projects[@]} -gt 0 ] || projects=(cargo zed)
+for project in "${projects[@]}"; do
+  src=$root/src/$project
+  ws=${workspace[$project]}
+  echo "project $project: $(git -C "$src" rev-parse bench)" >> "$out/projects.txt"
+  claim
+  for tool in "${tools[@]}"; do
+    echo "== $project $tool $fslabel $(date -u +%T)" >&2
+    work=$fs/throughput/$tool/$project
+    reset
+    mkdir -p "$fs/cache"
+    # The seed warms the store. Plain cargo has none to warm.
+    if [ "$tool" != none ]; then
+      worktree "$work/seed"
+      # trucker stores no own crate whose sources are younger than a second.
+      sleep 1.5
+      build "$tool" "$work/seed/$ws" "$out/logs/$project.$tool.seed.log" || echo "seed build failed" >&2
+    fi
+    for n in "${counts[@]}"; do
+      for run in $(seq "$runs"); do
+        hold
+        for i in $(seq "$n"); do worktree "$work/p$i"; done
+        # trucker stores no own crate whose sources are younger than a second.
+        sleep 1.5
+        together 1b "$n" "$run"
+        if [ "${LEAF:-1}" = 1 ] && [ -n "${leaf[$project]}" ]; then
+          for i in $(seq "$n"); do edit "$work/p$i/$ws/${leaf[$project]}"; done
+          together 2c "$n" "$run"
+        fi
+        for i in $(seq "$n"); do edit "$work/p$i/$ws/${deep[$project]}"; done
+        together 2a "$n" "$run"
+        for i in $(seq "$n"); do edit "$work/p$i/$ws/${deep[$project]}"; done
+        together 2b "$n" "$run"
+        for i in $(seq "$n"); do git -C "$src" worktree remove --force "$work/p$i" 2> /dev/null || true; done
+      done
+    done
+    [ "$tool" = trucker ] && { cp "$(cache trucker)/trucker/log" "$out/logs/$project.trucker.store.log" 2> /dev/null || true; }
+    reset
+  done
+  release
+done
+chmod -R u+w "$fs/cache" 2> /dev/null || true
+rm -rf "$fs/cache" "$fs/config" "$fs/throughput"

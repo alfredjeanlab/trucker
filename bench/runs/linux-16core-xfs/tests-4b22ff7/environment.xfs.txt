@@ -1,0 +1,11 @@
+kernel: Linux 7.0.0-30-generic
+cpu: AMD EPYC-Milan Processor, cpus 1-15 of 15
+memory: 61G
+filesystem: /home/ops/trucker-bench, xfs, /dev/loop0
+hyperfine: hyperfine 1.19.0
+rustc: rustc 1.100.0 (0ef1bc386 2026-11-09)
+cargo: cargo 1.100.0 (3acc79c0c 2026-11-05)
+trucker: 4b22ff79c7cf2efb6d0b0395de6ff16d738421a1
+sccache: sccache 0.19.0
+mbx: mbx 1.30.0
+kache: kache 2.2.0

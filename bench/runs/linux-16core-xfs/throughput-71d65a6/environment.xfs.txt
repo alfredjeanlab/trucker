@@ -1,0 +1,6 @@
+kernel: Linux 7.0.0-43-generic
+cpus: 1-15 of 16
+memory: 61G
+filesystem: /home/ops/trucker-bench, xfs, devices loop0 sda1
+rustc: rustc 1.100.0 (0ef1bc386 2026-11-09)
+trucker: 71d65a69532fdff33a067e063886dc7c28e66be9

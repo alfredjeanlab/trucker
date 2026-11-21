@@ -1,0 +1,20 @@
+A cold:
+OpenSSL 3.6.3 9 Jun 2026
+sha256: 2b7847b7b705781d7cf21a05e9c1bb37cbf078aea103bc3edcc6aca52ab65453
+P cold:
+OpenSSL 3.6.3 9 Jun 2026
+sha256: 2b7847b7b705781d7cf21a05e9c1bb37cbf078aea103bc3edcc6aca52ab65453
+B fresh:
+OpenSSL 3.6.3 9 Jun 2026
+sha256: 2b7847b7b705781d7cf21a05e9c1bb37cbf078aea103bc3edcc6aca52ab65453
+B changed:
+edited
+OpenSSL 3.6.3 9 Jun 2026
+sha256: 2b7847b7b705781d7cf21a05e9c1bb37cbf078aea103bc3edcc6aca52ab65453
+P changed:
+edited
+OpenSSL 3.6.3 9 Jun 2026
+sha256: 2b7847b7b705781d7cf21a05e9c1bb37cbf078aea103bc3edcc6aca52ab65453
+A after:
+OpenSSL 3.6.3 9 Jun 2026
+sha256: 2b7847b7b705781d7cf21a05e9c1bb37cbf078aea103bc3edcc6aca52ab65453

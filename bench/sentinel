@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Builds projects that are likely to break a build cache with trucker and with plain cargo, and checks that trucker's
+# outputs behave as plain cargo's do:
+#
+#   bench/sentinel <root> <fs> <out> <name>...
+#
+# A sentinel is a directory bench/sentinels/<name>. Either it is a crate, which becomes a repository of its own, or it
+# holds a script `sentinel`, which this script sources and which makes its own repositories and builds.
+# Worktree A builds cold with trucker and worktree P cold with plain cargo, then a new worktree B builds with trucker.
+# The input that the sentinel names changes in B and in P, which build again. Each build is one record of
+# <out>/sentinels.jsonl, with its time and the outcomes that trucker logged, and each sentinel's verdict compares the
+# output of B's program with P's, before and after the change. The crates are fetched before anything is timed.
+#
+# A build with trucker appends the lines that it logged to <out>/logs/sentinel.<name>.store.log, and its record names
+# that file in store_log and the first and last of those lines in store_lines, counted from 1.
+set -euo pipefail
+
+cpus=${CPUS:-1-15}
+if [ -z "${BENCH_PINNED:-}" ] && command -v taskset > /dev/null; then
+  BENCH_PINNED=1 exec taskset -c "$cpus" "$0" "$@"
+fi
+
+root=$(realpath "$1")
+mkdir -p "$2" "$3"
+fs=$(realpath "$2")
+out=$(realpath "$3")
+shift 3
+here=$(realpath "$(dirname "$0")")
+trucker=${TRUCKER:-$root/bin/trucker}
+toolchain=${RUSTUP_TOOLCHAIN:-1.100.0}
+cargo_home=$fs/sentinel-cargo
+mkdir -p "$out/logs" "$cargo_home"
+
+ledger=$HOME/ledger
+lname=trucker-sentinel-$$
+claim() {
+  [ -e "$ledger" ] || return 0
+  while true; do
+    local now held load
+    now=$(date +%s)
+    # BENCH_HOLD names a line that a script running several of these holds for all of them, as in bench/run.
+    held=$(awk -v now="$now" -v me="$lname" -v hold="${BENCH_HOLD:-}" \
+      '$1 != me && $1 != hold && $3 > now {n += $2} END {print n + 0}' "$ledger")
+    load=$(cut -d' ' -f1 /proc/loadavg)
+    if [ "$held" -eq 0 ] && awk -v l="$load" -v c="$(nproc --all)" 'BEGIN {exit !(l < c)}'; then break; fi
+    echo "waiting: $held cores held, load $load" >&2
+    sleep 60
+  done
+  release
+  printf '%s\t%s\t%s\n' "$lname" "$(( $(nproc --all) - 1 ))" "$(( $(date +%s) + 3 * 3600 ))" >> "$ledger"
+}
+release() {
+  [ -e "$ledger" ] || return 0
+  local rest
+  rest=$(grep -v "^$lname	" "$ledger" || true)
+  printf '%s' "${rest:+$rest$'\n'}" > "$ledger"
+}
+trap release EXIT
+
+# Git with fixed dates, so that the same commit in two worktrees has the same hash.
+fixed_git() {
+  GIT_AUTHOR_NAME=bench GIT_AUTHOR_EMAIL=bench@localhost GIT_COMMITTER_NAME=bench GIT_COMMITTER_EMAIL=bench@localhost \
+    GIT_AUTHOR_DATE=2026-11-19T00:00:00Z GIT_COMMITTER_DATE=2026-11-19T00:00:00Z git "$@"
+}
+
+# cargo $3... in directory $2 with tool $1, online only where ONLINE is set, with its output in $log.
+cargo_with() {
+  local tool=$1 dir=$2
+  shift 2
+  local env=(
+    env -C "$dir" -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER CARGO_HOME="$cargo_home" RUSTUP_TOOLCHAIN="$toolchain"
+    CARGO_TERM_COLOR=never PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" PYO3_PYTHON=/usr/bin/python3
+  )
+  [ -n "${ONLINE:-}" ] || env+=(CARGO_NET_OFFLINE=true)
+  case $tool in
+    none) "${env[@]}" RUSTC_WRAPPER= "${EXTRA_ENV[@]}" cargo "$@" ;;
+    trucker) "${env[@]}" RUSTC_WRAPPER="$trucker" XDG_CACHE_HOME="$work/cache" "${EXTRA_ENV[@]}" cargo "$@" ;;
+  esac
+}
+
+# One timed build: label $1, tool $2, directory $3, cargo arguments after.
+step() {
+  local label=$1 tool=$2 dir=$3
+  shift 3
+  local log=$out/logs/sentinel.$name.$label.log store=$out/logs/sentinel.$name.store.log lines status=0 start seconds
+  lines=0
+  [ -e "$work/cache/trucker/log" ] && lines=$(wc -l < "$work/cache/trucker/log")
+  start=$(date +%s.%N)
+  cargo_with "$tool" "$dir" "$@" -v > "$log" 2>&1 || status=$?
+  seconds=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN {printf "%.3f", b - a}')
+  local outcomes='{}' first range=
+  if [ "$tool" = trucker ]; then
+    touch "$store"
+    first=$(( $(wc -l < "$store") + 1 ))
+    tail -n "+$(( lines + 1 ))" "$work/cache/trucker/log" 2> /dev/null >> "$store" || true
+    range=$(printf ',"store_log":"logs/%s","store_lines":[%s,%s]' "${store##*/}" "$first" "$(wc -l < "$store")")
+    outcomes=$(tail -n "+$first" "$store" | python3 -I -c 'import json, sys, collections
+f = [l.split(maxsplit=3) for l in sys.stdin]
+c = collections.Counter(x[3].strip() for x in f if len(x) == 4 and x[1] != "-")
+print(json.dumps(dict(c)))')
+  fi
+  printf '{"sentinel":"%s","step":"%s","tool":"%s","seconds":%s,"status":%s,"ran":%s,"fresh":%s,"outcomes":%s%s}\n' \
+    "$name" "$label" "$tool" "$seconds" "$status" "$(grep -c '^ *Running `' "$log" || true)" \
+    "$(grep -c '^ *Fresh ' "$log" || true)" "$outcomes" "$range" >> "$out/sentinels.jsonl"
+  echo "  $label $tool ${seconds}s status $status $outcomes" >&2
+  return 0
+}
+
+verdict() {
+  printf '{"sentinel":"%s","verdict":"%s","detail":%s}\n' "$name" "$1" \
+    "$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$2")" >> "$out/sentinels.jsonl"
+  echo "  verdict $1: $2" >&2
+}
+
+# The program's output in worktree $1, as the sentinel runs it.
+run_output() {
+  local dir=$1
+  case $name in
+    pyo3)
+      local tmp
+      tmp=$(mktemp -d)
+      cp "$dir/target/debug/libsentinel_pyo3.so" "$tmp/sentinel_pyo3.so" 2>&1 || true
+      env -C "$tmp" python3 -c 'import sentinel_pyo3; print(sentinel_pyo3.greet())' 2>&1 || true
+      rm -rf "$tmp"
+      ;;
+    # A binary of bevy's dynamic_linking loads libbevy_dylib.so from the directory of its unit, and the toolchain's
+    # libstd, which cargo run would find.
+    bevy)
+      local dylib
+      dylib=$(find "$dir/target/debug" -name libbevy_dylib.so -print -quit)
+      local std=$HOME/.rustup/toolchains/$toolchain-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib
+      env -C "$dir" LD_LIBRARY_PATH="${dylib%/*}:$std" \
+        "$dir/target/debug/sentinel-$name" 2>&1 | sed "s|$dir/||g" || echo "exit $?"
+      ;;
+    *) env -C "$dir" "$dir/target/debug/sentinel-$name" 2>&1 || echo "exit $?" ;;
+  esac
+}
+
+# The input of the sentinel that changes in worktree $1.
+change() {
+  local dir=$1
+  case $name in
+    prost) sed -i 's/^}$/  string extra = 3;\n}/' "$dir/proto/hello.proto" ;;
+    embed)
+      echo "asset of the edited worktree" > "$dir/assets/hello.txt"
+      echo "template of the edited worktree, for {{ name }}" > "$dir/templates/hello.html"
+      ;;
+    vergen) fixed_git -C "$dir" commit -q --allow-empty -m "A new commit" ;;
+    pyo3) sed -i 's/greeting of the first commit/greeting of the edited worktree/' "$dir/src/lib.rs" ;;
+    cxx) sed -i 's/1469598103934665603ull/1469598103934665604ull/' "$dir/src/blob.cc" ;;
+    *) sed -i 's/^fn main() {$/fn main() {\n    println!("edited");/' "$dir/src/main.rs" ;;
+  esac
+}
+
+worktree() {
+  git -C "$work/repo" -c advice.detachedHead=false worktree add -q --detach "$1" HEAD
+}
+
+# A crate of bench/sentinels: A, P and B as above.
+crate() {
+  rm -rf "$work"
+  mkdir -p "$work"
+  cp -r "$here/sentinels/$name" "$work/repo"
+  git -C "$work/repo" init -q
+  ONLINE=1 cargo_with none "$work/repo" generate-lockfile -q
+  ONLINE=1 cargo_with none "$work/repo" fetch -q
+  git -C "$work/repo" add -A
+  fixed_git -C "$work/repo" commit -q -m "The sentinel"
+  cp "$work/repo/Cargo.lock" "$out/logs/sentinel.$name.Cargo.lock"
+  worktree "$work/a"
+  worktree "$work/p"
+  sleep 1.5
+  step cold trucker "$work/a" build
+  step cold none "$work/p" build
+  local a0 p0 b0 b1 p1 a1
+  a0=$(run_output "$work/a")
+  p0=$(run_output "$work/p")
+  worktree "$work/b"
+  sleep 1.5
+  step fresh trucker "$work/b" build
+  b0=$(run_output "$work/b")
+  change "$work/b"
+  change "$work/p"
+  # trucker stores no own crate whose sources changed in the second before its compile.
+  sleep 1.5
+  step changed trucker "$work/b" build
+  step changed none "$work/p" build
+  b1=$(run_output "$work/b")
+  p1=$(run_output "$work/p")
+  a1=$(run_output "$work/a")
+  printf 'A cold:\n%s\nP cold:\n%s\nB fresh:\n%s\nB changed:\n%s\nP changed:\n%s\nA after:\n%s\n' \
+    "$a0" "$p0" "$b0" "$b1" "$p1" "$a1" > "$out/logs/sentinel.$name.outputs"
+  local problems=()
+  [ "$a0" = "$p0" ] || problems+=("A's cold output differs from plain cargo's")
+  [ "$b0" = "$p0" ] || problems+=("B's fresh output differs from plain cargo's")
+  [ "$b1" = "$p1" ] || problems+=("B's changed output differs from plain cargo's")
+  [ "$b1" != "$b0" ] || problems+=("B's output did not change")
+  [ "$a1" = "$a0" ] || problems+=("A's output changed")
+  if [ "$name" = vergen ]; then
+    case $b1 in *"$(git -C "$work/b" rev-parse HEAD)"*) ;; *) problems+=("B does not embed its own commit") ;; esac
+  fi
+  case $b0$b1$p0 in *"exit "* | *Error* | *rror:*) problems+=("a program failed") ;; esac
+  if [ ${#problems[@]} -eq 0 ]; then
+    verdict pass "$(printf '%s' "$b1" | head -c 300)"
+  else
+    verdict fail "$(IFS='; '; echo "${problems[*]}")"
+  fi
+  XDG_CACHE_HOME="$work/cache" "$trucker" stats > "$out/logs/sentinel.$name.stats" 2>&1 || true
+}
+
+for name in "$@"; do
+  work=$fs/sentinel/$name
+  echo "== sentinel $name $(date -u +%T) $(cut -d' ' -f1-3 /proc/loadavg)" >&2
+  EXTRA_ENV=()
+  claim
+  if [ -f "$here/sentinels/$name/sentinel" ]; then
+    # shellcheck source=/dev/null
+    . "$here/sentinels/$name/sentinel"
+  else
+    crate
+  fi
+  release
+  chmod -R u+w "$work" 2> /dev/null || true
+  rm -rf "$work"
+done

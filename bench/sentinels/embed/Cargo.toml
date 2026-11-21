@@ -1,0 +1,9 @@
+[package]
+name = "sentinel-embed"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+askama = "0.16"
+rust-embed = { version = "8", features = ["debug-embed"] }

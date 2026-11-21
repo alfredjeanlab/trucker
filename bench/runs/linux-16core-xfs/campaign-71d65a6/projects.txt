@@ -1,0 +1,10 @@
+project ripgrep: e89fff89ac9af12e8d4ce9d5fd07beb408ca730f
+project ripgrep: e89fff89ac9af12e8d4ce9d5fd07beb408ca730f
+project cargo-vendored: 3acc79c0c841844675bc53a605922dbfc441e750
+project cargo-vendored: 3acc79c0c841844675bc53a605922dbfc441e750
+project cargo: 3acc79c0c841844675bc53a605922dbfc441e750
+project cargo: 3acc79c0c841844675bc53a605922dbfc441e750
+project rust: 0ef1bc386059596dada8fb65b50425aab2ea637a
+project rust: 0ef1bc386059596dada8fb65b50425aab2ea637a
+project zed: 2de9e435a5d98657f35c260b5f4dd0979df659e6
+project zed: 2de9e435a5d98657f35c260b5f4dd0979df659e6

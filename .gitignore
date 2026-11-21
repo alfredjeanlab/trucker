@@ -1,2 +1,10 @@
 /target
 .idea/
+# cargo's build logs of a benchmark run stay on the machine that ran it. trucker's store logs, checks and outputs stay.
+bench/runs/**/logs/*.log
+bench/runs/**/logs/*.log.[0-9]
+!bench/runs/**/logs/*.store.log
+!bench/runs/**/logs/*.store-before-cold.log
+bench/runs/**/uptime.log
+bench/runs/**/drive.log
+bench/runs/**/preflight.log

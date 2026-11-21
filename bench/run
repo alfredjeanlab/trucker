@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# Times cargo builds with each build cache, in each scenario of the README, in the manner of ripgrep's benchsuite.
+#
+#   bench/run <root> <fs> <out> [project]...
+#
+# <root> holds what bench/setup made. <fs> is the directory on the filesystem under test, where the worktrees, clones,
+# targets and caches go: <root> itself for the filesystem with reflinks, or one on a filesystem without them. The
+# projects are ripgrep, cargo, cargo-vendored, rust and zed by default.
+#
+# TOOLS picks the tools and their order, from none, trucker, sccache, mbx, kache, shared, builddir and reflink.
+# The next project runs them in the reverse order. SCENARIOS picks from these:
+#
+# - 1a is a cold build through hyperfine, whose --prepare empties the cache and the target before each run.
+# - 1c is a separate clone at another path, and 1d a new worktree after the first is removed.
+# - seq is a new worktree of the same commit (1b), two edits of its leaf crate (2c, 2d) and then two of its most
+#   depended-on crate (2a, 2b). Each edit appends an unused function with a new name, so that no cache has seen it.
+# - growth is scenario 3, the six commits before the release and four edits, test is `cargo test --no-run` in a new
+#   worktree and after an edit, and conc is four new worktrees building at once.
+#
+# RUNS is the number of runs of each scenario, COLD_RUNS of 1a, and CLONE_RUNS of 1c. LEAF=0 skips 2c and 2d. On Linux
+# every build is pinned to CPUS. Each record of <out>/steps.jsonl is one timed build:
+#
+# - rustc counts the rustc runs and build script runs that cargo started, by its -v output, and fresh the units that
+#   it found up to date.
+# - restored is what the tool served, by trucker's log, the statistics of sccache or kache, or the summary of mbx.
+# - target is the apparent size of the target directory, and store the size of the tool's own store, by du.
+# - added is what the build added to the filesystem, by df once deletes have settled, and total what the tool's
+#   builds of the project have added in all.
+# - times is the time of each run of a step that hyperfine timed, 1a or 1c, whose seconds is null.
+# - store_log names trucker's log of the project in <out>, and store_lines the first and last line of the build in it,
+#   counted from 1. A build that logged nothing has a last line one before its first.
+set -euo pipefail
+
+# On Linux the whole run is pinned to CPUS, so that cargo, hyperfine and every tool see the same cores each time.
+cpus=${CPUS:-1-15}
+if [ -z "${BENCH_PINNED:-}" ] && command -v taskset > /dev/null; then
+  BENCH_PINNED=1 exec taskset -c "$cpus" "$0" "$@"
+fi
+
+root=$(realpath "$1")
+mkdir -p "$2" "$3"
+fs=$(realpath "$2")
+out=$(realpath "$3")
+shift 3
+here=$(realpath "$(dirname "$0")")
+bin=$root/bin
+# TRUCKER names another build of trucker to measure in place of the installed one.
+trucker=${TRUCKER:-$bin/trucker}
+read -ra tools <<< "${TOOLS:-none trucker sccache mbx shared reflink}"
+read -ra scenarios <<< "${SCENARIOS:-1a 1c seq growth}"
+runs=${RUNS:-3}
+cold_runs=${COLD_RUNS:-3}
+toolchain=${RUSTUP_TOOLCHAIN:-1.100.0}
+
+# The workspace of each project within its repository, the source file of its most depended-on own crate, which every
+# other own crate of the build depends on, and that of a leaf crate, which nothing depends on. An edit appends an
+# unused function to the end of the file.
+declare -A workspace=(
+  [ripgrep]=. [cargo]=. [cargo-vendored]=. [serde]=. [rust]=src/tools/rust-analyzer [ruff]=. [sccache]=.
+  [mr-boxington]=. [trucker]=. [nushell]=. [uv]=. [zed]=.
+)
+declare -A deep=(
+  [ripgrep]=crates/matcher/src/lib.rs
+  [cargo]=crates/cargo-util/src/lib.rs
+  [cargo-vendored]=crates/cargo-util/src/lib.rs
+  [serde]=serde_core/src/lib.rs
+  [rust]=crates/stdx/src/lib.rs
+  [ruff]=crates/ruff_text_size/src/lib.rs
+  [sccache]=src/lib.rs
+  [mr-boxington]=crates/mbx-cache-protocol/src/lib.rs
+  [trucker]=src/main.rs
+  [nushell]=crates/nu-utils/src/lib.rs
+  [uv]=crates/uv-version/src/lib.rs
+  [zed]=crates/collections/src/collections.rs
+)
+# The arguments that a project's build needs beyond `cargo build`. cargo-vendored is a clone of cargo that builds its
+# own copy of OpenSSL, whose build script bakes its OUT_DIR into the outputs.
+declare -A extra=([cargo-vendored]="--features vendored-openssl")
+declare -A leaf=(
+  [ripgrep]=crates/core/main.rs
+  [cargo]=src/bin/cargo/main.rs
+  [cargo-vendored]=src/bin/cargo/main.rs
+  [serde]=serde/src/lib.rs
+  [rust]=crates/rust-analyzer/src/bin/main.rs
+  [ruff]=crates/ruff/src/main.rs
+  [sccache]=src/main.rs
+  [mr-boxington]=crates/mbx/src/main.rs
+  [trucker]=
+  [nushell]=src/main.rs
+  [uv]=crates/uv/src/bin/uv.rs
+  [zed]=crates/zed/src/main.rs
+)
+
+# PROJECTS names a file of more projects, one per line as `<name> <workspace> <deep file> <leaf file>`, each a
+# repository at <root>/src/<name> with a branch named bench.
+if [ -n "${PROJECTS:-}" ]; then
+  while read -r p w d l; do workspace[$p]=$w deep[$p]=$d leaf[$p]=$l; done < "$PROJECTS"
+fi
+
+# BENCH_HOLD names a line of the ledger that a script running several of these holds for all of them, so that no other
+# run takes the cores between two of its invocations; this run does not wait for that line.
+# The ledger shares the cores of the box between agents: a timing waits until it can hold all of CPUS, and while the
+# load is below the cores of the box, and holds them until it ends.
+ledger=$HOME/ledger
+name=trucker-bench-$$
+cores=$(( $(nproc --all) - 1 ))
+claim() {
+  [ -e "$ledger" ] || return 0
+  while true; do
+    local now held load
+    now=$(date +%s)
+    held=$(awk -v now="$now" -v me="$name" -v hold="${BENCH_HOLD:-}" \
+      '$1 != me && $1 != hold && $3 > now {n += $2} END {print n + 0}' "$ledger")
+    load=$(cut -d' ' -f1 /proc/loadavg)
+    if [ "$held" -eq 0 ] && awk -v l="$load" -v c="$(nproc --all)" 'BEGIN {exit !(l < c)}'; then break; fi
+    echo "waiting: $held cores held, load $load" >&2
+    sleep 60
+  done
+  release
+  printf '%s\t%s\t%s\n' "$name" "$cores" "$(( $(date +%s) + 3 * 3600 ))" >> "$ledger"
+  echo "$(date -u +%FT%TZ) $(uptime)" >> "$out/uptime.log"
+}
+release() {
+  [ -e "$ledger" ] || return 0
+  local rest
+  rest=$(grep -v "^$name	" "$ledger" || true)
+  printf '%s' "${rest:+$rest$'\n'}" > "$ledger"
+}
+trap release EXIT
+
+# The filesystem's used bytes, once deletes have settled: XFS frees blocks after an unlink returns.
+used() {
+  sync
+  local before after
+  after=$(df --output=used -B1 "$fs" | tail -1)
+  for _ in $(seq 30); do
+    sleep 1
+    before=$after
+    after=$(df --output=used -B1 "$fs" | tail -1)
+    [ "$before" = "$after" ] && break
+  done
+  echo "$after"
+}
+bytes() { if [ -e "$1" ]; then du -s "${@:2}" -B1 "$1/" 2> /dev/null | cut -f1; else echo 0; fi; }
+
+cache() { echo "$fs/cache/$1"; }
+# The directory that holds the tool's own store, excluding what is a target directory.
+store_size() {
+  case $1 in
+    trucker | sccache | kache | builddir) bytes "$(cache "$1")" ;;
+    mbx) du -s -B1 --exclude=targets "$(cache mbx)/" 2> /dev/null | cut -f1 || echo 0 ;;
+    *) echo 0 ;;
+  esac
+}
+# The target directory that a build in workspace $2 writes, which for shared is the one directory of every worktree.
+target_of() {
+  case $1 in
+    shared) echo "$(cache shared)/$project" ;;
+    *) echo "$2/target" ;;
+  esac
+}
+
+# Builds the workspace in $2 with tool $1, with cargo's verbose output in $3, so that each rustc it runs is counted.
+# $4 is the cargo command, `build` unless it is given, such as `test --no-run`.
+build() {
+  local tool=$1 dir=$2 log=$3
+  local sub
+  read -ra sub <<< "${4:-build}"
+  local args=(-v ${extra[$project]:-})
+  local env=(
+    env -C "$dir" -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER CARGO_HOME="$root/cargo" CARGO_NET_OFFLINE=true
+    RUSTUP_TOOLCHAIN="$toolchain" CARGO_TERM_COLOR=never PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+  )
+  case $tool in
+    none) "${env[@]}" RUSTC_WRAPPER= cargo "${sub[@]}" "${args[@]}" ;;
+    trucker) "${env[@]}" RUSTC_WRAPPER="$trucker" XDG_CACHE_HOME="$(cache trucker)" cargo "${sub[@]}" "${args[@]}" ;;
+    sccache) "${env[@]}" RUSTC_WRAPPER="$bin/sccache" SCCACHE_DIR="$(cache sccache)" cargo "${sub[@]}" "${args[@]}" ;;
+    # mbx defers to a rustc-wrapper that the repository's .cargo/config.toml names, and then caches no rustc run;
+    # MBX_OVERRIDE_WRAPPER=1 empties that setting for mbx alone.
+    mbx) "${env[@]}" ${MBX_OVERRIDE_WRAPPER:+CARGO_BUILD_RUSTC_WRAPPER=} MBX_CACHE_DIR="$(cache mbx)" XDG_CONFIG_HOME="$fs/config" \
+      MBX_SUMMARY=short "$bin/mbx" "${sub[@]}" "${args[@]}" ;;
+    # kache as `kache init` sets it up, with the cargo config that it wrote above the worktrees and its shims for
+    # cargo and the C compilers first on PATH. The variable of the test runner is what init adds to the shell.
+    kache) "${env[@]}" PATH="$(cache kache).home/.local/lib/kache/shims:$bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+      KACHE_CACHE_DIR="$(cache kache)" KACHE_LOCAL_ONLY=1 XDG_CONFIG_HOME="$(cache kache).home/.config" \
+      XDG_CACHE_HOME="$(cache kache).home/.cache" CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="kache test-runner" \
+      cargo "${sub[@]}" "${args[@]}" ;;
+    builddir) "${env[@]}" RUSTC_WRAPPER= CARGO_BUILD_BUILD_DIR="$(cache builddir)/$project" cargo "${sub[@]}" "${args[@]}" ;;
+    shared) "${env[@]}" RUSTC_WRAPPER= CARGO_TARGET_DIR="$(target_of shared)" cargo "${sub[@]}" "${args[@]}" ;;
+    # A new worktree starts from a copy of the target directory of the first one, cloned where the filesystem can.
+    reflink)
+      [ -e "$dir/target" ] || cp -a --reflink=auto "$seed/$ws/target" "$dir/target"
+      "${env[@]}" RUSTC_WRAPPER= cargo "${sub[@]}" "${args[@]}"
+      ;;
+  esac > "$log" 2>&1
+}
+
+# The tool's count of the rustc runs it restored rather than compiled, over the build whose log is $2.
+restored() {
+  case $1 in
+    trucker)
+      local lines
+      lines=$(wc -l < "$(cache trucker)/trucker/log" 2> /dev/null || echo 0)
+      tail -n "+$(( ${trucker_lines:-0} + 1 ))" "$(cache trucker)/trucker/log" 2> /dev/null | awk '$4 == "hit"' | wc -l
+      trucker_lines=$lines
+      ;;
+    sccache)
+      local hits
+      hits=$(SCCACHE_DIR="$(cache sccache)" "$bin/sccache" --show-stats --stats-format json 2> /dev/null |
+        python3 -I -c 'import json, sys; print(sum(json.load(sys.stdin)["stats"]["cache_hits"]["counts"].values()))' ||
+        echo 0)
+      echo $(( hits - ${sccache_hits:-0} ))
+      sccache_hits=$hits
+      ;;
+    kache)
+      local hits
+      hits=$(KACHE_CACHE_DIR="$(cache "$1")" "$bin/kache" stats --json --since 7d 2> /dev/null |
+        python3 -I -c 'import json, sys; d = json.load(sys.stdin); print(d["local_hits"] + d["readonly_hits"])' || echo 0)
+      echo $(( hits - ${kache_hits:-0} ))
+      kache_hits=$hits
+      ;;
+    mbx) { grep -o '[0-9]* hits' "$2" || true; } | awk '{n += $1} END {print n + 0}' ;;
+    *) echo 0 ;;
+  esac
+}
+
+# Appends one record to steps.jsonl: a build of step $1, run $2, by tool $3 of the workspace in $4, that took $5
+# seconds, with the build log in $6 and the used bytes of the filesystem before it in $7. $8 is the JSON list of the
+# times of hyperfine's runs, where it timed the step.
+record() {
+  local step=$1 run=$2 tool=$3 dir=$4 seconds=$5 log=$6 before=$7 times=${8:-}
+  local target invocations fresh hits after lines=
+  # trucker's lines of this build, numbered as in the copy of its log, which holds $saved lines of an emptied store.
+  if [ "$tool" = trucker ]; then
+    lines=$(printf ',"store_log":"logs/%s.trucker.store.log","store_lines":[%s,%s]' "$project" \
+      "$(( saved + ${trucker_lines:-0} + 1 ))" "$(( saved + $(wc -l < "$(cache trucker)/trucker/log" 2> /dev/null || echo 0) ))")
+  fi
+  target=$(target_of "$tool" "$dir")
+  # Each rustc run and each run of a build script that cargo starts, whether the tool restores or compiles it.
+  invocations=$(grep -c '^ *Running `' "$log" || true)
+  fresh=$(grep -c '^ *Fresh ' "$log" || true)
+  hits=$(restored "$tool" "$log")
+  after=$(used)
+  printf '{"fs":"%s","project":"%s","tool":"%s","step":"%s","run":%s,"seconds":%s,%s"rustc":%s,"restored":%s,' \
+    "$fslabel" "$project" "$tool" "$step" "$run" "$seconds" "${times:+\"times\":$times,}" "$invocations" "${hits:-0}" \
+    >> "$out/steps.jsonl"
+  printf '"fresh":%s,"target":%s,"target_allocated":%s,"store":%s,"added":%s,"total":%s,"ok":%s%s}\n' \
+    "$fresh" "$(bytes "$target" --apparent-size)" "$(bytes "$target")" "$(store_size "$tool")" \
+    "$(( after - before ))" "$(( after - baseline ))" "$(grep -q '^error' "$log" && echo false || echo true)" "$lines" \
+    >> "$out/steps.jsonl"
+}
+
+# The times of the runs in hyperfine's export $1, as a JSON list, which is then deleted.
+times_of() {
+  python3 -I -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["results"][0]["times"], separators=(",", ":")))' "$1"
+  rm -f "$1"
+}
+
+# Times one build: step $1, run $2, tool $3, workspace $4, cargo command $5.
+timed() {
+  local step=$1 run=$2 tool=$3 dir=$4 sub=${5:-build} log=$out/logs/$project.$3.$1.$2.log before start end
+  before=$(used)
+  [ "$tool" = trucker ] && trucker_lines=$(wc -l < "$(cache trucker)/trucker/log" 2> /dev/null || echo 0)
+  [ "$tool" = sccache ] && restored sccache /dev/null > /dev/null
+  [ "$tool" = kache ] && restored "$tool" /dev/null > /dev/null
+  start=$(date +%s.%N)
+  build "$tool" "$dir" "$log" "$sub" || echo "build failed: $log" >&2
+  end=$(date +%s.%N)
+  record "$step" "$run" "$tool" "$dir" "$(awk -v a="$start" -v b="$end" 'BEGIN {printf "%.3f", b - a}')" "$log" "$before"
+}
+
+# The user and system seconds of the shell's children, from the second line of the output of `times` in $1.
+children() { sed -n 2p "$1" | sed 's/m/ /g; s/s//g' | awk '{printf "%.1f", $1 * 60 + $2 + $3 * 60 + $4}'; }
+
+# CHECK names a command that runs in the workspace $1 after the seed build and after each new worktree's build, such
+# as the built program with its arguments, whose output goes to $2 for a comparison between the tools.
+check() { [ -z "${CHECK:-}" ] || (cd "$1" && bash -c "$CHECK") > "$2" 2>&1 || true; }
+
+edit() { printf '\n#[allow(dead_code)]\nfn _bench_%s() {}\n' "$(date +%s%N)" >> "$1"; }
+
+# A new worktree of the project's repository at path $1, at the pinned commit.
+worktree() {
+  git -C "$src" worktree remove --force "$1" 2> /dev/null || { chmod -R u+w "$1" 2> /dev/null || true; rm -rf "$1"; }
+  git -C "$src" worktree prune
+  git -C "$src" -c advice.detachedHead=false worktree add -q --detach "$1" bench
+  # trucker stores no own crate whose sources are younger than a second.
+  sleep 1.5
+}
+
+# Stops the daemon that kache starts beside its store, which keeps its files open.
+stop_kache() {
+  KACHE_CACHE_DIR="$(cache "$1")" "$bin/kache" daemon stop > /dev/null 2>&1 || true
+  pkill -f "^$bin/kache-engine daemon" 2> /dev/null || true
+}
+
+# Removes every cache, target, worktree and clone of tool $1, and stops sccache's server, so that it starts cold.
+reset() {
+  [ "$1" = sccache ] && SCCACHE_DIR="$(cache sccache)" "$bin/sccache" --stop-server > /dev/null 2>&1 || true
+  [ "$1" = kache ] && stop_kache "$1"
+  # mbx makes the files of its store read-only.
+  chmod -R u+w "$(cache "$1")" "$work" 2> /dev/null || true
+  rm -rf "$(cache "$1")" "$work"
+  git -C "$src" worktree prune
+  mkdir -p "$work"
+  [ "$1" = kache ] && rm -rf "$(cache kache).home" "$fs/work/kache/.cargo"
+  return 0
+}
+
+# Runs `kache init` with a home of its own, which holds its shims, shell files and logs, and with CARGO_HOME at the
+# parent of the worktrees, where cargo finds the config that it writes. It starts the daemon on the store.
+kache_init() {
+  local home
+  home=$(cache kache).home
+  mkdir -p "$home"
+  env -C "$home" HOME="$home" CARGO_HOME="$fs/work/kache/.cargo" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+    XDG_CONFIG_HOME="$home/.config" XDG_CACHE_HOME="$home/.cache" XDG_DATA_HOME="$home/.local/share" \
+    XDG_STATE_HOME="$home/.local/state" SHELL=/bin/bash KACHE_CACHE_DIR="$(cache kache)" KACHE_LOCAL_ONLY=1 \
+    PATH="$bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" "$bin/kache" init --yes --no-service > "$out/logs/$project.kache.init" 2>&1
+  cp "$fs/work/kache/.cargo/config.toml" "$out/logs/$project.kache.config.toml"
+}
+
+fslabel=$(df --output=fstype "$fs" | tail -1)
+mkdir -p "$out/logs"
+{
+  echo "kernel: $(uname -sr)"
+  echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), cpus $cpus of $(nproc)"
+  echo "memory: $(free -g | awk '/Mem:/ {print $2}')G"
+  echo "filesystem: $fs, $fslabel, $(df --output=source "$fs" | tail -1)"
+  echo "hyperfine: $(hyperfine --version)"
+  echo "rustc: $(RUSTUP_TOOLCHAIN=$toolchain rustc --version)"
+  echo "cargo: $(RUSTUP_TOOLCHAIN=$toolchain cargo --version)"
+  echo "trucker: ${TRUCKER_COMMIT:-$(git -C "$here/.." rev-parse HEAD)}"
+  echo "sccache: $("$bin/sccache" --version)"
+  echo "mbx: $("$bin/mbx" --version)"
+  [ -x "$bin/kache" ] && echo "kache: $("$bin/kache" --version)"
+} > "$out/environment.$fslabel.txt"
+
+projects=("$@")
+[ ${#projects[@]} -gt 0 ] || projects=(ripgrep cargo cargo-vendored rust zed)
+for p in "${projects[@]}"; do echo "project $p: $(git -C "$root/src/$p" rev-parse bench)"; done >> "$out/projects.txt"
+for project in "${projects[@]}"; do
+  src=$root/src/$project
+  ws=${workspace[$project]}
+  claim
+  for tool in "${tools[@]}"; do
+    echo "== $project $tool $fslabel $(date -u +%T) $(uptime)" >&2
+    work=$fs/work/$tool/$project
+    seed=$work/main
+    reset "$tool"
+    rm -rf "$(cache shared)"
+    mkdir -p "$fs/cache"
+    baseline=$(used)
+    # The copy of trucker's log, which keeps the lines of a store that a step empties.
+    saved=0
+    [ "$tool" = trucker ] && : > "$out/logs/$project.trucker.store.log"
+    [ "$tool" = kache ] && kache_init
+    worktree "$seed"
+
+    # 1a: a cold build of an empty target with an empty cache, which also leaves the cache warm for every other step.
+    # A tool without a cache of its own builds cold exactly as plain cargo does, so only plain cargo is timed.
+    if [[ " ${scenarios[*]} " == *" 1a "* ]] && [[ $tool =~ ^(none|trucker|sccache|mbx|kache)$ ]]; then
+      prepare="chmod -R u+w $(cache "$tool") 2> /dev/null; rm -rf $seed/$ws/target $(cache "$tool"); "
+      [ "$tool" = sccache ] && prepare+="SCCACHE_DIR=$(cache sccache) $bin/sccache --stop-server >/dev/null 2>&1; "
+      [ "$tool" = kache ] && prepare+="KACHE_CACHE_DIR=$(cache "$tool") $bin/kache daemon stop >/dev/null 2>&1; pkill -f '^$bin/kache-engine daemon'; "
+      prepare+="sync; sleep 2"
+      hyperfine --shell bash --style basic --runs "$cold_runs" --prepare "$prepare" \
+        --export-json "$work/hyperfine.json" -n "$tool" \
+        "$(declare -f build cache target_of); $(declare -p root fs bin trucker toolchain project seed ws extra); MBX_OVERRIDE_WRAPPER=${MBX_OVERRIDE_WRAPPER:-}; \
+          build $tool $seed/$ws $out/logs/$project.$tool.1a.log"
+      trucker_lines=0 sccache_hits=0 kache_hits=0
+      record 1a 0 "$tool" "$seed/$ws" null "$out/logs/$project.$tool.1a.log" "$baseline" "$(times_of "$work/hyperfine.json")"
+    else
+      build "$tool" "$seed/$ws" "$out/logs/$project.$tool.seed.log" || echo "seed build failed" >&2
+    fi
+    [ "$tool" = trucker ] && trucker_lines=$(wc -l < "$(cache trucker)/trucker/log" 2> /dev/null || echo 0)
+    check "$seed/$ws" "$out/logs/$project.$tool.seed.check"
+
+    # 1d: the worktree of the cold build is removed, as `git worktree remove` does, and a new worktree at another path
+    # builds with the cache warm. The new worktree takes the place of the first in the steps after it.
+    if [[ " ${scenarios[*]} " == *" 1d "* ]] && [ "$tool" != none ]; then
+      git -C "$src" worktree remove --force "$seed" 2> /dev/null || { chmod -R u+w "$seed"; rm -rf "$seed"; }
+      git -C "$src" worktree prune
+      seed=$work/wt-1d
+      worktree "$seed"
+      timed 1d 1 "$tool" "$seed/$ws"
+    fi
+
+    # 1c: a separate clone of the repository at another path, with the cache warm.
+    if [[ " ${scenarios[*]} " == *" 1c "* ]] && [ "$tool" != none ]; then
+      clone=$work/clone
+      prepare="chmod -R u+w $clone 2> /dev/null; rm -rf $clone; git clone -q --branch bench $src $clone; sync; df --output=used -B1 $fs | tail -1 > $work/df"
+      # The tool's counts before the last run, so that the work recorded is that of one build.
+      prepare+="; wc -l < $(cache trucker)/trucker/log > $work/lines 2> /dev/null || echo 0 > $work/lines"
+      [ "$tool" = sccache ] && prepare+="; SCCACHE_DIR=$(cache sccache) $bin/sccache --zero-stats > /dev/null"
+      [ "$tool" = kache ] && prepare+="; KACHE_CACHE_DIR=$(cache "$tool") $bin/kache stats --json --since 7d | python3 -I -c 'import json, sys; d = json.load(sys.stdin); print(d[\"local_hits\"] + d[\"readonly_hits\"])' > $work/kache"
+      hyperfine --shell bash --style basic --runs "${CLONE_RUNS:-$cold_runs}" --prepare "$prepare" \
+        --export-json "$work/hyperfine.json" -n "$tool" \
+        "$(declare -f build cache target_of); $(declare -p root fs bin trucker toolchain project seed ws extra); MBX_OVERRIDE_WRAPPER=${MBX_OVERRIDE_WRAPPER:-}; \
+          build $tool $clone/$ws $out/logs/$project.$tool.1c.log"
+      trucker_lines=$(cat "$work/lines") sccache_hits=0
+      [ "$tool" = kache ] && kache_hits=$(cat "$work/kache")
+      record 1c 0 "$tool" "$clone/$ws" null "$out/logs/$project.$tool.1c.log" "$(cat "$work/df")" \
+        "$(times_of "$work/hyperfine.json")"
+      chmod -R u+w "$clone" && rm -rf "$clone"
+    fi
+
+    # 1b, then 2c and 2d, then 2a and 2b: a new worktree with the cache warm, two edits of a leaf crate, then two of its
+    # most depended-on crate. Nothing that the leaf edits compile is a dependency of the deep crate, so each first
+    # edit is still the first of its crate since the worktree was made. Plain cargo has no cache, so its new worktree
+    # builds cold as in 1a, and its edits run in the worktree of 1a.
+    if [[ " ${scenarios[*]} " == *" seq "* ]]; then
+      for run in $(seq "$runs"); do
+        d=$seed
+        if [ "$tool" != none ]; then
+          d=$work/wt-$run
+          worktree "$d"
+          timed 1b "$run" "$tool" "$d/$ws"
+          check "$d/$ws" "$out/logs/$project.$tool.1b.$run.check"
+        fi
+        if [ "${LEAF:-1}" = 1 ] && [ -n "${leaf[$project]}" ]; then
+          edit "$d/$ws/${leaf[$project]}"
+          timed 2c "$run" "$tool" "$d/$ws"
+          edit "$d/$ws/${leaf[$project]}"
+          timed 2d "$run" "$tool" "$d/$ws"
+        fi
+        edit "$d/$ws/${deep[$project]}"
+        timed 2a "$run" "$tool" "$d/$ws"
+        edit "$d/$ws/${deep[$project]}"
+        timed 2b "$run" "$tool" "$d/$ws"
+        [ "$tool" = none ] || git -C "$src" worktree remove --force "$d" 2> /dev/null || true
+      done
+      git -C "$seed" checkout -q -- .
+    fi
+
+    # 3, growth: the worktree of 1a walks back through the six commits before the release, building each, then edits
+    # its most depended-on crate four times, with the target, the store and the filesystem measured after each build.
+    if [[ " ${scenarios[*]} " == *" growth "* ]]; then
+      d=$seed
+      step=0
+      timed g0 0 "$tool" "$d/$ws"
+      for commit in $(git -C "$src" rev-list --first-parent -n 7 bench | tail -n +2); do
+        step=$(( step + 1 ))
+        git -C "$d" -c advice.detachedHead=false checkout -q "$commit"
+        timed "g$step" 0 "$tool" "$d/$ws"
+      done
+      git -C "$d" checkout -q --detach bench
+      timed g7 0 "$tool" "$d/$ws"
+      for i in 1 2 3 4; do
+        edit "$d/$ws/${deep[$project]}"
+        timed "g$(( 7 + i ))" 0 "$tool" "$d/$ws"
+      done
+    fi
+    # Tests: `cargo test --no-run` in a new worktree, with the cache warm from the same command in the worktree of 1a,
+    # then after an edit of the most depended-on crate. Plain cargo's new worktree builds its tests cold.
+    if [[ " ${scenarios[*]} " == *" test "* ]]; then
+      build "$tool" "$seed/$ws" "$out/logs/$project.$tool.testseed.log" "test --no-run" || echo "test seed failed" >&2
+      for run in $(seq "$runs"); do
+        d=$work/wt-test-$run
+        worktree "$d"
+        timed t1b "$run" "$tool" "$d/$ws" "test --no-run"
+        edit "$d/$ws/${deep[$project]}"
+        timed t2a "$run" "$tool" "$d/$ws" "test --no-run"
+        git -C "$src" worktree remove --force "$d" 2> /dev/null || true
+      done
+    fi
+
+    # Concurrency: four new worktrees build at once, first with the cache warm, then with every cache and target of the
+    # tool emptied. The time is the makespan, the CPU that of every process that the builds waited for, which leaves
+    # out sccache's server, and the disk what the four added.
+    if [[ " ${scenarios[*]} " == *" conc "* ]]; then
+      for state in warm cold; do
+        if [ "$state" = cold ]; then
+          # Plain cargo has no cache, so its warm run is its cold one; a copied target has nothing to copy when cold.
+          [[ $tool =~ ^(none|reflink)$ ]] && continue
+          # The log of trucker's store goes with it, so the lines of the steps before are kept first.
+          if [ "$tool" = trucker ]; then
+            cat "$(cache trucker)/trucker/log" >> "$out/logs/$project.trucker.store.log" 2> /dev/null || true
+            saved=$(wc -l < "$out/logs/$project.trucker.store.log")
+          fi
+          [ "$tool" = sccache ] && { SCCACHE_DIR="$(cache sccache)" "$bin/sccache" --stop-server > /dev/null 2>&1 || true; }
+          [ "$tool" = kache ] && stop_kache "$tool"
+          chmod -R u+w "$(cache "$tool")" 2> /dev/null || true
+          rm -rf "$(cache "$tool")"
+          [ "$tool" = shared ] && rm -rf "$(cache shared)"
+        fi
+        for i in 1 2 3 4; do worktree "$work/c$i"; done
+        before=$(used)
+        [ "$tool" = trucker ] && trucker_lines=$(wc -l < "$(cache trucker)/trucker/log" 2> /dev/null || echo 0)
+        [ "$tool" = sccache ] && restored sccache /dev/null > /dev/null
+        [ "$tool" = kache ] && restored "$tool" /dev/null > /dev/null
+        times > "$work/times0"
+        start=$(date +%s.%N)
+        for i in 1 2 3 4; do build "$tool" "$work/c$i/$ws" "$out/logs/$project.$tool.c$state.$i.log" & done
+        wait
+        end=$(date +%s.%N)
+        times > "$work/times1"
+        cat "$out"/logs/"$project.$tool.c$state".?.log > "$out/logs/$project.$tool.c$state.log"
+        record "c$state" 0 "$tool" "$work/c1/$ws" "$(awk -v a="$start" -v b="$end" 'BEGIN {printf "%.3f", b - a}')" \
+          "$out/logs/$project.$tool.c$state.log" "$before"
+        cpu=$(awk -v a="$(children "$work/times1")" -v b="$(children "$work/times0")" 'BEGIN {printf "%.1f", a - b}')
+        printf '{"fs":"%s","project":"%s","tool":"%s","step":"c%s-cpu","cpu":%s}\n' "$fslabel" "$project" "$tool" "$state" \
+          "$cpu" >> "$out/cpu.jsonl"
+        for i in 1 2 3 4; do git -C "$src" worktree remove --force "$work/c$i" 2> /dev/null || true; done
+      done
+    fi
+
+    # What each tool says of its own work, kept before its cache goes.
+    case $tool in
+      trucker) cat "$(cache trucker)/trucker/log" >> "$out/logs/$project.trucker.store.log" 2> /dev/null || true ;;
+      sccache) SCCACHE_DIR="$(cache sccache)" "$bin/sccache" --show-stats > "$out/logs/$project.sccache.stats" 2>&1 || true ;;
+      kache) KACHE_CACHE_DIR="$(cache "$tool")" "$bin/kache" stats --full --format json --since 7d \
+        > "$out/logs/$project.$tool.stats.json" 2> /dev/null || true ;;
+      mbx) MBX_CACHE_DIR="$(cache mbx)" XDG_CONFIG_HOME="$fs/config" "$bin/mbx" stats > "$out/logs/$project.mbx.stats" 2>&1 || true ;;
+    esac
+    [ "$tool" = sccache ] && SCCACHE_DIR="$(cache sccache)" "$bin/sccache" --stop-server > /dev/null 2>&1 || true
+    reset "$tool"
+  done
+  release
+  # The next project runs the tools in the reverse order, in case a slow drift of the machine favors whichever is first.
+  for (( i = ${#tools[@]} - 1, j = 0; i > j; i--, j++ )); do t=${tools[i]}; tools[i]=${tools[j]}; tools[j]=$t; done
+done
+chmod -R u+w "$fs/cache" 2> /dev/null || true
+rm -rf "$fs/cache" "$fs/config"

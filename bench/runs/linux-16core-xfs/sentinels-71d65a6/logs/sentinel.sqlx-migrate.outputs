@@ -1,0 +1,15 @@
+A (trucker):
+20260101000000 users 72a7812119d92733
+1 migrations
+P (plain, as A):
+20260101000000 users 72a7812119d92733
+1 migrations
+B (trucker, a second migration):
+20260101000000 users 72a7812119d92733
+20260102000000 email 4b886657d12acaaa
+2 migrations
+Q (plain, as B):
+20260101000000 users 72a7812119d92733
+20260102000000 email 4b886657d12acaaa
+2 migrations
+dep-info of Q names: migrations/20260101000000_users.sql migrations/20260102000000_email.sql 

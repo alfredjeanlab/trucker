@@ -1,0 +1,10 @@
+[package]
+name = "sentinel-vergen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[build-dependencies]
+vergen-gitcl = "10"

@@ -1,0 +1,24 @@
+mbx · since 2026-11-21
+store: /home/ops/trucker-bench/cache/mbx/actions
+
+compiler time avoided    3s (estimated)
+builds                   6
+cache hits               364
+compilations             364 hits, 9 misses, 478 not looked up, 3 bypassed since 2026-11-21
+pruned by mbx            1.9 GiB logical
+  targets / cache        1.9 GiB logical / 0 B logical
+automatically pruned     1.9 GiB logical since 2026-11-21
+requested removals       0 B logical
+copying avoided          978.9 MiB (cumulative)
+
+shared cache             5.4 GiB in 1633 objects
+managed targets          2 (6.6 GiB)
+live workspaces          1
+with separate caches     3.3 GiB
+duplication avoided      at least 0 B (estimated)
+
+Sharing is a lower-bound estimate of logical cache bytes, excluding targets.
+Pruned totals are logical file sizes, not physical space reclaimed; requested removals are separate.
+Compiler time and copying avoided are cumulative, not wall time or current disk savings.
+
+1.9 GiB logical taken out with the trash. You did not lift a finger.

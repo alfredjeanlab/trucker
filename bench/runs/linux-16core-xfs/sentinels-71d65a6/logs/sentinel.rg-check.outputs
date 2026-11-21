@@ -1,0 +1,8 @@
+trucker:
+ripgrep 15.2.0 (rev e89fff89ac)
+crates/core/main.rs:11
+crates/matcher/src/lib.rs:88
+plain cargo:
+ripgrep 15.2.0 (rev e89fff89ac)
+crates/core/main.rs:11
+crates/matcher/src/lib.rs:88

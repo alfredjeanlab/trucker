@@ -1,0 +1,6 @@
+    303       1.5 s  hit
+    154      57.0 s  miss
+      1       0.7 s  miss session
+      2       0.1 s  passthrough rustc-failed
+66.2% of the cached invocations hit
+the store held 0.0 GB at its last gc, of a cap of 33.4 GB computed from its filesystem, both counting the length of its files, which clones may share

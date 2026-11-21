@@ -1,0 +1,20 @@
+A cold:
+client hello written: true
+aws-lc-rs suites: 9
+P cold:
+client hello written: true
+aws-lc-rs suites: 9
+B fresh:
+client hello written: true
+aws-lc-rs suites: 9
+B changed:
+edited
+client hello written: true
+aws-lc-rs suites: 9
+P changed:
+edited
+client hello written: true
+aws-lc-rs suites: 9
+A after:
+client hello written: true
+aws-lc-rs suites: 9

@@ -1,0 +1,141 @@
+{"sentinel":"sqlx-migrate","step":"a-cold","tool":"trucker","seconds":11.058,"status":0,"ran":145,"fresh":0,"outcomes":{"miss": 145},"store_log":"logs/sentinel.sqlx-migrate.store.log","store_lines":[1,150]}
+{"sentinel":"sqlx-migrate","step":"a-cold","tool":"none","seconds":9.424,"status":0,"ran":145,"fresh":0,"outcomes":{}}
+{"sentinel":"sqlx-migrate","step":"b-cross","tool":"trucker","seconds":1.066,"status":0,"ran":145,"fresh":0,"outcomes":{"hit": 144, "miss session": 1},"store_log":"logs/sentinel.sqlx-migrate.store.log","store_lines":[151,295]}
+{"sentinel":"sqlx-migrate","step":"b-cross","tool":"none","seconds":9.341,"status":0,"ran":145,"fresh":0,"outcomes":{}}
+{"sentinel":"sqlx-migrate","verdict":"pass","detail":"B gave '2 migrations' as plain cargo did; the dep-info names migrations/20260101000000_users.sql migrations/20260102000000_email.sql "}
+{"sentinel":"sqlx","step":"a-cold","tool":"trucker","seconds":10.797,"status":0,"ran":152,"fresh":0,"outcomes":{"miss": 152},"store_log":"logs/sentinel.sqlx.store.log","store_lines":[1,157]}
+{"sentinel":"sqlx","step":"a-cold","tool":"none","seconds":10.460,"status":0,"ran":152,"fresh":0,"outcomes":{}}
+{"sentinel":"sqlx","step":"b-cross","tool":"trucker","seconds":1.509,"status":0,"ran":152,"fresh":0,"outcomes":{"hit": 151, "miss session": 1},"store_log":"logs/sentinel.sqlx.store.log","store_lines":[158,309]}
+{"sentinel":"sqlx","step":"b-cross","tool":"none","seconds":10.436,"status":0,"ran":152,"fresh":0,"outcomes":{}}
+{"sentinel":"sqlx","step":"c-same","tool":"trucker","seconds":0.873,"status":0,"ran":152,"fresh":0,"outcomes":{"hit": 152},"store_log":"logs/sentinel.sqlx.store.log","store_lines":[310,461]}
+{"sentinel":"sqlx","step":"a-edited","tool":"trucker","seconds":0.135,"status":0,"ran":0,"fresh":115,"outcomes":{},"store_log":"logs/sentinel.sqlx.store.log","store_lines":[462,461]}
+{"sentinel":"sqlx","step":"a-edited","tool":"none","seconds":0.161,"status":0,"ran":0,"fresh":115,"outcomes":{}}
+{"sentinel":"sqlx","verdict":"pass","detail":"B gave 'name: core::option::Option<alloc::string::String> = Some(\"sentinel\")' as plain cargo did, A 'name: alloc::string::String = \"sentinel\"'; C as A with 0 misses; plain cargo after the edit of .sqlx in place: unchanged, its blind spot"}
+{"sentinel":"rustls","step":"cold","tool":"trucker","seconds":13.565,"status":0,"ran":29,"fresh":0,"outcomes":{"miss": 29},"store_log":"logs/sentinel.rustls.store.log","store_lines":[1,30]}
+{"sentinel":"rustls","step":"cold","tool":"none","seconds":12.142,"status":0,"ran":29,"fresh":0,"outcomes":{}}
+{"sentinel":"rustls","step":"fresh","tool":"trucker","seconds":0.614,"status":0,"ran":29,"fresh":0,"outcomes":{"hit": 29},"store_log":"logs/sentinel.rustls.store.log","store_lines":[31,59]}
+{"sentinel":"rustls","step":"changed","tool":"trucker","seconds":0.406,"status":0,"ran":1,"fresh":20,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.rustls.store.log","store_lines":[60,60]}
+{"sentinel":"rustls","step":"changed","tool":"none","seconds":0.425,"status":0,"ran":1,"fresh":20,"outcomes":{}}
+{"sentinel":"rustls","verdict":"pass","detail":"edited\nclient hello written: true\naws-lc-rs suites: 9"}
+{"sentinel":"rocksdb","step":"cold","tool":"trucker","seconds":138.398,"status":0,"ran":56,"fresh":0,"outcomes":{"miss": 56},"store_log":"logs/sentinel.rocksdb.store.log","store_lines":[1,60]}
+{"sentinel":"rocksdb","step":"cold","tool":"none","seconds":125.892,"status":0,"ran":56,"fresh":0,"outcomes":{}}
+{"sentinel":"rocksdb","step":"fresh","tool":"trucker","seconds":2.819,"status":0,"ran":56,"fresh":0,"outcomes":{"hit": 56},"store_log":"logs/sentinel.rocksdb.store.log","store_lines":[61,116]}
+{"sentinel":"rocksdb","step":"changed","tool":"trucker","seconds":0.757,"status":0,"ran":1,"fresh":35,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.rocksdb.store.log","store_lines":[117,117]}
+{"sentinel":"rocksdb","step":"changed","tool":"none","seconds":0.643,"status":0,"ran":1,"fresh":35,"outcomes":{}}
+{"sentinel":"rocksdb","verdict":"pass","detail":"edited\nrocksdb read: value"}
+{"sentinel":"jemalloc","step":"cold","tool":"trucker","seconds":45.537,"status":0,"ran":15,"fresh":0,"outcomes":{"miss": 15},"store_log":"logs/sentinel.jemalloc.store.log","store_lines":[1,16]}
+{"sentinel":"jemalloc","step":"cold","tool":"none","seconds":43.563,"status":0,"ran":15,"fresh":0,"outcomes":{}}
+{"sentinel":"jemalloc","step":"fresh","tool":"trucker","seconds":0.439,"status":0,"ran":15,"fresh":0,"outcomes":{"hit": 15},"store_log":"logs/sentinel.jemalloc.store.log","store_lines":[17,31]}
+{"sentinel":"jemalloc","step":"changed","tool":"trucker","seconds":0.350,"status":0,"ran":1,"fresh":8,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.jemalloc.store.log","store_lines":[32,32]}
+{"sentinel":"jemalloc","step":"changed","tool":"none","seconds":0.343,"status":0,"ran":1,"fresh":8,"outcomes":{}}
+{"sentinel":"jemalloc","verdict":"pass","detail":"edited\nsum: 499999500000\njemalloc: 5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"}
+{"sentinel":"openssl","step":"cold","tool":"trucker","seconds":33.620,"status":0,"ran":29,"fresh":0,"outcomes":{"miss": 29},"store_log":"logs/sentinel.openssl.store.log","store_lines":[1,33]}
+{"sentinel":"openssl","step":"cold","tool":"none","seconds":32.009,"status":0,"ran":29,"fresh":0,"outcomes":{}}
+{"sentinel":"openssl","step":"fresh","tool":"trucker","seconds":0.501,"status":0,"ran":29,"fresh":0,"outcomes":{"hit": 29},"store_log":"logs/sentinel.openssl.store.log","store_lines":[34,62]}
+{"sentinel":"openssl","step":"changed","tool":"trucker","seconds":0.427,"status":0,"ran":1,"fresh":18,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.openssl.store.log","store_lines":[63,63]}
+{"sentinel":"openssl","step":"changed","tool":"none","seconds":0.426,"status":0,"ran":1,"fresh":18,"outcomes":{}}
+{"sentinel":"openssl","verdict":"pass","detail":"edited\nOpenSSL 3.6.3 9 Jun 2026\nsha256: 2b7847b7b705781d7cf21a05e9c1bb37cbf078aea103bc3edcc6aca52ab65453"}
+{"sentinel":"wasmtime","step":"cold","tool":"trucker","seconds":105.017,"status":0,"ran":402,"fresh":0,"outcomes":{"miss": 381, "passthrough baked-path": 3, "passthrough baked-slot": 2},"store_log":"logs/sentinel.wasmtime.store.log","store_lines":[1,394]}
+{"sentinel":"wasmtime","step":"cold","tool":"none","seconds":97.426,"status":0,"ran":402,"fresh":0,"outcomes":{}}
+{"sentinel":"wasmtime","step":"fresh","tool":"trucker","seconds":22.495,"status":0,"ran":402,"fresh":0,"outcomes":{"hit": 367, "passthrough baked-path": 5, "miss session": 14},"store_log":"logs/sentinel.wasmtime.store.log","store_lines":[395,780]}
+{"sentinel":"wasmtime","step":"changed","tool":"trucker","seconds":15.956,"status":0,"ran":16,"fresh":264,"outcomes":{"miss": 16},"store_log":"logs/sentinel.wasmtime.store.log","store_lines":[781,796]}
+{"sentinel":"wasmtime","step":"changed","tool":"none","seconds":15.828,"status":0,"ran":16,"fresh":264,"outcomes":{}}
+{"sentinel":"wasmtime","verdict":"pass","detail":"wasmtime 50.0.2 warning: using `--invoke` with a function that takes arguments is experimental and may break in the future warning: using `--invoke` with a function that returns values is experimental and may break in the future 5  at v50.0.2"}
+{"sentinel":"prost","step":"cold","tool":"trucker","seconds":4.457,"status":0,"ran":47,"fresh":0,"outcomes":{"miss": 46},"store_log":"logs/sentinel.prost.store.log","store_lines":[1,51]}
+{"sentinel":"prost","step":"cold","tool":"none","seconds":4.122,"status":0,"ran":47,"fresh":0,"outcomes":{}}
+{"sentinel":"prost","step":"fresh","tool":"trucker","seconds":0.424,"status":0,"ran":47,"fresh":0,"outcomes":{"hit": 46},"store_log":"logs/sentinel.prost.store.log","store_lines":[52,97]}
+{"sentinel":"prost","step":"changed","tool":"trucker","seconds":0.280,"status":0,"ran":2,"fresh":33,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.prost.store.log","store_lines":[98,98]}
+{"sentinel":"prost","step":"changed","tool":"none","seconds":0.331,"status":0,"ran":2,"fresh":33,"outcomes":{}}
+{"sentinel":"prost","verdict":"pass","detail":"Hello { name: \"sentinel\", count: 3, extra: \"\" }"}
+{"sentinel":"embed","step":"cold","tool":"trucker","seconds":7.276,"status":0,"ran":48,"fresh":0,"outcomes":{"miss": 48},"store_log":"logs/sentinel.embed.store.log","store_lines":[1,52]}
+{"sentinel":"embed","step":"cold","tool":"none","seconds":7.264,"status":0,"ran":48,"fresh":0,"outcomes":{}}
+{"sentinel":"embed","step":"fresh","tool":"trucker","seconds":0.400,"status":0,"ran":48,"fresh":0,"outcomes":{"hit": 48},"store_log":"logs/sentinel.embed.store.log","store_lines":[53,100]}
+{"sentinel":"embed","step":"changed","tool":"trucker","seconds":0.358,"status":0,"ran":1,"fresh":36,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.embed.store.log","store_lines":[101,101]}
+{"sentinel":"embed","step":"changed","tool":"none","seconds":0.370,"status":0,"ran":1,"fresh":36,"outcomes":{}}
+{"sentinel":"embed","verdict":"pass","detail":"asset of the edited worktree\ntemplate of the edited worktree, for sentinel"}
+{"sentinel":"vergen","step":"cold","tool":"trucker","seconds":6.596,"status":0,"ran":45,"fresh":0,"outcomes":{"miss": 44},"store_log":"logs/sentinel.vergen.store.log","store_lines":[1,49]}
+{"sentinel":"vergen","step":"cold","tool":"none","seconds":6.286,"status":0,"ran":45,"fresh":0,"outcomes":{}}
+{"sentinel":"vergen","step":"fresh","tool":"trucker","seconds":0.501,"status":0,"ran":45,"fresh":0,"outcomes":{"hit": 44},"store_log":"logs/sentinel.vergen.store.log","store_lines":[50,93]}
+{"sentinel":"vergen","step":"changed","tool":"trucker","seconds":0.319,"status":0,"ran":2,"fresh":24,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.vergen.store.log","store_lines":[94,94]}
+{"sentinel":"vergen","step":"changed","tool":"none","seconds":0.370,"status":0,"ran":2,"fresh":24,"outcomes":{}}
+{"sentinel":"vergen","verdict":"pass","detail":"commit: 3f6e04cebc7a7fbd85fd9c8b057b52e96f01cea2"}
+{"sentinel":"bevy","step":"cold","tool":"trucker","seconds":19.047,"status":0,"ran":98,"fresh":0,"outcomes":{"miss": 98},"store_log":"logs/sentinel.bevy.store.log","store_lines":[1,103]}
+{"sentinel":"bevy","step":"cold","tool":"none","seconds":19.028,"status":0,"ran":98,"fresh":0,"outcomes":{}}
+{"sentinel":"bevy","step":"fresh","tool":"trucker","seconds":0.706,"status":0,"ran":98,"fresh":0,"outcomes":{"hit": 98},"store_log":"logs/sentinel.bevy.store.log","store_lines":[104,201]}
+{"sentinel":"bevy","step":"changed","tool":"trucker","seconds":0.398,"status":0,"ran":1,"fresh":76,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.bevy.store.log","store_lines":[202,202]}
+{"sentinel":"bevy","step":"changed","tool":"none","seconds":0.396,"status":0,"ran":1,"fresh":76,"outcomes":{}}
+{"sentinel":"bevy","verdict":"pass","detail":"edited\nbevy system ran"}
+{"sentinel":"pyo3","step":"cold","tool":"trucker","seconds":6.959,"status":0,"ran":28,"fresh":0,"outcomes":{"miss": 28},"store_log":"logs/sentinel.pyo3.store.log","store_lines":[1,32]}
+{"sentinel":"pyo3","step":"cold","tool":"none","seconds":6.718,"status":0,"ran":28,"fresh":0,"outcomes":{}}
+{"sentinel":"pyo3","step":"fresh","tool":"trucker","seconds":0.306,"status":0,"ran":28,"fresh":0,"outcomes":{"hit": 28},"store_log":"logs/sentinel.pyo3.store.log","store_lines":[33,60]}
+{"sentinel":"pyo3","step":"changed","tool":"trucker","seconds":0.279,"status":0,"ran":1,"fresh":13,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.pyo3.store.log","store_lines":[61,61]}
+{"sentinel":"pyo3","step":"changed","tool":"none","seconds":0.343,"status":0,"ran":1,"fresh":13,"outcomes":{}}
+{"sentinel":"pyo3","verdict":"pass","detail":"greeting of the edited worktree"}
+{"sentinel":"rg-clippy","step":"clippy-cold","tool":"trucker","seconds":3.888,"status":0,"ran":54,"fresh":0,"outcomes":{"miss": 53},"store_log":"logs/sentinel.rg-clippy.store.log","store_lines":[1,55]}
+{"sentinel":"rg-clippy","step":"clippy-cold","tool":"none","seconds":3.791,"status":0,"ran":54,"fresh":0,"outcomes":{}}
+{"sentinel":"rg-clippy","step":"clippy-fresh","tool":"trucker","seconds":0.427,"status":0,"ran":54,"fresh":0,"outcomes":{"hit": 53},"store_log":"logs/sentinel.rg-clippy.store.log","store_lines":[56,108]}
+{"sentinel":"rg-clippy","step":"clippy-lint","tool":"trucker","seconds":0.446,"status":0,"ran":2,"fresh":33,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.rg-clippy.store.log","store_lines":[109,109]}
+{"sentinel":"rg-clippy","step":"clippy-lint","tool":"none","seconds":0.462,"status":0,"ran":2,"fresh":33,"outcomes":{}}
+{"sentinel":"rg-clippy","step":"clippy-lint-new","tool":"trucker","seconds":0.357,"status":0,"ran":54,"fresh":0,"outcomes":{"hit": 52, "hit promoted": 1},"store_log":"logs/sentinel.rg-clippy.store.log","store_lines":[110,162]}
+{"sentinel":"rg-clippy","step":"clippy-lint-again","tool":"trucker","seconds":0.125,"status":0,"ran":0,"fresh":34,"outcomes":{},"store_log":"logs/sentinel.rg-clippy.store.log","store_lines":[163,162]}
+{"sentinel":"rg-clippy","verdict":"pass","detail":"ptr_arg reported in B (1), P (1), a new worktree C (1) and B again (1); fresh B's warning lines 287, P's cold 287"}
+{"sentinel":"rg-coverage","step":"cov-cold","tool":"trucker","seconds":5.019,"status":0,"ran":3,"fresh":0,"outcomes":{"miss": 22, "passthrough coverage": 6},"store_log":"logs/sentinel.rg-coverage.store.log","store_lines":[1,29]}
+{"sentinel":"rg-coverage","step":"cov-cold","tool":"none","seconds":4.809,"status":0,"ran":3,"fresh":0,"outcomes":{}}
+{"sentinel":"rg-coverage","step":"cov-fresh","tool":"trucker","seconds":2.035,"status":0,"ran":3,"fresh":0,"outcomes":{"hit": 22, "passthrough coverage": 6},"store_log":"logs/sentinel.rg-coverage.store.log","store_lines":[30,58]}
+{"sentinel":"rg-coverage","verdict":"pass","detail":"TOTAL 2801 989 64.69% 391 161 58.82% 2661 1005 62.23% 0 0 -"}
+{"sentinel":"rg-check","step":"check-cold","tool":"trucker","seconds":1.403,"status":0,"ran":54,"fresh":0,"outcomes":{"hit": 43, "miss": 10},"store_log":"logs/sentinel.rg-check.store.log","store_lines":[1,53]}
+{"sentinel":"rg-check","step":"build-cold","tool":"trucker","seconds":5.277,"status":0,"ran":34,"fresh":0,"outcomes":{"hit": 8, "miss": 26},"store_log":"logs/sentinel.rg-check.store.log","store_lines":[54,87]}
+{"sentinel":"rg-check","step":"build-cold","tool":"none","seconds":6.284,"status":0,"ran":54,"fresh":0,"outcomes":{}}
+{"sentinel":"rg-check","step":"check-fresh","tool":"trucker","seconds":0.381,"status":0,"ran":54,"fresh":0,"outcomes":{"hit": 53},"store_log":"logs/sentinel.rg-check.store.log","store_lines":[88,140]}
+{"sentinel":"rg-check","step":"build-fresh","tool":"trucker","seconds":0.240,"status":0,"ran":34,"fresh":0,"outcomes":{"hit": 34},"store_log":"logs/sentinel.rg-check.store.log","store_lines":[141,174]}
+{"sentinel":"rg-check","verdict":"pass","detail":"check, then build"}
+{"sentinel":"rg-space","step":"cold","tool":"trucker","seconds":0.357,"status":0,"ran":54,"fresh":0,"outcomes":{"hit": 53},"store_log":"logs/sentinel.rg-space.store.log","store_lines":[1,53]}
+{"sentinel":"rg-space","step":"cold","tool":"none","seconds":6.189,"status":0,"ran":54,"fresh":0,"outcomes":{}}
+{"sentinel":"rg-space","step":"fresh-space","tool":"trucker","seconds":0.375,"status":0,"ran":54,"fresh":0,"outcomes":{"hit": 44, "miss": 9},"store_log":"logs/sentinel.rg-space.store.log","store_lines":[54,107]}
+{"sentinel":"rg-space","step":"changed-space","tool":"trucker","seconds":2.095,"status":0,"ran":2,"fresh":33,"outcomes":{"miss": 1},"store_log":"logs/sentinel.rg-space.store.log","store_lines":[108,108]}
+{"sentinel":"rg-space","step":"changed","tool":"none","seconds":0.837,"status":0,"ran":2,"fresh":33,"outcomes":{}}
+{"sentinel":"rg-space","verdict":"pass","detail":"a path with a space"}
+{"sentinel":"rg-thinlto","step":"release-cold","tool":"trucker","seconds":10.644,"status":0,"ran":54,"fresh":0,"outcomes":{"miss": 53},"store_log":"logs/sentinel.rg-thinlto.store.log","store_lines":[1,54]}
+{"sentinel":"rg-thinlto","step":"release-cold","tool":"none","seconds":10.504,"status":0,"ran":54,"fresh":0,"outcomes":{}}
+{"sentinel":"rg-thinlto","step":"release-fresh","tool":"trucker","seconds":0.348,"status":0,"ran":54,"fresh":0,"outcomes":{"hit": 53},"store_log":"logs/sentinel.rg-thinlto.store.log","store_lines":[55,107]}
+{"sentinel":"rg-thinlto","step":"release-changed","tool":"trucker","seconds":5.939,"status":0,"ran":2,"fresh":33,"outcomes":{"miss": 1},"store_log":"logs/sentinel.rg-thinlto.store.log","store_lines":[108,108]}
+{"sentinel":"rg-thinlto","step":"release-changed","tool":"none","seconds":5.708,"status":0,"ran":2,"fresh":33,"outcomes":{}}
+{"sentinel":"rg-thinlto","verdict":"pass","detail":"release with thin LTO"}
+{"sentinel":"rg-rustflags","step":"rustflags-sentinel_one","tool":"trucker","seconds":5.660,"status":0,"ran":54,"fresh":0,"outcomes":{"miss": 43, "miss session": 10}}
+{"sentinel":"rg-rustflags","step":"rustflags-sentinel_one","tool":"none","seconds":6.186,"status":0,"ran":54,"fresh":0,"outcomes":{}}
+{"sentinel":"rg-rustflags","step":"rustflags-sentinel_two","tool":"trucker","seconds":5.598,"status":0,"ran":54,"fresh":0,"outcomes":{"miss": 53},"store_log":"logs/sentinel.rg-rustflags.store.log","store_lines":[1,54]}
+{"sentinel":"rg-rustflags","step":"rustflags-sentinel_two","tool":"none","seconds":5.456,"status":0,"ran":54,"fresh":0,"outcomes":{}}
+{"sentinel":"rg-rustflags","step":"rustflags-sentinel_one","tool":"trucker","seconds":0.100,"status":0,"ran":0,"fresh":34,"outcomes":{},"store_log":"logs/sentinel.rg-rustflags.store.log","store_lines":[55,54]}
+{"sentinel":"rg-rustflags","step":"rustflags-sentinel_one","tool":"none","seconds":0.141,"status":0,"ran":0,"fresh":34,"outcomes":{}}
+{"sentinel":"rg-rustflags","verdict":"pass","detail":"RUSTFLAGS changed and changed back"}
+{"sentinel":"wasm","step":"wasm-cold","tool":"trucker","seconds":0.629,"status":0,"ran":4,"fresh":0,"outcomes":{"miss": 3},"store_log":"logs/sentinel.wasm.store.log","store_lines":[1,4]}
+{"sentinel":"wasm","step":"native-cold","tool":"trucker","seconds":0.382,"status":0,"ran":3,"fresh":1,"outcomes":{"miss": 2},"store_log":"logs/sentinel.wasm.store.log","store_lines":[5,6]}
+{"sentinel":"wasm","step":"wasm-cold","tool":"none","seconds":0.407,"status":0,"ran":4,"fresh":0,"outcomes":{}}
+{"sentinel":"wasm","step":"native-cold","tool":"none","seconds":0.355,"status":0,"ran":3,"fresh":1,"outcomes":{}}
+{"sentinel":"wasm","step":"wasm-fresh","tool":"trucker","seconds":0.170,"status":0,"ran":4,"fresh":0,"outcomes":{"hit": 3},"store_log":"logs/sentinel.wasm.store.log","store_lines":[7,9]}
+{"sentinel":"wasm","step":"native-fresh","tool":"trucker","seconds":0.067,"status":0,"ran":3,"fresh":1,"outcomes":{"hit": 2},"store_log":"logs/sentinel.wasm.store.log","store_lines":[10,11]}
+{"sentinel":"wasm","step":"wasm-changed","tool":"trucker","seconds":0.176,"status":0,"ran":2,"fresh":1,"outcomes":{"miss": 1},"store_log":"logs/sentinel.wasm.store.log","store_lines":[12,12]}
+{"sentinel":"wasm","step":"native-changed","tool":"trucker","seconds":0.311,"status":0,"ran":3,"fresh":1,"outcomes":{"miss session": 2},"store_log":"logs/sentinel.wasm.store.log","store_lines":[13,14]}
+{"sentinel":"wasm","step":"wasm-changed","tool":"none","seconds":0.255,"status":0,"ran":2,"fresh":1,"outcomes":{}}
+{"sentinel":"wasm","step":"native-changed","tool":"none","seconds":0.354,"status":0,"ran":3,"fresh":1,"outcomes":{}}
+{"sentinel":"wasm","verdict":"pass","detail":"7f1f20ce1a1c1bac2228a44b56f7ef4888dcd3d46ca9a66cd06d166d3113a7c4 x86_64-unknown-linux-gnu 43 53 "}
+{"sentinel":"tests","step":"test-cold","tool":"trucker","seconds":6.642,"status":0,"ran":65,"fresh":0,"outcomes":{"miss": 64},"store_log":"logs/sentinel.tests.store.log","store_lines":[1,69]}
+{"sentinel":"tests","step":"test-cold","tool":"none","seconds":6.340,"status":0,"ran":65,"fresh":0,"outcomes":{}}
+{"sentinel":"tests","step":"test-fresh","tool":"trucker","seconds":0.320,"status":0,"ran":65,"fresh":0,"outcomes":{"hit": 64},"store_log":"logs/sentinel.tests.store.log","store_lines":[70,133]}
+{"sentinel":"tests","step":"test-changed","tool":"trucker","seconds":1.257,"status":0,"ran":8,"fresh":33,"outcomes":{"miss session": 8},"store_log":"logs/sentinel.tests.store.log","store_lines":[134,141]}
+{"sentinel":"tests","step":"test-changed","tool":"none","seconds":1.008,"status":0,"ran":8,"fresh":33,"outcomes":{}}
+{"sentinel":"tests","step":"doc","tool":"trucker","seconds":4.575,"status":0,"ran":22,"fresh":30,"outcomes":{"miss": 13},"store_log":"logs/sentinel.tests.store.log","store_lines":[142,154]}
+{"sentinel":"tests","step":"doc","tool":"none","seconds":4.626,"status":0,"ran":22,"fresh":30,"outcomes":{}}
+{"sentinel":"tests","verdict":"pass","detail":"B as P: 123 tests pass and 323 fail, 123 and 323 after the edit, 22 doctests pass"}
+{"sentinel":"cxx","step":"cold","tool":"trucker","seconds":4.292,"status":0,"ran":33,"fresh":0,"outcomes":{"miss": 30, "passthrough baked-path": 2},"store_log":"logs/sentinel.cxx.store.log","store_lines":[1,36]}
+{"sentinel":"cxx","step":"cold","tool":"none","seconds":4.078,"status":0,"ran":33,"fresh":0,"outcomes":{}}
+{"sentinel":"cxx","step":"fresh","tool":"trucker","seconds":1.378,"status":0,"ran":33,"fresh":0,"outcomes":{"hit": 30, "miss session": 1, "passthrough baked-path": 1},"store_log":"logs/sentinel.cxx.store.log","store_lines":[37,68]}
+{"sentinel":"cxx","step":"changed","tool":"trucker","seconds":0.845,"status":0,"ran":2,"fresh":20,"outcomes":{"miss": 1},"store_log":"logs/sentinel.cxx.store.log","store_lines":[69,69]}
+{"sentinel":"cxx","step":"changed","tool":"none","seconds":0.943,"status":0,"ran":2,"fresh":20,"outcomes":{}}
+{"sentinel":"cxx","verdict":"pass","detail":"cxx checksum: 708339aa2e682bf4"}
+{"sentinel":"cmake","step":"cold","tool":"trucker","seconds":10.969,"status":0,"ran":16,"fresh":0,"outcomes":{"miss": 16},"store_log":"logs/sentinel.cmake.store.log","store_lines":[1,17]}
+{"sentinel":"cmake","step":"cold","tool":"none","seconds":10.356,"status":0,"ran":16,"fresh":0,"outcomes":{}}
+{"sentinel":"cmake","step":"fresh","tool":"trucker","seconds":0.252,"status":0,"ran":16,"fresh":0,"outcomes":{"hit": 16},"store_log":"logs/sentinel.cmake.store.log","store_lines":[18,33]}
+{"sentinel":"cmake","step":"changed","tool":"trucker","seconds":0.274,"status":0,"ran":1,"fresh":9,"outcomes":{"miss session": 1},"store_log":"logs/sentinel.cmake.store.log","store_lines":[34,34]}
+{"sentinel":"cmake","step":"changed","tool":"none","seconds":0.305,"status":0,"ran":1,"fresh":9,"outcomes":{}}
+{"sentinel":"cmake","verdict":"pass","detail":"edited\nzlib-ng round trip: sentinel built through cmake (36 bytes)"}

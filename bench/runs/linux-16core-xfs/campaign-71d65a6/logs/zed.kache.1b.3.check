@@ -1,0 +1,48 @@
+error: unexpected argument '--version' found
+
+  tip: to pass '--version' as a value, use '-- --version'
+
+Usage: zed [OPTIONS] [PATHS_OR_URLS]...
+
+For more information, try '--help'.
+Usage: zed [OPTIONS] [PATHS_OR_URLS]...
+
+Arguments:
+  [PATHS_OR_URLS]...
+          A sequence of space-separated paths or urls that you want to open.
+          
+          Use `path:line:row` syntax to open a file at a specific location. Non-existing paths and
+          directories will ignore `:line:row` suffix.
+          
+          URLs can either be `file://` or `zed://` scheme, or relative to <https://zed.dev>.
+
+Options:
+      --diff <OLD_PATH> <NEW_PATH>
+          Pairs of file paths to diff. Can be specified multiple times. When directories are
+          provided, recurses into them and shows all changed files in a single multi-diff view
+
+      --user-data-dir <DIR>
+          Sets a custom directory for all user data (e.g., database, extensions, logs).
+          
+          This overrides the default platform-specific data directory location.
+          On macOS, the default is `~/Library/Application Support/Zed`.
+          On Linux/FreeBSD, the default is `$XDG_DATA_HOME/zed`.
+          On Windows, the default is `%LOCALAPPDATA%\Zed`.
+
+      --dev-container
+          Open the project in a dev container.
+          
+          Automatically triggers "Reopen in Dev Container" if a `.devcontainer/` configuration is
+          found in the project directory.
+
+      --dev-server-token <DEV_SERVER_TOKEN>
+          Instructs zed to run as a dev server on this machine. (not implemented)
+
+      --system-specs
+          Prints system specs.
+          
+          Useful for submitting issues on GitHub when encountering a bug that prevents Zed from
+          starting, so you can't run `zed: copy system specs to clipboard`
+
+  -h, --help
+          Print help (see a summary with '-h')

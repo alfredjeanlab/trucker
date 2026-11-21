@@ -1,0 +1,120 @@
+# Sourced by bench/sentinel: ways of working on ripgrep other than `cargo build`, each in worktrees of its own of one
+# repository, sharing one store. Each workflow is a sentinel of its own in the records, named rg-<workflow>.
+# shellcheck shell=bash disable=SC2154
+rm -rf "$work"
+mkdir -p "$work"
+git clone -q --shared "$root/src/ripgrep" "$work/repo"
+git -C "$work/repo" checkout -q bench
+ONLINE=1 cargo_with none "$work/repo" fetch -q
+workflows=${WORKFLOWS:-clippy coverage check space thinlto rustflags}
+
+# ripgrep's output in worktree $1 for profile $2: its version and a search of its own source. rg searches the two
+# files on threads of its own, so their lines are sorted.
+rg_output() {
+  "$1/target/$2/rg" --version 2>&1 | head -1
+  { "$1/target/$2/rg" -c 'fn ' "$1/crates/core/main.rs" "$1/crates/matcher/src/lib.rs" 2>&1 || echo "exit $?"; } |
+    sed "s|$1/||" | sort
+}
+same() {
+  printf 'trucker:\n%s\nplain cargo:\n%s\n' "$2" "$3" > "$out/logs/sentinel.$name.outputs"
+  if [ "$2" = "$3" ]; then verdict pass "$1"
+  else verdict fail "$1: trucker's output differs from plain cargo's: $(diff <(echo "$3") <(echo "$2") | grep '^[<>]' | tr '\n' ' ')"; fi
+}
+lint() { printf '\n#[allow(dead_code)]\nfn _sentinel_lint(v: &Vec<u8>) -> usize {\n    v.len()\n}\n' >> "$1/crates/core/main.rs"; }
+
+for flow in $workflows; do
+  name=rg-$flow
+  echo "== workflow $flow $(date -u +%T)" >&2
+  base=$work/$flow
+  mkdir -p "$base"
+  wt() { git -C "$work/repo" -c advice.detachedHead=false worktree add -q --detach "$1" bench; }
+  EXTRA_ENV=()
+  case $flow in
+    clippy)
+      # Clippy's warnings appear in a new worktree, and a lint that an edit triggers appears in B and in a third
+      # worktree C with the same edit, whose crate trucker may have stored.
+      wt "$base/a"; wt "$base/p"; wt "$base/b"; sleep 1.5
+      step clippy-cold trucker "$base/a" clippy
+      step clippy-cold none "$base/p" clippy
+      step clippy-fresh trucker "$base/b" clippy
+      wb=$(grep -c '^warning' "$out/logs/sentinel.$name.clippy-fresh.log" || true)
+      wp=$(grep -c '^warning' "$out/logs/sentinel.$name.clippy-cold.log" || true)
+      lint "$base/b"; lint "$base/p"; sleep 1.5
+      step clippy-lint trucker "$base/b" clippy
+      lb=$(grep -c 'clippy::ptr_arg' "$out/logs/sentinel.$name.clippy-lint.log" || true)
+      step clippy-lint none "$base/p" clippy
+      lp=$(grep -c 'clippy::ptr_arg' "$out/logs/sentinel.$name.clippy-lint.log" || true)
+      wt "$base/c"; lint "$base/c"; sleep 1.5
+      step clippy-lint-new trucker "$base/c" clippy
+      lc=$(grep -c 'clippy::ptr_arg' "$out/logs/sentinel.$name.clippy-lint-new.log" || true)
+      step clippy-lint-again trucker "$base/b" clippy
+      la=$(grep -c 'clippy::ptr_arg' "$out/logs/sentinel.$name.clippy-lint-again.log" || true)
+      if [ "$lb" -gt 0 ] && [ "$lp" -gt 0 ] && [ "$lc" -gt 0 ] && [ "$la" -gt 0 ]; then
+        verdict pass "ptr_arg reported in B ($lb), P ($lp), a new worktree C ($lc) and B again ($la); fresh B's warning lines $wb, P's cold $wp"
+      else
+        verdict fail "ptr_arg reported in B $lb, P $lp, C $lc, B again $la times; fresh B's warning lines $wb, P's cold $wp"
+      fi
+      ;;
+    coverage)
+      # cargo llvm-cov builds with -C instrument-coverage into a target directory of its own, and runs the tests.
+      wt "$base/a"; wt "$base/p"; wt "$base/b"; sleep 1.5
+      cov=(llvm-cov --summary-only -p grep-matcher -p grep-cli -p globset)
+      step cov-cold trucker "$base/a" "${cov[@]}"
+      step cov-cold none "$base/p" "${cov[@]}"
+      tp=$(grep '^TOTAL' "$out/logs/sentinel.$name.cov-cold.log" || true)
+      step cov-fresh trucker "$base/b" "${cov[@]}"
+      tb=$(grep '^TOTAL' "$out/logs/sentinel.$name.cov-fresh.log" || true)
+      if [ -n "$tb" ] && [ "$tb" = "$tp" ]; then verdict pass "$(echo "$tb" | tr -s ' ')"
+      else verdict fail "TOTAL differs: B '$tb', P '$tp'"; fi
+      ;;
+    check)
+      # cargo check, then cargo build, in a new worktree.
+      wt "$base/a"; wt "$base/p"; wt "$base/b"; sleep 1.5
+      step check-cold trucker "$base/a" check
+      step build-cold trucker "$base/a" build
+      step build-cold none "$base/p" build
+      step check-fresh trucker "$base/b" check
+      step build-fresh trucker "$base/b" build
+      same "check, then build" "$(rg_output "$base/b" debug)" "$(rg_output "$base/p" debug)"
+      ;;
+    space)
+      # A worktree whose path contains a space, after a cold build in one whose path does not.
+      wt "$base/a"; wt "$base/p"; wt "$base/with space"; sleep 1.5
+      step cold trucker "$base/a" build
+      step cold none "$base/p" build
+      step fresh-space trucker "$base/with space" build
+      lint "$base/with space"; lint "$base/p"; sleep 1.5
+      step changed-space trucker "$base/with space" build
+      step changed none "$base/p" build
+      same "a path with a space" "$(rg_output "$base/with space" debug | sed 's|with space/||')" \
+        "$(rg_output "$base/p" debug | sed 's|p/||')"
+      ;;
+    thinlto)
+      # The release profile with ThinLTO across crates.
+      EXTRA_ENV=(CARGO_PROFILE_RELEASE_LTO=thin)
+      wt "$base/a"; wt "$base/p"; wt "$base/b"; sleep 1.5
+      step release-cold trucker "$base/a" build --release
+      step release-cold none "$base/p" build --release
+      step release-fresh trucker "$base/b" build --release
+      lint "$base/b"; lint "$base/p"; sleep 1.5
+      step release-changed trucker "$base/b" build --release
+      step release-changed none "$base/p" build --release
+      same "release with thin LTO" "$(rg_output "$base/b" release)" "$(rg_output "$base/p" release)"
+      EXTRA_ENV=()
+      ;;
+    rustflags)
+      # RUSTFLAGS changes between builds of one worktree, and changes back.
+      wt "$base/a"; wt "$base/p"; sleep 1.5
+      for flags in "--cfg sentinel_one" "--cfg sentinel_two" "--cfg sentinel_one"; do
+        label=rustflags-${flags##* }
+        EXTRA_ENV=(RUSTFLAGS="$flags")
+        step "$label" trucker "$base/a" build
+        step "$label" none "$base/p" build
+      done
+      EXTRA_ENV=()
+      same "RUSTFLAGS changed and changed back" "$(rg_output "$base/a" debug)" "$(rg_output "$base/p" debug)"
+      ;;
+  esac
+done
+XDG_CACHE_HOME="$work/cache" "$trucker" stats > "$out/logs/sentinel.workflows.stats" 2>&1 || true
+name=workflows
