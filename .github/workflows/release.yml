@@ -17,6 +17,9 @@ jobs:
   build:
     name: Build (${{ matrix.name }})
     if: github.event_name == 'push'
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +36,9 @@ jobs:
           - name: macos-aarch64
             runner: macos-latest
             target: aarch64-apple-darwin
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -48,13 +54,21 @@ jobs:
           test "v$version" = "$GITHUB_REF_NAME"
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
+        if: runner.os != 'Windows'
         run: |
           tar czf trucker-${{ matrix.name }}.tar.gz -C target/${{ matrix.target }}/release trucker
           shasum -a 256 trucker-${{ matrix.name }}.tar.gz > trucker-${{ matrix.name }}.tar.gz.sha256
+      # The checksum is written as shasum writes it elsewhere, because sha256sum on Windows marks the file as binary.
+      - name: Package for Windows
+        if: runner.os == 'Windows'
+        run: |
+          archive=trucker-${{ matrix.name }}.zip
+          (cd target/${{ matrix.target }}/release && 7z a -tzip "$OLDPWD/$archive" trucker.exe)
+          echo "$(sha256sum < "$archive" | cut -d' ' -f1)  $archive" > "$archive.sha256"
       - uses: actions/upload-artifact@v7
         with:
           name: trucker-${{ matrix.name }}
-          path: trucker-${{ matrix.name }}.tar.gz*
+          path: trucker-${{ matrix.name }}.*
 
   release:
     name: GitHub release
