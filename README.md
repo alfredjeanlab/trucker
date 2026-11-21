@@ -18,8 +18,11 @@ so a fresh worktree builds in a fraction of the time and uses much less disk spa
 ## Installation
 
 ```
-cargo install --path .
+brew install alfredjeanlab/tap/trucker
+cargo install trucker
 ```
+
+Binaries for Linux and macOS are on the [releases page](https://github.com/alfredjeanlab/trucker/releases).
 
 Then name it in the `.cargo/config.toml` of a repository, or of your home directory:
 
