@@ -1,15 +1,18 @@
-//! The removal of the entries that no build has used for a while, least recently used first, and of what they leave.
+//! The removal of the entries and slots that no build has used for a while, least recently used first, and of what they
+//! leave.
 //!
-//! A hit sets the mtime of the entry and of the `.reads` file of the key to the time of use, so an mtime is the last
-//! use. Before an entry is deleted, it is renamed to a name that readers do not look up, and a build that reads it at
-//! that moment fails its restore and falls back as on a miss. Removal never follows a symlink.
+//! A hit sets the mtime of the entry and of the `.reads` file of the key to the time of use, and a compile that takes a
+//! slot sets the mtime of its lock, so an mtime is the last use. Before an entry or a part of a slot is deleted, it is
+//! renamed to a name that readers do not look up, and a build that reads it at that moment falls back as on a miss.
+//! Removal never follows a symlink.
 //!
-//! The cap bounds the length of the files of the store. An inode counts once, and it counts even where a worktree links
-//! it too, because the removal of that worktree leaves the file to the store. The space reported as freed counts only
-//! files with one link, and on disk it can be less, because the clones in target directories share blocks with the
-//! store.
+//! The cap bounds the length of the files of the store. A file of an entry counts whole even where a worktree links it
+//! too, because the removal of that worktree leaves the file to the store. A file of a slot counts its length divided
+//! among its links, so a library that many slots link counts once. The space reported as freed counts only files with
+//! one link, and on disk it can be less, because clones share blocks.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
@@ -57,40 +60,85 @@ const FREE_PERCENT: u64 = 10;
 /// process.
 const RECENT: u64 = 3600;
 
+/// The share in percent of the cap that a run evicts beyond the cap or the floor of free space, once it must evict.
+///
+/// The next run that a miss starts is then that far away, rather than at the next entry stored.
+const MARGIN_PERCENT: u64 = 10;
+
 /// The interval in seconds between the runs of gc that misses start, so that a build pays for at most one stat.
 const INTERVAL: u64 = 3600;
 
-/// The bytes that the store may gain before a miss starts gc within [`INTERVAL`], because a busy hour adds tens of GiB.
+/// The bytes that the store may gain before a miss starts gc within [`INTERVAL`], where no run recorded its room.
 const ADDED_LIMIT: u64 = GIB;
+
+/// The file of the store that remembers the size of each entry and idle slot, and the last sweep of the memos.
+///
+/// An entry never changes once it is renamed into place, and a slot changes only under its lock, so a run measures only
+/// what is new or was used since the last one.
+const SIZES: &str = "gc.sizes";
+
+/// The name in [`SIZES`] of the time and bytes of the last sweep of the memos.
+const MEMOS: &str = "memos";
+
+/// The interval in seconds between two sweeps of the memos, which keeps a memo for at most a day past [`UNUSED_AGE`].
+const SWEEP: u64 = 86400;
+
+/// The parts of a slot other than its lock, in the order that gc removes them.
+const SLOT: [&str; 6] = ["session", "source", "libraries", "cold", "warm", "slot"];
+
+/// The extension of an entry or part of a slot that gc renamed to remove it.
+const DOOMED: &str = "gc";
 
 /// What one run of gc removed and the size of the store after it.
 #[derive(Debug, PartialEq)]
 pub struct Collected {
     pub entries: usize,
+    pub slots: usize,
     pub freed: u64,
     pub size: u64,
+    /// The time before which another run would remove nothing, where the store stays over its bounds, or 0.
+    pub next: u64,
 }
 
-/// Runs gc on `store` with the constants of this module unless another run holds the lock, and logs and describes it.
-pub fn run(store: &Path) -> String {
+/// Runs gc on `store` with the constants of this module, after any other run that holds the lock, and logs and
+/// describes it.
+///
+/// Where `all`, it removes every entry and slot that no compile holds, and every memo and marker, whatever their age
+/// and the cap. It still leaves the staging of a running build alone, and the lock files and the log follow their age.
+pub fn run(store: &Path, all: bool) -> String {
+    let lock = fs::create_dir_all(store).and_then(|()| fs::File::create(store.join("gc.lock")));
+    let taken = lock.and_then(|lock| match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => {
+            eprintln!("trucker gc waits for another run of gc to end");
+            let waited = Instant::now();
+            let locked = lock.lock().map(|()| lock);
+            eprintln!("trucker gc waited {:.1} s", waited.elapsed().as_secs_f64());
+            locked
+        }
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    });
+    let Ok(_lock) = taken else {
+        return format!("trucker gc cannot take its lock in {}\n", store.display());
+    };
     let started = Instant::now();
-    let lock = fs::File::create(store.join("gc.lock"));
-    if !lock.as_ref().is_ok_and(|lock| lock.try_lock().is_ok()) {
-        return "another trucker gc is running\n".to_string();
-    }
     let (cap, _) = store_cap(store);
     let cut = crate::now().saturating_sub(UNUSED_AGE);
-    let Collected { entries, freed, size } = collect(store, cut, cap, || space(store));
-    crate::log(store, "-", started, &format!("gc {entries} {freed} {size}"));
+    let Collected { entries, slots, freed, size, next } =
+        collect(store, cut, cap, all, || space(store));
+    crate::log(store, "-", started, &format!("gc {entries} {freed} {size} {slots}"));
+    // The room is what the store may gain before it is over its bounds, after which a miss starts gc.
     let (total, free) = space(store);
-    let over = size > cap || free < total / 100 * FREE_PERCENT;
+    let room = cap.saturating_sub(size).min(free.saturating_sub(total / 100 * FREE_PERCENT));
+    let _ = fs::write(store.join("gc.stamp"), format!("{next} {room}"));
     let megabytes = |bytes: u64| bytes as f64 / 1e6;
     format!(
-        "removed {entries} entries of {:.1} MB, and the store is now {:.1} MB of a {:.1} MB cap{}\n",
+        "removed {entries} entries and {slots} slots of {:.1} MB in {:.1} s, and the store is now {:.1} MB of a {:.1} MB cap{}\n",
         megabytes(freed),
+        started.elapsed().as_secs_f64(),
         megabytes(size),
         megabytes(cap),
-        if over { ", where the rest was used in the last hour" } else { "" }
+        if next > 0 { ", where the rest was used in the last hour" } else { "" }
     )
 }
 
@@ -130,7 +178,7 @@ pub fn bytes(text: &str) -> Option<u64> {
 ///
 /// Each addition is a line appended to `gc.added`, so concurrent builds do not need a lock.
 pub fn add(store: &Path, path: &Path) {
-    add_bytes(store, size(path, &mut HashSet::new()).0);
+    add_bytes(store, size(path, false).0);
 }
 
 /// Adds `bytes` to the bytes that `store` gained since a miss last started gc.
@@ -164,20 +212,30 @@ fn space(path: &Path) -> (u64, u64) {
 use crate::windows::space;
 
 /// Starts `wrapper gc` detached, where the last run that a miss started in `store` is older than [`INTERVAL`] or
-/// the store gained more than [`ADDED_LIMIT`] since it.
+/// the store gained more since it than the room that the last run recorded, or [`ADDED_LIMIT`] without one.
 ///
-/// Returns whether it started one.
+/// A run that left the store short of its target holds off the next until an item turns [`RECENT`] old, because until
+/// then none is due. Returns whether it started one.
 pub fn trigger(store: &Path, wrapper: &Path) -> bool {
     let (stamp, added) = (store.join("gc.stamp"), store.join("gc.added"));
     let lines = fs::read_to_string(&added).unwrap_or_default();
     let gained = lines.lines().filter_map(|line| line.parse::<u64>().ok()).sum::<u64>();
-    if gained <= ADDED_LIMIT
+    // A run writes the time before which another would remove nothing, or 0, and the room that it left.
+    let text = fs::read_to_string(&stamp).unwrap_or_default();
+    let mut fields = text.split_whitespace().map(|field| field.parse::<u64>().ok());
+    let (next, room) = (fields.next().flatten(), fields.next().flatten());
+    if next.is_some_and(|next| crate::now() < next) {
+        return false;
+    }
+    if gained <= room.unwrap_or(ADDED_LIMIT)
         && modified(&stamp).is_some_and(|time| time > crate::now().saturating_sub(INTERVAL))
     {
         return false;
     }
     let _ = fs::remove_file(&added);
-    let touched = fs::File::create(&stamp).and_then(|file| file.set_modified(SystemTime::now()));
+    // The stamp keeps the room of the last run, so a miss during this run does not start another.
+    let file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(&stamp);
+    let touched = file.and_then(|file| file.set_modified(SystemTime::now()));
     let mut command = Command::new(wrapper);
     command.arg("gc").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     touched.is_ok() && detached(&mut command).spawn().is_ok()
@@ -195,34 +253,78 @@ fn detached(command: &mut Command) -> &mut Command {
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
 }
 
-/// Removes what `store` has not used since `cut`, then the least recently used while it is over `cap`.
+/// An entry or a slot, which gc removes as a whole, least recently used first.
+struct Item {
+    /// The last use in seconds since 1970.
+    time: u64,
+    path: PathBuf,
+    bytes: u64,
+    /// What [`SIZES`] remembers `bytes` under, where the item cannot change before that does.
+    stamp: Option<String>,
+    /// The pool and number of a slot, which is `None` for an entry.
+    slot: Option<(PathBuf, String)>,
+}
+
+/// Removes what `store` has not used since `cut`, then the least recently used entries and slots while it is over `cap`.
 ///
 /// `space` gives the total size and the free space of the filesystem, and gc also removes the least recently used while
-/// less than [`FREE_PERCENT`] is free. An entry used in the last [`RECENT`] seconds stays. The cleanups of what entries
-/// leave follow the same `cut`.
-pub fn collect(store: &Path, cut: u64, cap: u64, space: impl Fn() -> (u64, u64)) -> Collected {
+/// less than [`FREE_PERCENT`] is free. An entry or slot used in the last [`RECENT`] seconds stays. The cleanups of what
+/// entries leave follow the same `cut`.
+/// Removes what [`run`] describes, where an item last used before `cut` is unused.
+pub fn collect(
+    store: &Path,
+    cut: u64,
+    cap: u64,
+    all: bool,
+    space: impl Fn() -> (u64, u64),
+) -> Collected {
     let older = |path: &Path, cut: u64| modified(path).is_some_and(|time| time <= cut);
-    let (pid, recent) = (std::process::id().to_string(), crate::now().saturating_sub(RECENT));
-    let mut entries = Vec::new();
+    let now = crate::now();
+    let recent = now.saturating_sub(RECENT);
+    // The cut of what only saves time, such as a memo, a record of reads, a candidate or a marker.
+    let unused = if all { now } else { cut };
+    let mut phase = Phase(Instant::now());
+    let known = remembered(store);
+    let measured = |path: &Path, stamp: &Option<String>| {
+        let relative = path.strip_prefix(store).unwrap_or(path).to_string_lossy();
+        let known = known.get(&*relative).filter(|(was, _)| Some(was) == stamp.as_ref());
+        known.map(|(_, bytes)| *bytes)
+    };
+    // What builds leave beside the items, such as memos, records of reads, candidates and lock files, lies in
+    // directories of tens or hundreds of thousands of names, so it is swept and counted once per [`SWEEP`].
+    let swept =
+        known.get(MEMOS).and_then(|(time, bytes)| Some((time.parse::<u64>().ok()?, *bytes)));
+    let swept = swept.filter(|(time, _)| !all && *time > now.saturating_sub(SWEEP) && *time <= now);
+    let mut memos = (now, 0);
+    // The bytes of what is not an entry or a slot, which each run lists anyway.
+    let mut rest = 0;
+    let mut items = Vec::new();
     for path in ["entries", "scripts"].iter().flat_map(|name| children(&store.join(name))) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         if !name.contains('.') {
-            entries.extend(modified(&path).map(|time| (time, path.clone())));
-        } else if name.ends_with(".cand") {
-            // A candidate counts only its file, and is removed once old or unable to make its entry.
-            for file in children(&path) {
-                let temporary = file.extension().is_some();
-                if older(&file, if temporary { recent } else { cut })
-                    || (!temporary && !crate::lazy::is_alive(&file))
-                {
-                    remove(&file);
-                }
-            }
-            let _ = fs::remove_dir(&path);
-        } else if older(&path, if name.ends_with(".reads") { cut } else { recent }) {
+            let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
+            let stamp = Some(stamp(&path, &metadata));
+            let bytes = measured(&path, &stamp).unwrap_or_else(|| size(&path, false).0);
+            let time = seconds(metadata.modified());
+            items.push(Item { time, path: path.clone(), bytes, stamp, slot: None });
+        } else if path.extension() == Some(DOOMED.as_ref()) {
+            // Only gc dooms an entry, and this run holds the lock of gc, so the run that doomed it was killed.
             remove(&path);
+        } else if name.ends_with(".cand") {
+            memos.1 += swept.map_or_else(|| candidates(&path, unused, recent), |_| 0);
+        } else if swept.is_none() || !name.ends_with(".reads") {
+            let reads = name.ends_with(".reads");
+            match fs::symlink_metadata(&path) {
+                Ok(file) if seconds(file.modified()) <= if reads { unused } else { recent } => {
+                    remove(&path)
+                }
+                Ok(file) if reads => memos.1 += file.len(),
+                Ok(file) => rest += file.len(),
+                Err(_) => {}
+            }
         }
     }
+    phase.end("listed the entries");
     let current = env::current_exe().and_then(|wrapper| file_hash(&wrapper));
     // A name with an extension is the staging copy of a wrapper, which may still be written. Its age is that of its
     // inode, because a copy can carry the mtime of the wrapper that it copies, as a clone on macOS does.
@@ -235,93 +337,256 @@ pub fn collect(store: &Path, cut: u64, cap: u64, space: impl Fn() -> (u64, u64))
         };
         if stale {
             remove(&path);
+        } else {
+            rest += size(&path, false).0;
         }
     }
-    let memos =
-        ["rustc", "cc", "hashes", "notices"].iter().flat_map(|name| children(&store.join(name)));
-    for path in memos.filter(|path| older(path, cut)) {
-        remove(&path);
-    }
-    for path in children(&store.join("locks")).iter().filter(|path| older(path, cut)) {
-        if let Some(_lock) = unlocked(path) {
-            remove(path);
+    let memos = match swept {
+        Some(swept) => swept,
+        None => {
+            memos.1 += sweep(store, unused);
+            for path in children(&store.join("locks")).iter().filter(|path| older(path, cut)) {
+                if let Some(_lock) = unlocked(path) {
+                    remove(path);
+                }
+            }
+            trim(&store.join("log"), cut);
+            phase.end("swept the memos, locks and log");
+            memos
         }
-    }
-    // The lock, directory, session snapshot and staging leftovers of a slot follow the rules for the locks and staging
-    // of the store.
-    for pool in children(&store.join("slots")) {
-        for path in children(&pool) {
+    };
+    // A slot is the lock, directory, record, snapshot, manifest and compile times of one number in a pool, and its last
+    // use is the mtime of its lock, which each compile that takes it sets. Its staging leftovers follow the rule of the
+    // store.
+    let pools = children(&store.join("slots"));
+    for pool in &pools {
+        let mut slots = BTreeMap::<String, (Option<fs::Metadata>, u64)>::new();
+        for path in children(pool) {
             let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
             match name.rsplit_once('.') {
-                Some((number, "lock")) if older(&path, cut) => {
-                    if let Some(_lock) = unlocked(&path) {
-                        for kind in ["slot", "source", "session", "libraries", "lock"] {
-                            remove(&pool.join(format!("{number}.{kind}")));
-                        }
-                    }
+                Some((number, "lock")) => {
+                    slots.entry(number.to_string()).or_default().0 =
+                        fs::symlink_metadata(&path).ok();
                 }
-                Some((_, "lock" | "slot" | "source" | "session" | "libraries")) => {}
+                Some((number, "slot" | "source" | "session" | "libraries" | "cold" | "warm")) => {
+                    let newest = &mut slots.entry(number.to_string()).or_default().1;
+                    *newest = (*newest).max(modified(&path).unwrap_or(0));
+                }
+                // Only gc dooms the parts of a slot, under the lock of gc.
+                Some((_, DOOMED)) => remove(&path),
                 _ if older(&path, recent) => remove(&path),
-                _ => {}
+                _ => rest += size(&path, false).0,
             }
         }
-        let _ = fs::remove_dir(&pool);
+        for (number, (lock, newest)) in slots {
+            let time = lock.as_ref().map_or(newest, |lock| seconds(lock.modified()));
+            let stamp = lock.map(|lock| nanos(lock.modified()).to_string());
+            let path = pool.join(&number);
+            let part = |kind: &str| pool.join(format!("{number}.{kind}"));
+            let measure = || SLOT.iter().map(|kind| size(&part(kind), true).0).sum::<u64>();
+            // A slot changes only under its lock, and a compile that takes the lock sets its mtime, so a size measured
+            // under the lock holds until the mtime changes. No compile holds a slot unused for an hour, and a lock
+            // without parts, as `wait.lock` is, guards nothing that gc measures.
+            let (bytes, stamp) = match measured(&path, &stamp) {
+                Some(bytes) => (bytes, stamp),
+                None if time > recent && newest > 0 => match unlocked(&part("lock")) {
+                    Some(_lock) => (measure(), stamp),
+                    None => (measure(), None),
+                },
+                None => (measure(), stamp),
+            };
+            items.push(Item { time, path, bytes, stamp, slot: Some((pool.clone(), number)) });
+        }
     }
+    phase.end("listed the slots");
     // A slot of a fixed OUT_DIR and its symlink to a target directory follow its lock. A marker of a key, a package or a
     // baked crate follows the rule of the memos.
     for path in children(&store.join("out")) {
         for lock in children(&path).iter().filter(|path| path.extension() == Some("lock".as_ref()))
         {
-            if let Some(_lock) = older(lock, cut).then(|| unlocked(lock)).flatten() {
+            if let Some(_lock) = older(lock, unused).then(|| unlocked(lock)).flatten() {
                 for kind in ["", "target", "lock"] {
                     remove(&lock.with_extension(kind));
                 }
             }
         }
         let _ = fs::remove_dir(&path);
-        if older(&path, cut) && fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
+        if older(&path, unused)
+            && fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
         {
             remove(&path);
         }
+        rest += size(&path, false).0;
     }
-    let log = store.join("log");
-    if let Ok(text) = fs::read_to_string(&log) {
-        let time = |line: &str| line.split(' ').next().and_then(|time| time.parse::<u64>().ok());
-        let lines = text.lines().filter(|line| time(line).is_some_and(|time| time > cut));
-        let staging = log.with_extension(&pid);
-        let kept = String::from_iter(lines.map(|line| format!("{line}\n")));
-        // A rewrite loses a line that a build appends meanwhile, so the log is rewritten only to drop old lines.
-        if kept.len() < text.len() {
-            let _ = fs::write(&staging, kept).and_then(|()| crate::store::rename(&staging, &log));
-        }
-    }
-    entries.sort();
-    let mut collected =
-        Collected { entries: 0, freed: 0, size: size(store, &mut HashSet::new()).0 };
-    for (time, path) in entries {
-        let (total, free) = space();
-        if time > recent
-            || (time > cut && collected.size <= cap && free >= total / 100 * FREE_PERCENT)
-        {
+    // The file of the sizes does not count, so that a run sees the size that the last one left.
+    let files = children(store).into_iter().filter(|path| !path.ends_with(SIZES));
+    let files = files.filter_map(|path| fs::symlink_metadata(path).ok());
+    rest += files.filter(fs::Metadata::is_file).map(|file| file.len()).sum::<u64>();
+    items.sort_by_key(|item| item.time);
+    let size = rest + memos.1 + items.iter().map(|item| item.bytes).sum::<u64>();
+    let mut collected = Collected { entries: 0, slots: 0, freed: 0, size, next: 0 };
+    let (total, mut free) = space();
+    let floor = total / 100 * FREE_PERCENT;
+    // A run that must evict evicts a further [`MARGIN_PERCENT`] of the cap, so that the next run is that far away.
+    let margin = if size > cap || free < floor { cap / 100 * MARGIN_PERCENT } else { 0 };
+    let short = |size: u64, free: u64| size > cap - margin || free < floor.saturating_add(margin);
+    let (mut sizes, mut oldest) = (format!("{MEMOS}\t{}\t{}\n", memos.0, memos.1), None);
+    for item in items {
+        let due = all || item.time <= recent && (item.time <= cut || short(collected.size, free));
+        if let Some(unlinked) = due.then(|| evict(&item)).flatten() {
+            *if item.slot.is_some() { &mut collected.slots } else { &mut collected.entries } += 1;
+            collected.freed += unlinked;
+            collected.size = collected.size.saturating_sub(item.bytes);
+            if margin > 0 {
+                free = space().1;
+            }
             continue;
         }
-        let doomed = path.with_extension(&pid);
-        if crate::store::rename(&path, &doomed).is_ok() {
-            let (owned, unlinked) = size(&doomed, &mut HashSet::new());
-            remove(&doomed);
-            collected.entries += 1;
-            collected.freed += unlinked;
-            collected.size = collected.size.saturating_sub(owned);
+        oldest = oldest.or(Some(item.time));
+        if let Some(stamp) = &item.stamp {
+            let relative = item.path.strip_prefix(store).unwrap_or(&item.path).to_string_lossy();
+            let _ = writeln!(sizes, "{relative}\t{stamp}\t{}", item.bytes);
         }
     }
+    for pool in &pools {
+        let _ = fs::remove_dir(pool);
+    }
+    // An item becomes due only once it is an hour old, so a run before then would remove nothing more.
+    if short(collected.size, free) {
+        collected.next = oldest.map_or(now + INTERVAL, |time| time + RECENT + 1);
+    }
+    let staging = store.join(format!("{SIZES}.new"));
+    let _ =
+        fs::write(&staging, sizes).and_then(|()| crate::store::rename(&staging, store.join(SIZES)));
+    phase.end(&format!("removed {} entries and {} slots", collected.entries, collected.slots));
     collected
+}
+
+/// Removes the candidates in `path` that are old or unable to make their entries, and returns the bytes of the rest.
+fn candidates(path: &Path, cut: u64, recent: u64) -> u64 {
+    let mut bytes = 0;
+    for file in children(path) {
+        let temporary = file.extension().is_some();
+        if modified(&file).is_some_and(|time| time <= if temporary { recent } else { cut })
+            || (!temporary && !crate::lazy::is_alive(&file))
+        {
+            remove(&file);
+        } else {
+            bytes += size(&file, false).0;
+        }
+    }
+    let _ = fs::remove_dir(path);
+    bytes
+}
+
+/// Drops the lines of `log` that are not newer than `cut`.
+///
+/// A rewrite loses a line that a build appends meanwhile, so the log is rewritten only to drop old lines.
+fn trim(log: &Path, cut: u64) {
+    let Ok(text) = fs::read_to_string(log) else { return };
+    let time = |line: &str| line.split(' ').next().and_then(|time| time.parse::<u64>().ok());
+    let lines = text.lines().filter(|line| time(line).is_some_and(|time| time > cut));
+    let kept = String::from_iter(lines.map(|line| format!("{line}\n")));
+    if kept.len() < text.len() {
+        let staging = log.with_extension("new");
+        let _ = fs::write(&staging, kept).and_then(|()| crate::store::rename(&staging, log));
+    }
+}
+
+/// The start of a phase of a run, whose end goes to stderr, which only `trucker gc` by hand shows.
+struct Phase(Instant);
+
+impl Phase {
+    fn end(&mut self, what: &str) {
+        eprintln!("trucker gc {what} in {:.2} s", self.0.elapsed().as_secs_f64());
+        self.0 = Instant::now();
+    }
+}
+
+/// Removes `item` unless its lock is taken, and returns the bytes of its files that had one link.
+///
+/// Each part is renamed out of reach first, because a compile uses the snapshot of a slot without a check, so a killed
+/// run must not leave part of one. The next run removes what such a run left.
+fn evict(item: &Item) -> Option<u64> {
+    let Some((pool, number)) = &item.slot else {
+        let doomed = item.path.with_extension(DOOMED);
+        crate::store::rename(&item.path, &doomed).ok()?;
+        let unlinked = size(&doomed, false).1;
+        remove(&doomed);
+        return Some(unlinked);
+    };
+    let lock = pool.join(format!("{number}.lock"));
+    let _lock = unlocked(&lock)?;
+    let mut unlinked = 0;
+    for kind in SLOT {
+        let part = pool.join(format!("{number}.{kind}"));
+        let doomed = pool.join(format!("{number}.{kind}.{DOOMED}"));
+        if crate::store::rename(&part, &doomed).is_ok() {
+            unlinked += size(&doomed, true).1;
+            remove(&doomed);
+        }
+    }
+    remove(&lock);
+    Some(unlinked)
+}
+
+/// Removes the memos of `store` that no build has used since `cut`, and returns the bytes of those that stay.
+fn sweep(store: &Path, cut: u64) -> u64 {
+    let memos =
+        ["rustc", "cc", "hashes", "notices"].iter().flat_map(|name| children(&store.join(name)));
+    let mut bytes = 0;
+    for path in memos {
+        match fs::symlink_metadata(&path) {
+            Ok(memo) if seconds(memo.modified()) <= cut => remove(&path),
+            Ok(memo) => bytes += memo.len(),
+            Err(_) => {}
+        }
+    }
+    bytes
+}
+
+/// The size of each item that [`SIZES`] remembers by its path in the store, with the stamp that it holds for.
+fn remembered(store: &Path) -> HashMap<String, (String, u64)> {
+    let text = fs::read_to_string(store.join(SIZES)).unwrap_or_default();
+    let line = |line: &str| {
+        let mut fields = line.split('\t');
+        let (path, stamp) = (fields.next()?.to_string(), fields.next()?.to_string());
+        Some((path, (stamp, fields.next()?.parse().ok()?)))
+    };
+    text.lines().filter_map(line).collect()
+}
+
+/// What tells an entry from another that a later build stores under its name, which is its inode and birth time.
+#[cfg(unix)]
+fn stamp(_: &Path, metadata: &fs::Metadata) -> String {
+    format!("{}.{}", metadata.ino(), nanos(metadata.created().or_else(|_| metadata.modified())))
+}
+
+#[cfg(windows)]
+fn stamp(path: &Path, metadata: &fs::Metadata) -> String {
+    let index = crate::windows::information(path, false).map_or(0, |(_, index, ..)| index);
+    format!("{index}.{}", nanos(metadata.created()))
+}
+
+/// `time` in seconds since 1970, or 0 where it is not known.
+fn seconds(time: std::io::Result<SystemTime>) -> u64 {
+    time.ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map_or(0, |time| time.as_secs())
+}
+
+/// `time` in nanoseconds since 1970, or 0 where it is not known.
+fn nanos(time: std::io::Result<SystemTime>) -> u128 {
+    time.ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |time| time.as_nanos())
 }
 
 /// The lock at `path`, created where it is missing and taken where no other process has taken it.
 ///
-/// gc keeps the lock while it removes what the lock guards.
+/// gc keeps the lock while it removes what the lock guards. The lock is not truncated, because that would set its
+/// mtime, which is the last use of a slot.
 fn unlocked(path: &Path) -> Option<fs::File> {
-    fs::File::create(path).ok().filter(|lock| lock.try_lock().is_ok())
+    let lock = fs::OpenOptions::new().write(true).create(true).truncate(false).open(path);
+    lock.ok().filter(|lock| lock.try_lock().is_ok())
 }
 
 /// The mtime of `path` itself, in seconds since 1970.
@@ -345,24 +610,25 @@ fn children(directory: &Path) -> Vec<PathBuf> {
     )
 }
 
-/// The length of the files under `path` whose inodes are not in `seen`, and of those with one link.
-fn size(path: &Path, seen: &mut HashSet<(u64, u64)>) -> (u64, u64) {
+/// The length of the files under `path`, and of those with one link.
+///
+/// Where `shared`, a file with several links counts its length divided among them, as a library that a slot links
+/// counts once across the slots and the worktree that link it.
+fn size(path: &Path, shared: bool) -> (u64, u64) {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => children(path).iter().fold((0, 0), |sum, child| {
-            let size = size(child, seen);
+            let size = size(child, shared);
             (sum.0 + size.0, sum.1 + size.1)
         }),
-        #[cfg(unix)]
-        Ok(metadata) if seen.insert((metadata.dev(), metadata.ino())) => {
-            (metadata.len(), if metadata.nlink() > 1 { 0 } else { metadata.len() })
+        Ok(metadata) => {
+            #[cfg(unix)]
+            let links = metadata.nlink().max(1);
+            #[cfg(windows)]
+            let links = crate::windows::information(path, false)
+                .map_or(1, |(_, _, links, _)| u64::from(links.max(1)));
+            let length = metadata.len();
+            (if shared { length / links } else { length }, if links > 1 { 0 } else { length })
         }
-        #[cfg(windows)]
-        Ok(_) => match crate::windows::information(path, false) {
-            Some((volume, index, links, length)) if seen.insert((u64::from(volume), index)) => {
-                (length, if links > 1 { 0 } else { length })
-            }
-            _ => (0, 0),
-        },
         _ => (0, 0),
     }
 }

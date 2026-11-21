@@ -368,7 +368,7 @@ pub fn commit(
     staging: &Path,
     entry: &Path,
 ) -> Result<(), &'static str> {
-    let recorded = reads.is_empty() || fs::write(reads_of(entries, key), reads).is_ok();
+    let recorded = reads.is_empty() || write_reads(entries, key, reads).is_ok();
     let renamed = recorded && rename(staging, entry).is_ok();
     if let Some(store) = entries.parent().filter(|_| renamed) {
         crate::gc::add(store, entry);
@@ -383,14 +383,15 @@ pub fn reads_of(entries: &Path, key: &str) -> std::path::PathBuf {
     entries.join(format!("{key}.reads"))
 }
 
-/// An exclusive lock on `key` in `store` that a process takes so that others wait while it compiles the key.
+/// An exclusive lock on `inputs`, a key or the name of an entry, that a process in `store` takes so that others wait
+/// while it compiles them.
 ///
 /// The lock is polled, because a blocking call cannot time out, and the kernel releases it when its process dies.
 /// After a minute the wait is said once on stderr. It is `None` where the lock file cannot be opened, or after
 /// [`PATIENCE`].
-pub fn lock(store: &Path, key: &str, name: &str) -> Option<fs::File> {
+pub fn lock(store: &Path, inputs: &str, name: &str) -> Option<fs::File> {
     fs::create_dir_all(store.join("locks")).ok()?;
-    let file = fs::File::create(store.join("locks").join(key)).ok()?;
+    let file = fs::File::create(store.join("locks").join(inputs)).ok()?;
     let (started, mut said) = (Instant::now(), false);
     loop {
         match file.try_lock() {
@@ -407,6 +408,18 @@ pub fn lock(store: &Path, key: &str, name: &str) -> Option<fs::File> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Writes `reads` to [`reads_of`] `key` through a rename, so that a process without a lock never reads it partly
+/// written.
+pub fn write_reads(entries: &Path, key: &str, reads: &str) -> io::Result<()> {
+    let path = reads_of(entries, key);
+    let staging = path.with_extension(format!("reads.{}", std::process::id()));
+    let written = fs::write(&staging, reads).and_then(|()| rename(&staging, &path));
+    if written.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    written
 }
 
 /// Records a use of `entry`, and of the `.reads` file of `key` in `entries`, by setting their mtime to now.

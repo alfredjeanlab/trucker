@@ -50,7 +50,10 @@ fn main() {
         (Some("stats"), Some(rest)) => {
             print!("{}", stats(&rest, &store_directory()).unwrap_or_else(|| usage()))
         }
-        (Some("gc"), Some(rest)) if rest.is_empty() => print!("{}", gc::run(&store_directory())),
+        (Some("gc"), Some(rest)) if rest.is_empty() || rest == ["--all"] => {
+            print!("{}", gc::run(&store_directory(), !rest.is_empty()))
+        }
+        (Some(word), _) if !is_program(word) => usage(),
         (Some(rustc), Some(rest)) => {
             exit(wrap(rustc, &rest, &store_directory(), unit::cargo_home()))
         }
@@ -58,12 +61,25 @@ fn main() {
     }
 }
 
+/// Whether `word` can name the rustc that cargo passes, as a path or as a program on `PATH`.
+///
+/// Any other word is a mistyped subcommand, such as `trucker status`, which would otherwise run as a rustc that cannot
+/// be found.
+fn is_program(word: &str) -> bool {
+    let on_path = |directory: PathBuf| {
+        let program = directory.join(word);
+        program.is_file() || (cfg!(windows) && program.with_extension("exe").is_file())
+    };
+    word.contains(['/', std::path::MAIN_SEPARATOR])
+        || env::var_os("PATH").is_some_and(|path| env::split_paths(&path).any(on_path))
+}
+
 fn usage() -> ! {
     eprintln!("usage: RUSTC_WRAPPER=trucker cargo build");
     eprintln!(
         "       trucker stats [--duplicates] [--since <seconds since 1970, or an age such as 90s, 15m, 2h or 3d>]"
     );
-    eprintln!("       trucker gc");
+    eprintln!("       trucker gc [--all]");
     exit(2)
 }
 
@@ -194,22 +210,28 @@ fn cached(
     }
     let (entries, files) = (store.join("entries"), store::Files::probe(store));
     let key = unit.key(rustc, args, store, env::vars_os()).map_err(|_| "unreadable-input")?;
-    let current_entry = || {
+    let variant = |started| {
         let reads = fs::read_to_string(store::reads_of(&entries, &key)).unwrap_or_default();
-        unit.variant(&key, &reads, None, &store.join("hashes")).ok().map(|name| entries.join(name))
+        unit.variant(&key, &reads, started, &store.join("hashes"))
     };
-    let mut entry = current_entry();
-    // A process that finds no entry compiles under the key's lock, so that every worktree stores the same bytes.
+    let current_entry = || variant(None).ok().map(|name| entries.join(name));
+    // A compile that starts now from a source that changed within the last second is not stored.
+    let found = variant(Some(SystemTime::now()));
+    let settled = found != Err("changed-source");
+    let mut entry =
+        if settled { found.ok().map(|name| entries.join(name)) } else { current_entry() };
+    // A process that finds no entry compiles under the lock of the entry, or of the key where the reads that select an
+    // entry are unknown. Every process with the same inputs then restores the bytes that the first one stores, and
+    // a process with other sources does not wait. A compile that will not be stored takes no lock.
     let waited = !entry.as_ref().is_some_and(|entry| entry.is_dir());
-    let lock = waited.then(|| store::lock(store, &key, crate_name(args))).flatten();
-    // An own crate is stored as a candidate, which a miss under the key's lock promotes into the entry.
+    let inputs = entry.as_ref().and_then(|entry| entry.file_name()?.to_str()).unwrap_or(&key);
+    let _lock = (waited && settled).then(|| store::lock(store, inputs, crate_name(args))).flatten();
+    // An own crate is stored as a candidate, which a miss promotes into the entry.
     let lazy = unit.roots.worktree.is_some() && !crate_name(args).starts_with("build_script_");
     let mut promoted = false;
     if waited {
         entry = current_entry();
-        if let Some(entry) =
-            entry.as_ref().filter(|entry| lazy && lock.is_some() && !entry.is_dir())
-        {
+        if let Some(entry) = entry.as_ref().filter(|entry| lazy && !entry.is_dir()) {
             promoted = lazy::promote(&entries, &key, entry, files);
         }
     }
@@ -245,8 +267,9 @@ fn cached(
     clear().map_err(|_| "unremovable-output")?;
     let (compiling, started) = (Instant::now(), SystemTime::now());
     let mut slot = session::Slot::take(unit, args, store, files);
-    let mut forwarded = HashSet::new();
+    let (mut forwarded, running) = (HashSet::new(), Instant::now());
     let mut compiled = compile(rustc, args, unit, slot.as_ref(), cargo, &mut forwarded)?;
+    let ran = running.elapsed();
     // A session that crashes rustc is deleted, and the crate is compiled once more without it. Where the session cannot
     // be deleted, that compile runs in the worktree.
     if slot
@@ -288,6 +311,7 @@ fn cached(
     if let Some(slot) = &slot {
         localize_dep_info(&dep_info, slot);
         if code == 0 {
+            slot.time(ran);
             let _ = slot.keep();
         }
     }
@@ -469,11 +493,15 @@ fn stats(args: &[String], store: &Path) -> Option<String> {
         return Some(duplicates::report(&store.join("entries"), start));
     }
     let (mut totals, mut text) = (BTreeMap::<String, (u64, u64)>::new(), String::new());
+    let mut size = None;
     for line in fs::read_to_string(store.join("log")).unwrap_or_default().lines() {
         let fields = Vec::from_iter(line.splitn(4, ' '));
-        if let [time, _, milliseconds, outcome] = fields[..]
+        if let [_, _, _, outcome] = fields[..]
+            && let Some(collected) = outcome.strip_prefix("gc ")
+        {
+            size = collected.split(' ').nth(2).and_then(|size| size.parse::<u64>().ok()).or(size);
+        } else if let [time, _, milliseconds, outcome] = fields[..]
             && time.parse::<u64>().is_ok_and(|time| time >= start)
-            && !outcome.starts_with("gc ")
         {
             let total = totals.entry(outcome.to_string()).or_default();
             *total = (total.0 + 1, total.1 + milliseconds.parse::<u64>().unwrap_or(0));
@@ -495,6 +523,16 @@ fn stats(args: &[String], store: &Path) -> Option<String> {
     } else {
         "computed from its filesystem".to_string()
     };
-    let _ = writeln!(text, "the store may take {:.1} GB, {source}", cap as f64 / 1e9);
+    let gigabytes = |bytes: u64| bytes as f64 / 1e9;
+    let _ = match size {
+        Some(size) => writeln!(
+            text,
+            "the store held {:.1} GB at its last gc, of a cap of {:.1} GB {source}, both counting the length of its \
+             files, which clones may share",
+            gigabytes(size),
+            gigabytes(cap)
+        ),
+        None => writeln!(text, "the store may take {:.1} GB, {source}", gigabytes(cap)),
+    };
     Some(text)
 }

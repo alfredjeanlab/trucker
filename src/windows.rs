@@ -441,6 +441,10 @@ pub mod session {
             match self.never {}
         }
 
+        pub fn time(&self, _: std::time::Duration) {
+            match self.never {}
+        }
+
         pub fn reads_itself(&self, _: &Unit) -> bool {
             match self.never {}
         }

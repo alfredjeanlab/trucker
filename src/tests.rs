@@ -8,7 +8,7 @@ use std::{env, fs, thread};
 use crate::script::{self, Run, replay_or_run};
 use crate::store::Files;
 use crate::unit::{self, CARGO_HOME, Roots, TARGET, Unit, WORKTREE};
-use crate::{cached, gc, lazy, session, stats, store};
+use crate::{cached, gc, is_program, lazy, session, stats, store};
 
 /// A directory of one test, with a stand-in rustc and a CARGO_HOME, on the filesystem of the temporary directory.
 struct Fixture {
@@ -384,7 +384,7 @@ fn store_that_cannot_clone_links_in_and_copies_out_what_its_hash_verifies() {
     let [first, second, third, fourth] = worktrees.map(|name| fixture.worktree(name, "metadata"));
     let out = |target: &Path| target.join("debug/build/foo/abc/out");
     let build = |target: &Path| fixture.build(&fixture.args(target), &store, None);
-    let collect = |cap| gc::collect(&store, 0, cap, || (100, 100));
+    let collect = |cap| gc::collect(&store, 0, cap, false, || (100, 100));
 
     assert_eq!(build(&first), Ok(("miss".to_string(), 0)));
     let entry = fs::read_dir(store.join("entries")).unwrap().next().unwrap().unwrap().path();
@@ -1119,7 +1119,7 @@ fn gc_keeps_a_staging_copy_of_the_stand_in_that_may_still_be_written() {
         fs::write(path, "a wrapper").unwrap();
         age(path, 30 * 86400);
     }
-    gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, || (100, 100));
+    gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, false, || (100, 100));
     assert!(staging.exists(), "a staging copy whose inode is new stays");
     assert!(!other.exists(), "the copy of another wrapper goes");
     assert_eq!(fs::read_dir(store.join("stand-in")).unwrap().count(), 2);
@@ -1289,7 +1289,7 @@ fn gc_removes_what_no_build_used_for_three_days_and_keeps_a_hit_entry() {
     fs::write(store.join("log"), format!("100 foo 2000 miss\n{} foo 1 hit\n", crate::now()))
         .unwrap();
 
-    let collected = gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, || (100, 100));
+    let collected = gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, false, || (100, 100));
     assert_eq!(collected.entries, 1);
     let mut kept =
         Vec::from_iter(fs::read_dir(&entries).unwrap().map(|entry| entry.unwrap().file_name()));
@@ -1329,7 +1329,7 @@ fn gc_removes_the_fixed_out_dirs_and_markers_that_no_script_used_for_three_days(
         fs::write(store.join("out").join(name), "").unwrap();
         age(&store.join("out").join(name), if old { 4 * 86400 } else { 60 });
     }
-    gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, || (100, 100));
+    gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, false, || (100, 100));
     let names = |directory: &Path| {
         let mut names = Vec::from_iter(
             fs::read_dir(directory)
@@ -1345,7 +1345,7 @@ fn gc_removes_the_fixed_out_dirs_and_markers_that_no_script_used_for_three_days(
     assert!(fixture.root.join("rustc").is_file(), "removal must not follow a symlink");
     drop(held);
     fs::remove_dir_all(&pool).unwrap();
-    gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, || (100, 100));
+    gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, false, || (100, 100));
     let kept = ["-.new.linked.baked", "new.fixed-package", "new.never"];
     assert_eq!(names(&store.join("out")), kept, "an empty pool is removed");
 }
@@ -1363,25 +1363,28 @@ fn gc_removes_the_least_recently_used_over_the_cap_or_the_free_space_but_none_us
     entry("oldest", 3 * 3600);
     entry("older", 2 * 3600);
     entry("recent", 1800);
-    let size = gc::collect(&store, 0, u64::MAX, || (100, 100)).size;
-    let collected = gc::collect(&store, 0, size - 1, || (100, 100));
-    assert_eq!(collected, gc::Collected { entries: 1, freed: 1000, size: size - 1000 });
+    let size = gc::collect(&store, 0, u64::MAX, false, || (10_000, 10_000)).size;
+    let collected = gc::collect(&store, 0, size - 1, false, || (10_000, 10_000));
+    assert_eq!(
+        collected,
+        gc::Collected { entries: 1, slots: 0, freed: 1000, size: size - 1000, next: 0 }
+    );
     assert!(!store.join("entries/oldest").exists() && store.join("entries/older").exists());
-    let collected = gc::collect(&store, 0, 0, || (100, 100));
+    let collected = gc::collect(&store, 0, 0, false, || (10_000, 10_000));
     assert_eq!((collected.entries, collected.size), (1, size - 2000));
 
     entry("unused", 2 * 3600);
-    let collected = gc::collect(&store, 0, u64::MAX, || (100, 9));
+    let collected = gc::collect(&store, 0, u64::MAX, false, || (100, 9));
     assert_eq!(collected.entries, 1, "the free space is below a tenth of the filesystem");
     assert!(store.join("entries/recent").exists());
 
     // A cap that the variable sets keeps the floor of free space.
     entry("overridden", 2 * 3600);
     let (cap, _) = gc::cap(100, Some("1T"));
-    assert_eq!(gc::collect(&store, 0, cap, || (100, 9)).entries, 1);
+    assert_eq!(gc::collect(&store, 0, cap, false, || (100, 9)).entries, 1);
     assert!(!store.join("entries/overridden").exists() && store.join("entries/recent").exists());
     entry("kept", 2 * 3600);
-    assert_eq!(gc::collect(&store, 0, cap, || (100, 10)).entries, 0, "a tenth is free");
+    assert_eq!(gc::collect(&store, 0, cap, false, || (100, 10)).entries, 0, "a tenth is free");
     assert!(store.join("entries/kept").exists());
 }
 
@@ -1435,7 +1438,7 @@ fn trigger_starts_gc_within_the_hour_once_the_store_gains_more_than_a_gib() {
 }
 
 #[test]
-fn trigger_starts_at_most_one_gc_an_hour_and_a_second_gc_does_not_run() {
+fn trigger_starts_at_most_one_gc_an_hour_and_a_second_gc_waits_for_the_first() {
     let fixture = fixture("gc-trigger", "");
     let store = fixture.root.join("store");
     assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
@@ -1445,12 +1448,207 @@ fn trigger_starts_at_most_one_gc_an_hour_and_a_second_gc_does_not_run() {
 
     let lock = fs::File::create(store.join("gc.lock")).unwrap();
     lock.try_lock().unwrap();
-    assert_eq!(gc::run(&store), "another trucker gc is running\n");
-    drop(lock);
-    // A child that another test forks shares the descriptor of the lock until it runs exec.
-    let mut reports = std::iter::repeat_with(|| gc::run(&store));
-    let report = reports.find(|report| !report.starts_with("another")).unwrap();
-    assert!(report.starts_with("removed 0 entries"), "{report}");
+    let started = Instant::now();
+    let report = thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(300));
+            drop(lock);
+        });
+        gc::run(&store, false)
+    });
+    assert!(started.elapsed() >= Duration::from_millis(300), "a second gc waits for the first");
+    assert!(report.starts_with("removed 0 entries and 0 slots"), "{report}");
+}
+
+/// Writes `bytes` zeros to `path` under `store`, in new directories where needed, and ages it by `seconds`.
+fn stored(store: &Path, path: &str, bytes: usize, seconds: u64) -> PathBuf {
+    let path = store.join(path);
+    fs::create_dir_all(path.parent().unwrap())
+        .and_then(|()| fs::write(&path, vec![0; bytes]))
+        .unwrap();
+    age(&path, seconds);
+    path
+}
+
+#[test]
+fn gc_counts_slots_under_the_cap_and_removes_the_least_recently_used_of_entries_and_slots() {
+    let fixture = fixture("gc-slots", "");
+    let (store, pool) = (fixture.root.join("store"), fixture.root.join("store/slots/foo"));
+    stored(&store, "entries/old/lib", 1000, 5 * 3600);
+    age(&store.join("entries/old"), 5 * 3600);
+    for (number, hours) in [("0", 4), ("1", 2), ("2", 3), ("3", 0)] {
+        stored(&store, &format!("slots/foo/{number}.slot/.trucker-libraries/lib"), 1000, 0);
+        stored(&store, &format!("slots/foo/{number}.source"), 0, 0);
+        stored(&store, &format!("slots/foo/{number}.lock"), 0, hours * 3600 + 60);
+    }
+    stored(&store, "slots/foo/0.session/foo-1x/s-1-2-3/query", 3000, 0);
+    // A library that a slot links counts its share of the links.
+    let library = stored(&fixture.root, "worktree/libbar.rlib", 1000, 0);
+    fs::hard_link(&library, pool.join("1.slot/.trucker-libraries/libbar.rlib")).unwrap();
+    // What a killed run of gc doomed goes at once, whatever its age.
+    stored(&store, "entries/doomed.gc/lib", 1000, 0);
+    stored(&store, "slots/foo/3.session.gc/query", 1000, 0);
+    let held = fs::File::open(pool.join("2.lock")).unwrap();
+    held.try_lock().unwrap();
+
+    let size = gc::collect(&store, 0, u64::MAX, false, || (10_000, 10_000)).size;
+    assert!(!store.join("entries/doomed.gc").exists() && !pool.join("3.session.gc").exists());
+    let collected = gc::collect(&store, 0, size - 4500, false, || (10_000, 10_000));
+    let expected = gc::Collected { entries: 1, slots: 1, freed: 5000, size: size - 5000, next: 0 };
+    assert_eq!(collected, expected, "the oldest entry, then the oldest slot");
+    assert!(!store.join("entries/old").exists());
+    for part in ["0.slot", "0.session", "0.source", "0.lock"] {
+        assert!(!pool.join(part).exists(), "{part}");
+    }
+    let collected = gc::collect(&store, 0, 0, false, || (10_000, 10_000));
+    assert_eq!((collected.slots, collected.freed), (1, 1000), "a held slot stays");
+    assert_eq!(collected.size, size - 5000 - 1500, "a linked library counted half");
+    assert!(pool.join("2.slot").exists() && !pool.join("1.slot").exists() && library.exists());
+    drop(held);
+    let collected = gc::collect(&store, 0, 0, false, || (10_000, 10_000));
+    assert_eq!(collected.slots, 1);
+    assert!(pool.join("3.slot").exists(), "a slot used in the last hour stays");
+    let used = fs::metadata(pool.join("3.lock")).unwrap().modified().unwrap();
+    let used = used.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(collected.next, used + 3601, "the oldest slot that stays turns an hour old");
+}
+
+#[test]
+fn gc_of_all_removes_what_was_used_just_now_but_keeps_held_slots_staging_and_locks() {
+    let fixture = fixture("gc-all", "");
+    let (store, pool) = (fixture.root.join("store"), fixture.root.join("store/slots/foo"));
+    stored(&store, "entries/recent/lib", 1000, 0);
+    stored(&store, "entries/key.reads", 10, 0);
+    stored(&store, "entries/staged.123/lib", 1000, 0);
+    stored(&store, "hashes/memo", 10, 0);
+    stored(&store, "out/key.never", 0, 0);
+    stored(&store, "locks/inputs", 0, 0);
+    for number in ["0", "1"] {
+        stored(&store, &format!("slots/foo/{number}.slot/lib"), 1000, 0);
+        stored(&store, &format!("slots/foo/{number}.lock"), 0, 0);
+    }
+    let held = fs::File::open(pool.join("1.lock")).unwrap();
+    held.try_lock().unwrap();
+
+    let collected = gc::collect(&store, 0, u64::MAX, true, || (10_000, 10_000));
+    assert_eq!((collected.entries, collected.slots, collected.next), (1, 1, 0));
+    for gone in
+        ["entries/recent", "entries/key.reads", "hashes/memo", "out/key.never", "slots/foo/0.slot"]
+    {
+        assert!(!store.join(gone).exists(), "{gone}");
+    }
+    for kept in ["entries/staged.123", "locks/inputs", "slots/foo/1.slot"] {
+        assert!(store.join(kept).exists(), "{kept}");
+    }
+}
+
+#[test]
+fn gc_measures_only_the_entries_and_slots_that_changed_since_its_last_run() {
+    let fixture = fixture("gc-sizes", "");
+    let store = fixture.root.join("store");
+    let entry = stored(&store, "entries/entry/lib", 1000, 0);
+    let idle = stored(&store, "slots/foo/0.slot/lib", 1000, 0);
+    let busy = stored(&store, "slots/foo/1.slot/lib", 1000, 0);
+    let held = stored(&store, "slots/foo/2.slot/lib", 1000, 0);
+    let lock = stored(&store, "slots/foo/0.lock", 0, 7200);
+    let busy_lock = stored(&store, "slots/foo/1.lock", 0, 60);
+    let held_lock = fs::File::create(stored(&store, "slots/foo/2.lock", 0, 60)).unwrap();
+    held_lock.try_lock().unwrap();
+    let size = || gc::collect(&store, 0, u64::MAX, false, || (100, 100)).size;
+    let first = size();
+    for path in [&entry, &idle, &busy, &held] {
+        fs::write(path, [0; 1500]).unwrap();
+    }
+    assert_eq!(size(), first + 500, "only a slot that a compile holds is measured again");
+    age(&busy_lock, 30);
+    assert_eq!(
+        size(),
+        first + 1000,
+        "a slot that a compile took in the last hour is measured again"
+    );
+    age(&lock, 7000);
+    assert_eq!(size(), first + 1500, "a slot that a compile took is measured again");
+    fs::remove_dir_all(entry.parent().unwrap()).unwrap();
+    stored(&store, "entries/entry/lib", 3000, 0);
+    assert_eq!(size(), first + 3500, "an entry stored again under its name is measured again");
+}
+
+#[test]
+fn gc_sweeps_the_memos_once_a_day() {
+    let fixture = fixture("gc-memos", "");
+    let store = fixture.root.join("store");
+    let cut = crate::now() - 3 * 86400;
+    let old = stored(&store, "hashes/old", 32, 4 * 86400);
+    let kept = stored(&store, "hashes/kept", 32, 86400);
+    let size = gc::collect(&store, cut, u64::MAX, false, || (100, 100)).size;
+    assert!(!old.exists() && kept.exists());
+    let old = stored(&store, "hashes/old", 32, 4 * 86400);
+    assert_eq!(gc::collect(&store, cut, u64::MAX, false, || (100, 100)).size, size);
+    assert!(old.exists(), "a sweep waits for a day");
+    let sizes = fs::read_to_string(store.join("gc.sizes")).unwrap();
+    let (memos, items) = sizes.split_once('\n').unwrap();
+    let bytes = memos.rsplit('\t').next().unwrap();
+    let swept = format!("memos\t{}\t{bytes}\n{items}", crate::now() - 86400);
+    fs::write(store.join("gc.sizes"), swept).unwrap();
+    gc::collect(&store, cut, u64::MAX, false, || (100, 100));
+    assert!(!old.exists() && kept.exists());
+}
+
+#[test]
+fn gc_that_must_evict_evicts_a_tenth_of_the_cap_more_and_leaves_that_room_to_the_trigger() {
+    let fixture = fixture("gc-margin", "");
+    let store = fixture.root.join("store");
+    for number in 0..20 {
+        stored(&store, &format!("entries/{number}/lib"), 1000, 0);
+        age(&store.join(format!("entries/{number}")), 7200 - number);
+    }
+    let size = gc::collect(&store, 0, u64::MAX, false, || (1 << 40, 1 << 40)).size;
+    let cap = size - 1;
+    let collected = gc::collect(&store, 0, cap, false, || (1 << 40, 1 << 40));
+    assert_eq!(collected.entries, 2, "down to nine tenths of the cap");
+    assert!(collected.size <= cap - cap / 100 * 10 && collected.next == 0);
+    assert_eq!(gc::collect(&store, 0, cap, false, || (1 << 40, 1 << 40)).entries, 0);
+    // Where the free space is short, a run frees a tenth of the cap beyond the floor, and asks again after each removal.
+    let calls = std::cell::Cell::new(0);
+    let space = || {
+        calls.set(calls.get() + 1);
+        (100_000, 8_999 + 1000 * calls.get())
+    };
+    assert_eq!(gc::collect(&store, 0, 100_000, false, space).entries, 11);
+
+    fs::write(store.join("gc.stamp"), "0 5000").unwrap();
+    gc::add_bytes(&store, 5000);
+    assert!(!gc::trigger(&store, Path::new("/usr/bin/true")), "the room that the last run left");
+    gc::add_bytes(&store, 1);
+    assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
+}
+
+#[test]
+fn trigger_waits_until_an_item_can_be_due_after_a_run_that_left_the_store_over_its_bounds() {
+    let fixture = fixture("gc-futile", "");
+    let store = fixture.root.join("store");
+    fs::write(store.join("gc.stamp"), (crate::now() + 100).to_string()).unwrap();
+    gc::add_bytes(&store, 2 << 30);
+    assert!(!gc::trigger(&store, Path::new("/usr/bin/true")));
+    fs::write(store.join("gc.stamp"), (crate::now() - 1).to_string()).unwrap();
+    assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
+}
+
+#[test]
+fn stats_gives_the_size_of_the_store_at_its_last_gc() {
+    let fixture = fixture("gc-stats", "");
+    let store = fixture.root.join("store");
+    fs::write(store.join("log"), "100 - 5 gc 1 2 3000000000 4\n101 foo 1 hit\n").unwrap();
+    let report = stats(&[], &store).unwrap();
+    assert!(report.contains("the store held 3.0 GB at its last gc, of a cap of "), "{report}");
+}
+
+#[test]
+fn a_word_that_names_no_program_is_not_taken_for_rustc() {
+    for word in ["status", "g", "--help", ""] {
+        assert!(!is_program(word), "{word}");
+    }
+    assert!(is_program("sh") && is_program("/no/such/rustc") && is_program("./rustc"));
 }
 
 #[test]
@@ -1536,11 +1734,24 @@ fn own_build(
     name: &str,
     source: &str,
 ) -> (Result<(String, i32), &'static str>, PathBuf) {
+    own_compile(fixture, name, source, true)
+}
+
+/// [`own_build`] with a source written just now where it is not `settled`.
+fn own_compile(
+    fixture: &Fixture,
+    name: &str,
+    source: &str,
+    settled: bool,
+) -> (Result<(String, i32), &'static str>, PathBuf) {
     let (root, target) = (fixture.root.join(name), fixture.worktree(name, "metadata"));
     fs::create_dir_all(root.join(".git"))
         .and_then(|()| fs::create_dir_all(root.join("src")))
         .unwrap();
-    write_source(&root.join("src/lib.rs"), source);
+    match settled {
+        true => write_source(&root.join("src/lib.rs"), source),
+        false => fs::write(root.join("src/lib.rs"), source).unwrap(),
+    }
     let mut args = fixture.args(&target);
     args[2] = root.join("src/lib.rs").display().to_string();
     args.extend([
@@ -1550,6 +1761,50 @@ fn own_build(
     let worktree = Some(root.display().to_string());
     let outcome = fixture.build(&args, &fixture.root.join("store"), worktree);
     (outcome, target.join("debug/build/foo/abc/out"))
+}
+
+/// A fixture whose stand-in, in a worktree that holds a file `gate`, waits up to five seconds for `gate.open` after it
+/// writes `runs`.
+fn gated(name: &str) -> Fixture {
+    let fixture = own(name);
+    let script = fs::read_to_string(&fixture.rustc).unwrap();
+    let gate = r#"
+root=${out%/target/*}
+n=0
+while [ -e "$root/gate" ] && [ ! -e "$root/gate.open" ] && [ $n -lt 500 ]; do sleep 0.01; n=$((n + 1)); done
+printf rmeta"#;
+    executable(Path::new(&fixture.rustc), &script.replacen("\nprintf rmeta", gate, 1));
+    fixture
+}
+
+// Worktrees that edited the same own crate share its key, and each compile waited for the ones before it.
+#[test]
+fn own_crate_waits_only_for_a_compile_of_the_same_settled_sources() {
+    let fixture = gated("same-inputs");
+    // The reads that select an entry of the key are known once a compile stored them.
+    own_build(&fixture, "seed", "pub fn seed() {}").0.unwrap();
+    fs::create_dir_all(fixture.root.join("a")).unwrap();
+    fs::write(fixture.root.join("a/gate"), "").unwrap();
+    thread::scope(|scope| {
+        let first = scope.spawn(|| own_build(&fixture, "a", "pub fn a() {}"));
+        wait_for(&fixture.root.join("a/target/debug/build/foo/abc/out/runs"));
+        let quick = |name, source, settled| {
+            let started = Instant::now();
+            let outcome = own_compile(&fixture, name, source, settled).0.unwrap().0;
+            assert!(started.elapsed() < Duration::from_secs(3), "{name} waited");
+            outcome
+        };
+        assert_eq!(quick("other", "pub fn b() {}", true), "miss");
+        assert_eq!(quick("young", "pub fn a() {}", false), "passthrough changed-source");
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(300));
+            fs::write(fixture.root.join("a/gate.open"), "").unwrap();
+        });
+        let (outcome, out) = own_build(&fixture, "same", "pub fn a() {}");
+        assert_eq!(outcome, Ok(("hit waited".to_string(), 0)));
+        assert!(!out.join("runs").exists(), "rustc must run once");
+        assert_eq!(first.join().unwrap().0, Ok(("miss".to_string(), 0)));
+    });
 }
 
 #[test]
@@ -2385,6 +2640,86 @@ fn session_is_kept_per_slot_and_restored_only_where_the_worktree_has_none_for_th
     assert!(eventually(|| session::remove_sessions(sessions).is_ok()) && !sessions.exists());
 }
 
+// New worktrees compiled the dependents of an edited crate at once, and all but the first started cold in new slots.
+// Then all of them waited for the one slot with a session, each for as long as a cold compile took, also in the next
+// edit, and those after the first waited for longer than a cold compile.
+#[test]
+fn compile_waits_for_a_busy_slot_with_a_session_only_alone_and_as_long_as_it_saves() {
+    let fixture = own("slot-wait");
+    rebuilt(&fixture, "a");
+    assert_eq!(carried_build(&fixture, "a", "pub fn a() {}", &[]).0, Ok(("miss".to_string(), 0)));
+    let pool = pool(&fixture);
+    let cold = fs::read_to_string(pool.join("0.cold")).unwrap();
+    assert!(cold.parse::<u64>().is_ok(), "a compile without a session records its time");
+    let slot = |number: usize| pool.join(format!("{number}.slot")).display().to_string();
+    let held = |number: usize| loop {
+        if let Some((taken, lock)) = session::choose(&pool, vec![number])
+            && taken == number
+        {
+            break lock;
+        }
+    };
+    // Where the pool has no record of a carried compile, a compile does not wait.
+    fs::write(pool.join("0.cold"), "5000").unwrap();
+    let lock = held(0);
+    let started = Instant::now();
+    let (outcome, out) = carried_build(&fixture, "b", "pub fn b() {}", &[]);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "waited with no record of a carried compile"
+    );
+    assert_eq!(
+        (outcome, sessions(&out)),
+        (Ok(("miss".to_string(), 0)), format!("none {}\n", slot(1)))
+    );
+    // Where another compile waits in the pool, a compile does not wait either.
+    let _one = held(1);
+    fs::write(pool.join("0.warm"), "100").unwrap();
+    let waiter = fs::File::create(pool.join("wait.lock")).unwrap();
+    waiter.lock().unwrap();
+    let started = Instant::now();
+    let (outcome, out) = carried_build(&fixture, "c", "pub fn c() {}", &[]);
+    assert!(started.elapsed() < Duration::from_secs(4), "waited behind another waiting compile");
+    assert_eq!(
+        (outcome, sessions(&out)),
+        (Ok(("miss".to_string(), 0)), format!("none {}\n", slot(2)))
+    );
+    drop(waiter);
+    // Otherwise it waits, and takes the slot once it frees up.
+    let _two = held(2);
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(lock);
+        });
+        let (outcome, out) = carried_build(&fixture, "d", "pub fn d() {}", &[]);
+        assert_eq!(outcome, Ok(("miss session".to_string(), 0)));
+        assert!(sessions(&out).ends_with(&format!(" {}\n", slot(0))), "{}", sessions(&out));
+    });
+    let warm = fs::read_to_string(pool.join("0.warm")).unwrap();
+    assert!(warm != "100" && warm.parse::<u64>().is_ok(), "a carried compile records its time");
+    // The worktree that waited compiles its next edit from its own session.
+    free(&pool, 0);
+    let (outcome, out) = carried_build(&fixture, "d", "pub fn e() {}", &[]);
+    assert_eq!(outcome, Ok(("miss".to_string(), 0)));
+    assert!(!sessions(&out).lines().last().unwrap().starts_with("none "));
+
+    // Once what a carried compile saves has passed, the compile starts cold in a free slot.
+    for number in [1, 2] {
+        fs::remove_file(pool.join(format!("{number}.cold"))).unwrap();
+    }
+    fs::write(pool.join("0.cold"), "400").unwrap();
+    fs::write(pool.join("0.warm"), "100").unwrap();
+    let _zero = held(0);
+    let started = Instant::now();
+    let (outcome, out) = carried_build(&fixture, "e", "pub fn f() {}", &[]);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(
+        (outcome, sessions(&out)),
+        (Ok(("miss".to_string(), 0)), format!("none {}\n", slot(3)))
+    );
+}
+
 #[test]
 fn session_in_a_store_that_links_is_copied_from_the_recorded_worktree_so_that_a_write_in_place_reaches_no_other()
  {
@@ -2698,10 +3033,10 @@ fn gc_removes_the_slots_that_no_compile_used_for_three_days_with_their_snapshots
     }
     age(&pool.join("2.lock"), 4 * 86400);
     let cut = crate::now() - 3 * 86400;
-    let size = gc::collect(&store, 0, u64::MAX, || (100, 100)).size;
+    let size = gc::collect(&store, 0, u64::MAX, false, || (100, 100)).size;
     assert!(!pool.join("0.session.1").exists(), "a snapshot left in staging is removed");
     assert!(pool.join("1.session.1").exists(), "a leftover of the last hour stays");
-    let collected = gc::collect(&store, cut, size - 1, || (100, 100));
+    let collected = gc::collect(&store, cut, size - 1, false, || (100, 100));
     assert_eq!((collected.entries, collected.freed), (1, 1000));
     assert!(!store.join("entries/old").exists());
     assert!(pool.join("0.source").exists(), "a record stays with its slot");
@@ -2711,8 +3046,10 @@ fn gc_removes_the_slots_that_no_compile_used_for_three_days_with_their_snapshots
     assert!(!pool.join("2.libraries").exists() && !pool.join("2.source").exists());
     assert!(!pool.join("2.session").exists());
     drop(lock);
-    age(&pool.join("1.session.1"), 7200);
-    gc::collect(&store, crate::now(), 0, || (100, 100));
+    for path in ["1.session.1", "1.lock", "0.lock"] {
+        age(&pool.join(path), 7200);
+    }
+    gc::collect(&store, crate::now(), 0, false, || (100, 100));
     assert!(!store.join("slots/foo").exists(), "an empty pool goes with its last slot");
 }
 
@@ -3143,14 +3480,18 @@ fn gc_removes_a_candidate_whose_outputs_changed_or_that_is_three_days_old() {
     own_build(&fixture, "a", "pub fn b() {}").0.unwrap();
     assert_eq!(candidates(&fixture).len(), 1, "a compile replaces the candidate of its outputs");
     fs::remove_file(fixture.root.join("a/target/debug/build/foo/abc/out/libfoo-abc.rlib")).unwrap();
-    gc::collect(&store, cut, u64::MAX, || (100, 100));
+    // A run checks the candidates where it sweeps, as it does once a day and where `gc.sizes` is missing.
+    let _ = fs::remove_file(store.join("gc.sizes"));
+    gc::collect(&store, cut, u64::MAX, false, || (100, 100));
     assert!(candidates(&fixture).is_empty());
     rebuilt(&fixture, "b");
     own_build(&fixture, "b", "pub fn c() {}").0.unwrap();
-    gc::collect(&store, cut, u64::MAX, || (100, 100));
+    fs::remove_file(store.join("gc.sizes")).unwrap();
+    gc::collect(&store, cut, u64::MAX, false, || (100, 100));
     let candidate = candidates(&fixture).pop().expect("a current candidate stays");
     age(&candidate, 4 * 86400);
-    gc::collect(&store, cut, u64::MAX, || (100, 100));
+    fs::remove_file(store.join("gc.sizes")).unwrap();
+    gc::collect(&store, cut, u64::MAX, false, || (100, 100));
     assert!(candidates(&fixture).is_empty());
 }
 

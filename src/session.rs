@@ -18,7 +18,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs, io};
 
 use crate::store::Files;
@@ -75,6 +75,8 @@ pub struct Slot {
     subdirectory: String,
     /// Whether the compile starts from a snapshot of the session that the slot recorded.
     pub restored: bool,
+    /// Whether the compile starts without a session.
+    cold: bool,
     /// Whether the compile links, so that it reads its libraries through [`LIBRARIES`].
     links: bool,
     files: Files,
@@ -87,6 +89,8 @@ impl Slot {
     /// The slot is the first of these.
     /// - The slot recorded for the session of the worktree, where it is free.
     /// - The free slot with the newest session.
+    /// - One of those that frees up while the compile waits for as long as a carried compile saves, where no other
+    ///   compile waits in the pool.
     /// - The lowest free slot.
     /// - A new slot.
     pub fn take(unit: &Unit, args: &[String], store: &Path, files: Files) -> Option<Slot> {
@@ -121,15 +125,31 @@ impl Slot {
         let sessions = Path::new(incremental).join(&subdirectory);
         let recorded = newest(&sessions)
             .and_then(|_| fs::read_to_string(sessions.join(SLOT)).ok()?.parse::<usize>().ok());
-        let mut kept = Vec::from_iter(fs::read_dir(&pool).ok()?.flatten().filter_map(|entry| {
-            let number =
-                entry.file_name().to_str()?.strip_suffix(".source")?.parse::<usize>().ok()?;
-            Some((entry.metadata().ok()?.modified().ok()?, number))
-        }));
+        let (mut kept, mut cold, mut warm) = (Vec::new(), Duration::ZERO, Duration::ZERO);
+        for entry in fs::read_dir(&pool).ok()?.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(number) = name.strip_suffix(".source").and_then(|n| n.parse::<usize>().ok())
+                && let Some(modified) = entry.metadata().ok().and_then(|file| file.modified().ok())
+            {
+                kept.push((modified, number));
+            } else if let Some(time) = [(".cold", &mut cold), (".warm", &mut warm)]
+                .into_iter()
+                .find_map(|(kind, time)| name.ends_with(kind).then_some(time))
+                && let Ok(milliseconds) =
+                    fs::read_to_string(entry.path()).map(|text| text.parse::<u64>())
+            {
+                *time = (*time).max(Duration::from_millis(milliseconds.unwrap_or(0)));
+            }
+        }
         kept.sort_by(|a, b| b.cmp(a));
-        let preferred = recorded
-            .map_or_else(|| Vec::from_iter(kept.iter().map(|(_, number)| *number)), |n| vec![n]);
-        let (number, lock) = choose(&pool, preferred)?;
+        let mut preferred = Vec::from_iter(recorded);
+        preferred.extend(kept.iter().map(|(_, number)| *number).filter(|n| Some(*n) != recorded));
+        // A compile waits for a slot with a session no longer than a carried compile saves on a cold one, and not at all
+        // where the pool has no record of both. Only one compile of a pool waits, because the ones behind it would
+        // queue for longer than a cold compile, and each that starts cold in its own slot carries its later edits.
+        let saved = if warm.is_zero() { Duration::ZERO } else { cold.saturating_sub(warm) };
+        let taken = wait(&pool, &preferred, saved.min(PATIENCE));
+        let (number, lock) = taken.or_else(|| choose(&pool, preferred))?;
         let path = pool.join(format!("{number}.slot"));
         let path = path
             .to_str()
@@ -145,6 +165,7 @@ impl Slot {
             sessions,
             subdirectory,
             restored: false,
+            cold: false,
             links: links(args),
             files,
             _lock: lock,
@@ -163,6 +184,7 @@ impl Slot {
             slot.restored = slot.restore().is_ok();
             if !slot.restored {
                 remove_sessions(&slot.sessions).ok()?;
+                slot.cold = true;
             }
             let written = fs::create_dir_all(&slot.sessions)
                 .and_then(|()| fs::write(slot.sessions.join(SLOT), number.to_string()));
@@ -540,6 +562,18 @@ impl Slot {
         environment
     }
 
+    /// Records `compile` as the time of a cold compile of the crate where this one started without a session, and
+    /// else of a carried one.
+    ///
+    /// [`Slot::take`] waits for a busy slot with a session for as long as the one saves on the other.
+    pub fn time(&self, compile: Duration) {
+        let kind = if self.cold { "cold" } else { "warm" };
+        let _ = fs::write(
+            self.pool.join(format!("{}.{kind}", self.number)),
+            compile.as_millis().to_string(),
+        );
+    }
+
     /// Records the newest session of the crate in the worktree, with its [`listing`], as the session that the slot
     /// compiled last.
     ///
@@ -770,29 +804,67 @@ pub fn linked(text: &str, worktree: &str, slot: &str) -> String {
     text.replace(&format!("{slot}{LIBRARIES}/"), &slot).replace(&format!("{worktree}/"), &slot)
 }
 
-/// The first of `preferred`, then of every slot number, whose lock in `pool` this process takes without waiting.
+/// The first of `preferred`, then of every slot number, whose [`lock`] in `pool` this process takes without waiting.
 ///
-/// A lock file that gc removed after it was opened is skipped, because another process may lock its successor. It is
-/// `None` where a lock file cannot be opened or locked.
+/// It is `None` where a lock file cannot be opened or locked.
 pub fn choose(pool: &Path, preferred: Vec<usize>) -> Option<(usize, fs::File)> {
-    use std::os::unix::fs::MetadataExt;
     for number in preferred.into_iter().chain(0..) {
-        let path = pool.join(format!("{number}.lock"));
-        let file = fs::File::create(&path).ok()?;
-        match file.try_lock() {
-            Err(fs::TryLockError::Error(_)) => return None,
-            Err(fs::TryLockError::WouldBlock) => {}
-            Ok(()) => {
-                let current = fs::metadata(&path).ok().map(|metadata| metadata.ino());
-                if current == file.metadata().ok().map(|metadata| metadata.ino()) {
-                    let _ = file.set_modified(std::time::SystemTime::now());
-                    return Some((number, file));
-                }
-            }
+        if let Some(file) = lock(pool, number)? {
+            return Some((number, file));
         }
     }
     None
 }
+
+/// The first of `warm` whose lock in `pool` this process takes within `patience`, which it polls for while it holds
+/// the lock `wait.lock` of the pool.
+///
+/// It is `None` after `patience`, at once where another process holds `wait.lock`, or where a lock file cannot be
+/// opened or locked.
+fn wait(pool: &Path, warm: &[usize], patience: Duration) -> Option<(usize, fs::File)> {
+    let started = Instant::now();
+    let mut waiting = None;
+    loop {
+        for &number in warm {
+            if let Some(file) = lock(pool, number)? {
+                return Some((number, file));
+            }
+        }
+        if started.elapsed() >= patience {
+            return None;
+        }
+        if waiting.is_none() {
+            let file = fs::File::create(pool.join("wait.lock")).ok()?;
+            file.try_lock().ok()?;
+            waiting = Some(file);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The lock of the slot `number` in `pool`, or `Some(None)` where another process holds it.
+///
+/// A lock file that gc removed after it was opened counts as held, because another process may lock its successor. It
+/// is `None` where the lock file cannot be opened or locked.
+fn lock(pool: &Path, number: usize) -> Option<Option<fs::File>> {
+    let path = pool.join(format!("{number}.lock"));
+    let file = fs::File::create(&path).ok()?;
+    match file.try_lock() {
+        Err(fs::TryLockError::Error(_)) => None,
+        Err(fs::TryLockError::WouldBlock) => Some(None),
+        Ok(()) => {
+            let current = fs::metadata(&path).ok().map(|metadata| metadata.ino());
+            if current != file.metadata().ok().map(|metadata| metadata.ino()) {
+                return Some(None);
+            }
+            let _ = file.set_modified(SystemTime::now());
+            Some(Some(file))
+        }
+    }
+}
+
+/// The longest that a compile waits for a slot with a session, whatever the pool recorded.
+const PATIENCE: Duration = Duration::from_secs(600);
 
 /// The directory of the crate and its newest finalized session in `sessions`, which is the `-C incremental` of a crate.
 ///

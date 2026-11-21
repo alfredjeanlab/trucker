@@ -283,13 +283,13 @@ pub fn record(
         && fs::File::create(&temporary)
             .and_then(|mut file| file.write_all(&candidate.encode()))
             .is_ok()
-        && (reads.is_empty() || fs::write(store::reads_of(entries, key), &reads).is_ok())
+        && (reads.is_empty() || store::write_reads(entries, key, &reads).is_ok())
         && fs::rename(&temporary, &path).is_ok();
     let _ = fs::remove_file(&temporary);
     if recorded { Ok(()) } else { Err("eager") }
 }
 
-/// Promotes the candidate of `key` that stands for `entry`, under the key's lock, and returns whether `entry` exists.
+/// Promotes the candidate of `key` that stands for `entry`, and returns whether `entry` exists.
 ///
 /// The candidate is removed, whether it made the entry or failed.
 pub fn promote(entries: &Path, key: &str, entry: &Path, files: Files) -> bool {
