@@ -1,0 +1,6 @@
+# The newest stable Rust; Cargo.toml's rust-version refuses one older than 1.100, the oldest that trucker caches, so
+# the repository builds through the installed trucker.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

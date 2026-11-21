@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT OR Apache-2.0"
+description = "A rustc wrapper that shares compiled crates between worktrees on a machine"
+repository = "https://github.com/alfredjeanlab/trucker"
+readme = "README.md"
+categories = ["development-tools::build-utils", "caching"]
+keywords = ["cargo", "rustc", "cache", "worktree", "build"]
+include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-*"]
 
 [dependencies]
 blake3 = { version = "1", features = ["mmap"] }

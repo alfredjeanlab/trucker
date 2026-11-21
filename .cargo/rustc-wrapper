@@ -1,0 +1,10 @@
+#!/bin/sh
+# rustc-wrapper RUSTC ARGUMENT...
+#
+# Cargo's wrapper of rustc in this repository, which .cargo/config.toml names: the installed trucker, built from main,
+# so that the tool is built by its stable version and never by the one being changed. Where trucker is not installed,
+# rustc runs alone. A branch's own binary is tested by naming it in RUSTC_WRAPPER.
+if command -v trucker > /dev/null 2>&1; then
+    exec trucker "$@"
+fi
+exec "$@"

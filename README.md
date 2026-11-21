@@ -1,0 +1,220 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/trucker-banner-dark.svg">
+  <img src="docs/trucker-banner-light.svg" alt="trucker: hauls crates to your worktrees" width="440" height="96">
+</picture>
+
+Trucker is a `RUSTC_WRAPPER` that shares compiled crates between every worktree and clone on a machine.
+
+A crate that has been compiled once is restored into each later build by cloning its files,
+so a fresh worktree builds in a fraction of the time and uses much less disk space.
+
+## Requirements
+
+  - Rust and cargo 1.100 or later. Trucker runs an older rustc untouched.
+  - macOS, Linux or Windows, as [supported platforms](#supported-platforms) says.
+  - The store and the target directories on one filesystem.  
+    The store is `~/.cache/trucker` or `$XDG_CACHE_HOME/trucker`.  
+
+## Installation
+
+```
+cargo install --path .
+```
+
+Then name it in the `.cargo/config.toml` of a repository, or of your home directory:
+
+```toml
+[build]
+rustc-wrapper = "trucker"
+```
+
+## Usage
+
+```
+cargo build                     # build through trucker, once configured
+
+RUSTC_WRAPPER= cargo build      # build without trucker
+
+trucker gc                      # removes entries that no build has used lately
+trucker gc --all                # empties the cache, but keeps what a running build holds
+trucker stats                   # cache hits, misses and build timers
+```
+
+Trucker automatically decides whether to run `trucker gc` after a miss so it rarely needs to be run by hand.
+Trucker will use up to 10% of the filesystem, between 16 GiB and 100 GiB,
+and always leaves behind at least 10% free space on the disk.
+
+Use `TRUCKER_CACHE_SIZE` to adjust the cache size, in bytes or with a suffix K, M, G or T (e.g. `=200G`).
+
+## When to use Trucker
+
+Use trucker whenever you run builds from **one or more worktrees or checkouts on a single machine**,
+as is typical during agentic development with Claude, Codex, Conductor, Zed, etc.
+
+It makes normal builds faster:
+
+- The first build in a new worktree or checkout.
+- The first edit (and subsequent edits) to any crate in the workspace.
+
+It helps run more concurrent work on the same machine:
+
+- Disk usage is bounded and garbage collected.
+- Concurrent builds compile each shared crate only once.
+- Overall system load is minimized to leave room for other work.
+
+It's almost always faster than cargo alone, and never meaningfully slower.
+
+## In CI
+
+Trucker is useful in CI on runners that keep the store and target on the same persistent disk.  
+It is not designed for classic GitHub Actions-like runners.
+
+  - **Persistent runners:** try trucker for tools like [Blacksmith](https://docs.blacksmith.sh/blacksmith-caching/dependencies-sticky-disks) or [Namespace](https://namespace.so/docs/architecture/storage/cache-volumes).
+  - **GitHub Actions or Forgejo Actions:** use [rust-cache](https://github.com/Swatinem/rust-cache).
+  - **GitLab CI:** use a `cache:` of `target/` and `~/.cargo`, keyed on `Cargo.lock`.
+
+See [CI caches](docs/comparisons/vs-ci.md) for a comparison of other CI caching tools.
+
+## Trucker vs alternatives
+
+Times and disk use are relative to plain cargo; lower is better.  
+See the [benchmarks](#benchmarks) below.
+
+| | trucker | kache | mr-boxington | shared `target/` | sccache |
+| --- | --- | --- | --- | --- | --- |
+| Build fresh worktree | 0.05–0.15× | 0.09–0.39× | 0.09–0.73× | 0.53–0.86× | 0.73–1.05× |
+| 1st edit in worktree | 0.96–1.18× | 1.15–5.14× | 1.20–3.22× | 0.97–1.03× | 0.93–1.14× |
+| 2nd edit in worktree | 0.96–1.08× | 0.93–1.03× | 0.99–1.29× | 0.97–1.03× | 0.91–1.01× |
+| Disk per worktree | 0.25–0.34×[^ext4] | 0.17–0.28× | 0.16–0.41× | 0.25–0.29× | ~1× |
+
+Trucker also handles the most common kinds of build steps in Rust projects:
+
+  - **Native code:** C or C++ that a build script compiles with `cc` or CMake, and `cxx` bridges.
+  - **Generated code:** sources that a build script writes into `OUT_DIR`, even where it bakes that path into a binary.
+  - **Proc macros that read files:** embedded assets, templates, and sqlx's offline data and migrations.
+  - **Build info:** the git commit that each worktree embeds, as vergen does.
+  - **Libraries loaded at run time:** a `cdylib` such as a pyo3 extension, and a `dylib` such as Bevy's.
+
+All of `cargo check`, `cargo clippy` and `cargo test` share the cache with `cargo build`, so they are fast in a fresh
+worktree too, and a restored crate still shows its clippy warnings.
+
+Each target, profile, and flagset is cached separately, so wasm or release builds are also reused.
+
+See also: [sentinel projects](bench/README.md#sentinels) used to test trucker.
+
+## Benchmarks
+
+Each figure is the mean of 3 builds with Rust 1.100.0 in the dev profile, on a 16-core Linux virtual machine with XFS,
+offline and pinned to 15 cores, with each tool at its defaults.
+
+The matrix above compares each tool with the plain cargo run alongside it.
+
+The methods, scripts and results are in [bench/](bench/README.md).
+
+### Fresh worktree, warm cache
+
+A new git worktree of the same commit builds, with the cache warm from the cold build of another worktree.
+
+| Project | cargo | trucker | [kache] | [mr-boxington] | [shared `target/`][shared] | [sccache] |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ripgrep | *6.43s* | **343ms** | 588ms | 592ms | 3.40s | 4.70s |
+| cargo | *50.88s* | **3.74s** | 6.71s | 37.27s | 33.20s | 53.26s |
+| rust-analyzer | *56.63s* | **8.23s** | 21.99s | 20.95s | 48.92s | 57.52s |
+| Zed | *216.81s* | **27.24s** | 40.99s | 144.94s | 133.46s | 204.83s |
+
+### First edit of the deepest crate
+
+The new worktree appends an unused function to the crate that every other own crate depends on, and builds.
+
+| Project | cargo | trucker | [kache] | [mr-boxington] | [shared `target/`][shared] | [sccache] |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ripgrep | *1.20s* | 1.22s | 2.33s | 2.09s | 1.23s | **1.18s** |
+| cargo | *6.35s* | 6.69s | 32.63s | 16.70s | 6.42s | **6.33s** |
+| rust-analyzer | *13.47s* | 13.50s | 49.60s | 32.70s | **13.43s** | 13.48s |
+| Zed | *42.50s* | 50.07s | 129.92s | 136.85s | **41.22s** | 43.38s |
+
+### First edit of a leaf crate
+
+The new worktree appends an unused function to the binary crate, which nothing depends on, and builds.
+
+| Project | cargo | trucker | [kache] | [mr-boxington] | [shared `target/`][shared] | [sccache] |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ripgrep | *816ms* | 834ms | 2.22s | 2.15s | 836ms | **755ms** |
+| cargo | *1.84s* | 2.10s | 4.14s | 3.89s | 1.83s | **1.79s** |
+| rust-analyzer | *1.82s* | **1.76s** | 2.11s | 2.19s | 1.84s | 1.80s |
+| Zed | *7.91s* | 9.15s | 12.31s | 10.63s | **7.77s** | 9.04s |
+
+### Disk use by four worktrees
+
+The filesystem's used space, by `df`, after one cold build and three new worktrees.
+
+| Project | cargo | trucker | [kache] | [mr-boxington] | [shared `target/`][shared] | [sccache] |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ripgrep | *1.5 GB* | 391 MB | 260 MB | **250 MB** | 388 MB | 1.6 GB |
+| cargo | *13 GB* | 3.3 GB | **2.3 GB** | 5.3 GB | 3.3 GB | 14 GB |
+| rust-analyzer | *18 GB* | 6.1 GB | 5.1 GB | 5.1 GB | **4.8 GB** | 17 GB |
+| Zed | *90 GB* | 23 GB | **22 GB** | 37 GB | 26 GB | 93 GB |
+
+### Cold build
+
+One worktree builds with an empty target and an empty cache. mr-boxington turns off cargo's incremental compilation, so
+its cold build writes less and its first edits recompile more.
+
+| Project | cargo | trucker | [kache] | [mr-boxington] | [sccache] |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ripgrep | *6.43s* | 6.44s | 6.06s | **6.03s** | 7.39s |
+| cargo | *50.88s* | 51.87s | 59.03s | **48.34s** | 55.08s |
+| rust-analyzer | *56.63s* | 58.00s | 49.83s | **49.34s** | 57.35s |
+| Zed | *216.81s* | 221.88s | 216.16s | **197.46s** | 240.45s |
+
+[^ext4]: 1× on a filesystem without reflinks, such as ext4, where each worktree gets a checked copy.
+
+[sccache]: docs/comparisons/vs-sccache.md
+[mr-boxington]: docs/comparisons/vs-mr-boxington.md
+[kache]: docs/comparisons/vs-kache.md
+[shared]: docs/comparisons/vs-cargo.md
+
+The figures were measured on Linux with XFS.
+
+A fresh worktree typically builds in 1/10th the time of a cold build (seconds instead of minutes),
+and incremental edit workflows stay as fast as cargo (~1x cargo incremental builds).
+
+## Concurrent builds (throughput)
+
+Four new worktrees of the same commit build at once against a warm store, then each edits a leaf crate, the deepest
+crate, and the deepest crate again. Each figure is the time until the last worktree finishes, from one or two runs.
+
+| Project | Step | cargo | [shared `target/`][shared] | trucker |
+| --- | --- | ---: | ---: | ---: |
+| cargo | Fresh worktree | 102.63s | 34.93s | **3.94s** |
+| cargo | Leaf edit | **2.50s** | 3.51s | 3.71s |
+| cargo | Deep edit | **7.23s** | 33.58s | 21.19s |
+| cargo | Second deep edit | **7.29s** | 33.65s | 7.49s |
+| Zed | Fresh worktree | 837.21s | 422.67s | **38.86s** |
+| Zed | Leaf edit | **21.34s** | 389.75s | 27.95s |
+| Zed | Deep edit | 254.60s | 420.04s | **156.91s** |
+| Zed | Second deep edit | **176.48s** | 397.76s | 179.94s |
+
+A shared `target/` makes the worktrees wait for each other on cargo's lock.
+
+With trucker, if several new worktrees edit the same crate at the same time,
+some will recompile the whole crate to avoid waiting on each other.
+Later edits are as fast as plain cargo.
+
+## Supported platforms
+
+  - **Supported:** macOS on APFS, and Linux on XFS, Btrfs or ext4.
+    The tests run on macOS and on Linux with XFS and ext4, and the benchmarks above run on Linux with XFS.
+    On a filesystem without reflinks, such as ext4, each build gets a copy that is checked against its hash,
+    so a fresh worktree is as fast but takes its full size on disk.
+  - **Experimental:** Windows 11, for third-party crates only, and your own crates compile as with plain cargo.
+    Files are cloned on a Dev Drive and copied with a hash check on NTFS.
+    It has not yet been tested on a Windows machine.
+    Inside WSL 2, trucker runs as on Linux, with the repository and the store on its Linux filesystem.
+
+## License
+
+trucker is licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in trucker, as defined in
+the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

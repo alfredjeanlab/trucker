@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: ""
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS, APFS
+            os: macos-latest
+            fs: apfs
+          - name: Linux, XFS
+            os: ubuntu-latest
+            fs: xfs
+          - name: Linux, Btrfs
+            os: ubuntu-latest
+            fs: btrfs
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.fs }}
+      # The unit tests need a filesystem that clones, and the root of a Linux runner is ext4.
+      # We run them in a loop file of the filesystem under test.
+      - name: Mount ${{ matrix.fs }} for the tests
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y xfsprogs btrfs-progs
+          sudo truncate -s 8G /mnt/work.img
+          sudo mkfs.${{ matrix.fs }} -q /mnt/work.img
+          sudo mkdir -p /work
+          sudo mount -o loop /mnt/work.img /work
+          sudo chown "$(id -u):$(id -g)" /work
+          echo "TMPDIR=/work" >> "$GITHUB_ENV"
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # Real cargo builds through trucker on XFS, with the store on another filesystem, and on ext4, which cannot clone.
+  linux-e2e:
+    name: Linux, XFS and ext4, end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install xfsprogs
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+      - run: bash tests/linux.sh
