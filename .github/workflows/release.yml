@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # A dispatch on a tag publishes it to crates.io alone, as once a private repository has been made public.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,6 +16,7 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.name }})
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -72,10 +75,16 @@ jobs:
   publish:
     name: crates.io
     needs: build
+    # A private repository is not published, because its crate would link to a page that nobody can open.
+    if: ${{ !cancelled() && !failure() && !github.event.repository.private }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check that the tag matches the crate version
+        run: |
+          version=$(cargo pkgid -p trucker | sed 's/.*[#@]//')
+          test "v$version" = "$GITHUB_REF_NAME"
       - run: cargo publish --locked -p trucker
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
