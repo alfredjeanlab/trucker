@@ -53,3 +53,35 @@ fn matches_at(bytes: &[u8], mut at: usize, width: usize, root: &[Vec<u8>]) -> bo
     }
     true
 }
+
+// These tests run on every platform, unlike those in `tests.rs`.
+#[cfg(test)]
+mod tests {
+    use super::Scan;
+
+    #[test]
+    fn matches_a_root_in_any_case_separator_json_or_utf16() {
+        let scan = Scan::new(&[r"C:\Work\tree\target\"]);
+        for text in [
+            r"x C:\Work\tree\target\debug",
+            "x c:/work/TREE/target/debug",
+            r#"{"artifact":"C:\\Work\\tree\\target\\debug"}"#,
+            r"\\?\C:\Work\tree\target",
+            "/c/work/tree/target/out",
+            r"C:\Work/tree\\target",
+        ] {
+            assert!(scan.contains(text.as_bytes()), "{text}");
+        }
+        let wide =
+            Vec::from_iter("D:\\WORK\\Tree\\Target".encode_utf16().flat_map(u16::to_le_bytes));
+        assert!(scan.contains(&[b"\x01".as_slice(), &wide].concat()));
+        for text in [r"C:\Work\tree\targe", r"C:\Work\treetarget", r"C:\Work\other\target", ""] {
+            assert!(!scan.contains(text.as_bytes()), "{text}");
+        }
+    }
+
+    #[test]
+    fn matches_everything_for_a_root_without_components() {
+        assert!(Scan::new(&[r"C:\"]).contains(b"nothing"));
+    }
+}

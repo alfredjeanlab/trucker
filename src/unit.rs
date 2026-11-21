@@ -1083,7 +1083,10 @@ impl Unit {
     /// resolved against the working directory. Returns `None` where the crate read a path with a control character, or
     /// a file elsewhere outside CARGO_HOME and the hashed trees, because an entry cannot cover it.
     pub fn portable_dep_info(&self, dep_info: &str) -> Option<(String, String)> {
+        // A directory is spelled as each path of the dep-info is, through `lexical`, because cargo joins the directory
+        // of a unit with `/` on Windows.
         let directory = |path: &str| {
+            let path = lexical(Path::new(path)).to_string_lossy().into_owned();
             let path = path.trim_end_matches(MAIN_SEPARATOR);
             self.roots.normalized(&format!("{path}{MAIN_SEPARATOR}"))
         };

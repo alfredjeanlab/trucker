@@ -27,6 +27,9 @@ jobs:
           - name: Linux, Btrfs
             os: ubuntu-latest
             fs: btrfs
+          - name: Windows, NTFS
+            os: windows-latest
+            fs: ntfs
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -61,3 +64,13 @@ jobs:
       - name: Install xfsprogs
         run: sudo apt-get update && sudo apt-get install -y xfsprogs
       - run: bash tests/linux.sh
+
+  # Real cargo builds through trucker on NTFS, where an own crate runs as plain rustc would.
+  windows-e2e:
+    name: Windows, NTFS, end to end
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash tests/windows.sh
+        shell: bash

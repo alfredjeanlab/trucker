@@ -6,7 +6,7 @@ README.md says what trucker is, how it is used and configured, and where it runs
 
 The repository builds itself through `.cargo/rustc-wrapper`, which runs the installed trucker where there is one and
 rustc alone where there is not. A branch's own binary is tested by naming it in `RUSTC_WRAPPER`. `tests/linux.sh`
-runs the Linux path inside a VM on XFS and ext4.
+runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs real builds on a Windows runner of CI.
 
 ## Commits
 
@@ -96,6 +96,8 @@ change for Windows never changes the Unix build.
   - A root that Windows could spell another way, as through a `subst` or network drive, runs as
     `passthrough path-spelling`.
   - No hash is remembered, because a process can set back the change time of a file on Windows.
+  - The tests of `tests.rs` run only on Unix, because their stand-in rustc is a shell script. A test that runs on
+    Windows too sits in a module of its own, as those of `windows_scan.rs` do.
 
 ### Own crates
 
