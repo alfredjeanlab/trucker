@@ -309,10 +309,24 @@ fn cached(
     }
     let code = code.unwrap_or(1);
     if let Some(slot) = &slot {
-        localize_dep_info(&dep_info, slot);
+        if localize_dep_info(&dep_info, slot).is_err() {
+            // A dep-info that names the slot would make cargo check another worktree's files, so the crate compiles
+            // again in the worktree, which writes its own.
+            let code = compile(rustc, args, unit, None, cargo, &mut forwarded)?.code.unwrap_or(1);
+            return Ok(("passthrough dep-info".to_string(), code));
+        }
         if code == 0 {
             slot.time(ran);
-            let _ = slot.keep();
+            if let Err(error) = slot.keep()
+                && !matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData)
+            {
+                log(
+                    store,
+                    crate_name(args),
+                    compiling,
+                    &format!("note unkept-session {}", error.kind()),
+                );
+            }
         }
     }
     let stored = if code == 0 {
@@ -448,10 +462,24 @@ fn late_bake(unit: &Unit, name: &str, cargo: &mut dyn Write) -> (String, i32) {
 }
 
 /// Rewrites the `dep_info` that rustc wrote in `slot` to name the paths of the worktree.
-fn localize_dep_info(dep_info: &[PathBuf], slot: &session::Slot) {
+///
+/// Each file is written beside itself and renamed into place, so cargo never reads a part of one.
+fn localize_dep_info(dep_info: &[PathBuf], slot: &session::Slot) -> io::Result<()> {
     for path in dep_info {
-        let _ = fs::read_to_string(path).and_then(|text| fs::write(path, slot.localized(&text)));
+        let text = match fs::read_to_string(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            text => text?,
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let staging = path.with_file_name(format!(".{name}.{}", std::process::id()));
+        let written =
+            fs::write(&staging, slot.localized(&text)).and_then(|()| fs::rename(&staging, path));
+        if written.is_err() {
+            let _ = fs::remove_file(&staging);
+            return written;
+        }
     }
+    Ok(())
 }
 
 /// Says `message` on stderr once per build and `kind` of notice.

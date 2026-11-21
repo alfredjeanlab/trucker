@@ -3,7 +3,7 @@
 //! Outputs are cloned in and out without copying data, or linked in and copied out where the filesystem cannot clone.
 //! An entry is written in a directory of its own and renamed into place, so a reader finds it whole or missing.
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::ffi::c_int;
 use std::io::Write;
 #[cfg(unix)]
@@ -72,18 +72,13 @@ pub fn clone(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub fn clone(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::ffi::c_ulong;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    unsafe extern "C" {
-        fn ioctl(descriptor: c_int, request: c_ulong, ...) -> c_int;
-    }
-    const FICLONE: c_ulong = 0x4004_9409;
     let source = fs::File::open(source)?;
     let mode = source.metadata()?.permissions().mode();
     let clone = fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(destination)?;
     // SAFETY: both descriptors are open files, and FICLONE takes the source's descriptor as its argument.
-    if unsafe { ioctl(clone.as_raw_fd(), FICLONE, source.as_raw_fd()) } != 0 {
+    if unsafe { libc::ioctl(clone.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } != 0 {
         let error = io::Error::last_os_error();
         let _ = fs::remove_file(destination);
         return Err(error);

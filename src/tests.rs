@@ -2406,6 +2406,14 @@ fn carried_compile_runs_in_a_slot_and_names_only_the_worktree_to_cargo_and_the_s
     assert!(!args.contains(&root), "{args}");
     let dep_info = fs::read_to_string(out.join("foo-abc.d")).unwrap();
     assert!(dep_info.contains(&format!(" {root}/src/lib.rs\n")) && !dep_info.contains(&slot));
+    // A dep-info that cannot be rewritten in place compiles the crate again in the worktree, which writes its own.
+    let staging = out.join(format!(".foo-abc.d.{}", std::process::id()));
+    fs::create_dir_all(&staging).unwrap();
+    let (outcome, _) = carried_build(&fixture, "a", "pub fn a() { let _ = 1; }", &[]);
+    fs::remove_dir(&staging).unwrap();
+    assert_eq!(outcome, Ok(("passthrough dep-info".to_string(), 0)));
+    let dep_info = fs::read_to_string(out.join("foo-abc.d")).unwrap();
+    assert!(dep_info.contains(&format!(" {root}/src/lib.rs\n")) && !dep_info.contains(&slot));
     let (promoted, z) = carried_build(&fixture, "z", "pub fn a() {}", &[]);
     assert_eq!(promoted, Ok(("hit promoted".to_string(), 0)));
     let artifact = format!("{{\"artifact\":\"{}/libfoo-abc.rmeta\"}}", unit::lexical(&z).display());

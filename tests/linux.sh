@@ -33,7 +33,8 @@ workspace() {
     printf '#[derive(serde::Serialize)]\nstruct Pid(i32);\n' > "$1/src/main.rs"
     printf 'fn main() -> anyhow::Result<()> {\n    let _ = Pid(e2e::pid());\n    Ok(())\n}\n' >> "$1/src/main.rs"
 }
-build() { (cd "$1" && XDG_CACHE_HOME=$2 RUSTC_WRAPPER=$wrapper cargo build 2>&1); }
+# A build is incremental, as on a developer's machine, even where CI turns CARGO_INCREMENTAL off.
+build() { (cd "$1" && XDG_CACHE_HOME=$2 RUSTC_WRAPPER=$wrapper CARGO_INCREMENTAL=1 cargo build 2>&1); }
 # A compile that a build script starts as a probe, such as anyhow's, is logged as `-` and runs only where the script
 # runs, so it is left out of the counts.
 outcomes() { awk '$2 != "-"' "$1/trucker/log" | cut -d' ' -f4- | grep -c "^$2" || true; }

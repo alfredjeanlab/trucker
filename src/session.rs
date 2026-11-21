@@ -205,8 +205,8 @@ impl Slot {
     /// The slot holds a real directory for each directory on that path, a symlink to every other entry beside them, and
     /// [`LIBRARIES`] at its root. rustc runs in a real directory, so it does not resolve the path, and the path does
     /// not differ between worktrees. An entry that already is the directory or symlink that it must be stays, so a slot
-    /// that mirrors the worktree is only read. An entry that cannot be linked is left out, and the caller checks the
-    /// paths of the crate for that.
+    /// that mirrors the worktree is only read. An entry that cannot be linked fails the mirror, so the crate compiles
+    /// without a slot.
     fn mirror(&self) -> io::Result<()> {
         let (mut real, mut copy) = (PathBuf::from(&self.worktree), PathBuf::from(&self.path));
         let mut down = self.relative.iter();
@@ -238,7 +238,7 @@ impl Slot {
                 if directory { fs::remove_dir_all(&path) } else { fs::remove_file(&path) }?;
             }
             for (name, target) in wanted {
-                let _ = std::os::unix::fs::symlink(target, copy.join(name));
+                std::os::unix::fs::symlink(target, copy.join(name))?;
             }
             let Some(next) = next else { return Ok(()) };
             (real, copy, kept) = (real.join(next), copy.join(next), None);
