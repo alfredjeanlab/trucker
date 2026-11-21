@@ -35,7 +35,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -51,7 +51,7 @@ jobs:
         run: |
           tar czf trucker-${{ matrix.name }}.tar.gz -C target/${{ matrix.target }}/release trucker
           shasum -a 256 trucker-${{ matrix.name }}.tar.gz > trucker-${{ matrix.name }}.tar.gz.sha256
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: trucker-${{ matrix.name }}
           path: trucker-${{ matrix.name }}.tar.gz*
@@ -61,7 +61,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -79,7 +79,7 @@ jobs:
     if: ${{ !cancelled() && !failure() && !github.event.repository.private }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Check that the tag matches the crate version
         run: |
