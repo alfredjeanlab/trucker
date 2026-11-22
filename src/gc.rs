@@ -214,9 +214,15 @@ use crate::windows::space;
 /// Starts `wrapper gc` detached, where the last run that a miss started in `store` is older than [`INTERVAL`] or
 /// the store gained more since it than the room that the last run recorded, or [`ADDED_LIMIT`] without one.
 ///
-/// A run that left the store short of its target holds off the next until an item turns [`RECENT`] old, because until
-/// then none is due. Returns whether it started one.
+/// A run that left the store short of its target holds off the next until enough items turn [`RECENT`] old to bring it
+/// back, because until then none is due. Returns whether it started one.
 pub fn trigger(store: &Path, wrapper: &Path) -> bool {
+    // Misses that end at once would each read the stamp before any touched it, so one decides at a time, and the others
+    // leave it to that one.
+    let Ok(deciding) = fs::File::create(store.join("gc.trigger")) else { return false };
+    if deciding.try_lock().is_err() {
+        return false;
+    }
     let (stamp, added) = (store.join("gc.stamp"), store.join("gc.added"));
     let lines = fs::read_to_string(&added).unwrap_or_default();
     let gained = lines.lines().filter_map(|line| line.parse::<u64>().ok()).sum::<u64>();
@@ -236,6 +242,8 @@ pub fn trigger(store: &Path, wrapper: &Path) -> bool {
     // The stamp keeps the room of the last run, so a miss during this run does not start another.
     let file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(&stamp);
     let touched = file.and_then(|file| file.set_modified(SystemTime::now()));
+    // The run must not inherit the lock, or a miss would find it held until the run had started.
+    drop(deciding);
     let mut command = Command::new(wrapper);
     command.arg("gc").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     touched.is_ok() && detached(&mut command).spawn().is_ok()
@@ -430,7 +438,7 @@ pub fn collect(
     // A run that must evict evicts a further [`MARGIN_PERCENT`] of the cap, so that the next run is that far away.
     let margin = if size > cap || free < floor { cap / 100 * MARGIN_PERCENT } else { 0 };
     let short = |size: u64, free: u64| size > cap - margin || free < floor.saturating_add(margin);
-    let (mut sizes, mut oldest) = (format!("{MEMOS}\t{}\t{}\n", memos.0, memos.1), None);
+    let (mut sizes, mut kept) = (format!("{MEMOS}\t{}\t{}\n", memos.0, memos.1), Vec::new());
     for item in items {
         let due = all || item.time <= recent && (item.time <= cut || short(collected.size, free));
         if let Some(unlinked) = due.then(|| evict(&item)).flatten() {
@@ -442,7 +450,7 @@ pub fn collect(
             }
             continue;
         }
-        oldest = oldest.or(Some(item.time));
+        kept.push((item.time, item.bytes));
         if let Some(stamp) = &item.stamp {
             let relative = item.path.strip_prefix(store).unwrap_or(&item.path).to_string_lossy();
             let _ = writeln!(sizes, "{relative}\t{stamp}\t{}", item.bytes);
@@ -451,9 +459,18 @@ pub fn collect(
     for pool in &pools {
         let _ = fs::remove_dir(pool);
     }
-    // An item becomes due only once it is an hour old, so a run before then would remove nothing more.
+    // An item becomes due only once it is an hour old, so the next run waits until enough of the kept items are due to
+    // bring the store back within its target, or all of them where they are not enough.
     if short(collected.size, free) {
-        collected.next = oldest.map_or(now + INTERVAL, |time| time + RECENT + 1);
+        let excess = collected.size.saturating_sub(cap - margin);
+        let excess = excess.max(floor.saturating_add(margin).saturating_sub(free));
+        let mut covered = 0;
+        let enough = kept.iter().find(|(_, bytes)| {
+            covered += bytes;
+            covered >= excess
+        });
+        let last = enough.or(kept.last());
+        collected.next = last.map_or(now + INTERVAL, |(time, _)| time + RECENT + 1);
     }
     let staging = store.join(format!("{SIZES}.new"));
     let _ =

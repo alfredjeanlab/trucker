@@ -1417,16 +1417,30 @@ fn size_variable_replaces_the_cap_unless_it_is_not_a_size() {
     }
 }
 
+/// Whether [`gc::trigger`] starts a run in `store` within 10 s.
+///
+/// A child that another test forks shares the lock of the trigger until it runs exec, so a trigger may find it held.
+fn triggered(store: &Path) -> bool {
+    let waited = Instant::now();
+    while waited.elapsed() < Duration::from_secs(10) {
+        if gc::trigger(store, Path::new("/usr/bin/true")) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
 #[test]
 fn trigger_starts_gc_within_the_hour_once_the_store_gains_more_than_a_gib() {
     let fixture = fixture("gc-added", "");
     let store = fixture.root.join("store");
-    assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
+    assert!(triggered(&store));
     gc::add_bytes(&store, 700 << 20);
     gc::add_bytes(&store, 324 << 20);
     assert!(!gc::trigger(&store, Path::new("/usr/bin/true")), "exactly a GiB");
     gc::add_bytes(&store, 1);
-    assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
+    assert!(triggered(&store));
     assert!(!store.join("gc.added").exists());
     assert!(!gc::trigger(&store, Path::new("/usr/bin/true")), "the count starts again");
 
@@ -1441,10 +1455,17 @@ fn trigger_starts_gc_within_the_hour_once_the_store_gains_more_than_a_gib() {
 fn trigger_starts_at_most_one_gc_an_hour_and_a_second_gc_waits_for_the_first() {
     let fixture = fixture("gc-trigger", "");
     let store = fixture.root.join("store");
-    assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
+    assert!(triggered(&store));
     assert!(!gc::trigger(&store, Path::new("/usr/bin/true")));
     age(&store.join("gc.stamp"), 7200);
-    assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
+    assert!(triggered(&store));
+    // A miss that ends while another decides leaves gc to that one.
+    age(&store.join("gc.stamp"), 7200);
+    let deciding = fs::File::create(store.join("gc.trigger")).unwrap();
+    deciding.try_lock().unwrap();
+    assert!(!gc::trigger(&store, Path::new("/usr/bin/true")));
+    drop(deciding);
+    assert!(triggered(&store));
 
     let lock = fs::File::create(store.join("gc.lock")).unwrap();
     lock.try_lock().unwrap();
@@ -1468,6 +1489,32 @@ fn stored(store: &Path, path: &str, bytes: usize, seconds: u64) -> PathBuf {
         .unwrap();
     age(&path, seconds);
     path
+}
+
+#[test]
+fn gc_short_of_its_target_waits_until_enough_kept_items_turn_an_hour_old_to_reach_it() {
+    let fixture = fixture("gc-next", "");
+    let store = fixture.root.join("store");
+    let entry = |name: &str, seconds| {
+        let entry = store.join("entries").join(name);
+        fs::create_dir_all(&entry).and_then(|()| fs::write(entry.join("lib"), [0; 1000])).unwrap();
+        age(&entry, seconds);
+        let used = fs::metadata(&entry).unwrap().modified().unwrap();
+        used.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+    };
+    let older = entry("older", 1800);
+    let newer = entry("newer", 600);
+    let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
+    // A cap whose target, a tenth below it, needs both entries gone.
+    let cap = (0..size).find(|cap| (1001..=2000).contains(&(size - (cap - cap / 10)))).unwrap();
+    let collected = gc::collect(&store, 0, cap, false, || (100_000, 100_000));
+    assert_eq!(collected.entries, 0, "both were used in the last hour");
+    assert_ne!(older, newer);
+    assert_eq!(
+        collected.next,
+        newer + 3601,
+        "one entry is not enough, so the run waits for the second"
+    );
 }
 
 #[test]
@@ -1620,7 +1667,7 @@ fn gc_that_must_evict_evicts_a_tenth_of_the_cap_more_and_leaves_that_room_to_the
     gc::add_bytes(&store, 5000);
     assert!(!gc::trigger(&store, Path::new("/usr/bin/true")), "the room that the last run left");
     gc::add_bytes(&store, 1);
-    assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
+    assert!(triggered(&store));
 }
 
 #[test]
@@ -1631,7 +1678,7 @@ fn trigger_waits_until_an_item_can_be_due_after_a_run_that_left_the_store_over_i
     gc::add_bytes(&store, 2 << 30);
     assert!(!gc::trigger(&store, Path::new("/usr/bin/true")));
     fs::write(store.join("gc.stamp"), (crate::now() - 1).to_string()).unwrap();
-    assert!(gc::trigger(&store, Path::new("/usr/bin/true")));
+    assert!(triggered(&store));
 }
 
 #[test]
