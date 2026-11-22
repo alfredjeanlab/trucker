@@ -3549,3 +3549,26 @@ fn gc_removes_a_candidate_whose_outputs_changed_or_that_is_three_days_old() {
     gc::collect(&store, cut, u64::MAX, false, || (100, 100));
     assert!(candidates(&fixture).is_empty());
 }
+
+#[test]
+fn store_is_marked_once_as_a_cache_that_backups_skip() {
+    let fixture = fixture("mark", "");
+    let store = fixture.root.join("store");
+    fs::create_dir_all(&store).unwrap();
+    store::mark(&store);
+    let tag = fs::read_to_string(store.join("CACHEDIR.TAG")).unwrap();
+    assert!(tag.starts_with("Signature: 8a477f597d28d172789f06886806bc55\n"), "{tag}");
+    #[cfg(target_os = "macos")]
+    {
+        let excluded = Command::new("tmutil").arg("isexcluded").arg(&store).output().unwrap();
+        let excluded = String::from_utf8_lossy(&excluded.stdout);
+        assert!(excluded.contains("[Excluded]"), "{excluded}");
+    }
+    fs::write(store.join("CACHEDIR.TAG"), "kept").unwrap();
+    store::mark(&store);
+    assert_eq!(
+        fs::read_to_string(store.join("CACHEDIR.TAG")).unwrap(),
+        "kept",
+        "a marked store is left alone"
+    );
+}

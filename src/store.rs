@@ -86,6 +86,43 @@ pub fn clone(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Marks `store` once as a cache that backups skip, since every entry in it can be compiled again.
+///
+/// `CACHEDIR.TAG` is the mark that restic, borg and GNU tar read, and on macOS Time Machine reads the attribute that
+/// `tmutil addexclusion` sets. The tag is written last, so a store that has it has the attribute too.
+pub fn mark(store: &Path) {
+    let tag = store.join("CACHEDIR.TAG");
+    if tag.exists() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    exclude_from_backups(store);
+    let text = "Signature: 8a477f597d28d172789f06886806bc55\n# The store of trucker, a build cache. See https://bford.info/cachedir/\n";
+    let _ = fs::write(tag, text);
+}
+
+/// Sets on `path` the attribute that `tmutil addexclusion` sets, which needs no privileges.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn exclude_from_backups(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    const NAME: &[u8] = b"com.apple.metadata:com_apple_backup_excludeItem\0";
+    // The binary property list of the string `com.apple.backupd`.
+    const VALUE: &[u8] = b"bplist00_\x10\x11com.apple.backupd\x08\0\0\0\0\0\0\x01\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x1c";
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return };
+    // SAFETY: the path and the name are NUL-terminated, and the value is `VALUE.len()` bytes long.
+    unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            NAME.as_ptr().cast(),
+            VALUE.as_ptr().cast(),
+            VALUE.len(),
+            0,
+            0,
+        );
+    }
+}
+
 /// How files enter and leave the store.
 ///
 /// They are cloned where the filesystem clones, and otherwise hard-linked in and copied out, as on ext4. A probe

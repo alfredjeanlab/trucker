@@ -123,6 +123,7 @@ fn now() -> u64 {
 fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
     let started = Instant::now();
     let _ = fs::create_dir_all(store.join("entries"));
+    store::mark(store);
     let untouched = || replace(Command::new(rustc).args(args), rustc.as_ref());
     if unit::is_query(args) {
         return untouched();
