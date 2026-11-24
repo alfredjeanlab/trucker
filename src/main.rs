@@ -51,7 +51,11 @@ fn main() {
             print!("{}", stats(&rest, &store_directory()).unwrap_or_else(|| usage()))
         }
         (Some("gc"), Some(rest)) if rest.is_empty() || rest == ["--all"] => {
-            print!("{}", gc::run(&store_directory(), !rest.is_empty()))
+            print!("{}", gc::run(&store_directory(), !rest.is_empty(), true))
+        }
+        // The run that a miss starts, which leaves the store to a run already going.
+        (Some("gc"), Some(rest)) if rest == ["--if-idle"] => {
+            print!("{}", gc::run(&store_directory(), false, false))
         }
         (Some(word), _) if !is_program(word) => usage(),
         (Some(rustc), Some(rest)) => {

@@ -1452,7 +1452,7 @@ fn trigger_starts_gc_within_the_hour_once_the_store_gains_more_than_a_gib() {
 }
 
 #[test]
-fn trigger_starts_at_most_one_gc_an_hour_and_a_second_gc_waits_for_the_first() {
+fn trigger_starts_at_most_one_gc_an_hour_and_none_while_one_runs() {
     let fixture = fixture("gc-trigger", "");
     let store = fixture.root.join("store");
     assert!(triggered(&store));
@@ -1475,7 +1475,16 @@ fn trigger_starts_at_most_one_gc_an_hour_and_a_second_gc_waits_for_the_first() {
             thread::sleep(Duration::from_millis(300));
             drop(lock);
         });
-        gc::run(&store, false)
+        assert!(
+            !gc::trigger(&store, Path::new("/usr/bin/true")),
+            "a miss during a run starts no other"
+        );
+        assert_eq!(
+            gc::run(&store, false, false),
+            "",
+            "a run that a miss started leaves it to the first"
+        );
+        gc::run(&store, false, true)
     });
     assert!(started.elapsed() >= Duration::from_millis(300), "a second gc waits for the first");
     assert!(report.starts_with("removed 0 entries and 0 slots"), "{report}");

@@ -22,7 +22,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use std::{env, fs};
+use std::{env, fs, io};
 
 use crate::unit::file_hash;
 
@@ -105,10 +105,14 @@ pub struct Collected {
 ///
 /// Where `all`, it removes every entry and slot that no compile holds, and every memo and marker, whatever their age
 /// and the cap. It still leaves the staging of a running build alone, and the lock files and the log follow their age.
-pub fn run(store: &Path, all: bool) -> String {
+pub fn run(store: &Path, all: bool, wait: bool) -> String {
     let lock = fs::create_dir_all(store).and_then(|()| fs::File::create(store.join("gc.lock")));
     let taken = lock.and_then(|lock| match lock.try_lock() {
         Ok(()) => Ok(lock),
+        // A run that a miss started leaves the store to the run already going, which would remove what it would.
+        Err(fs::TryLockError::WouldBlock) if !wait => {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
         Err(fs::TryLockError::WouldBlock) => {
             eprintln!("trucker gc waits for another run of gc to end");
             let waited = Instant::now();
@@ -118,8 +122,10 @@ pub fn run(store: &Path, all: bool) -> String {
         }
         Err(fs::TryLockError::Error(error)) => Err(error),
     });
-    let Ok(_lock) = taken else {
-        return format!("trucker gc cannot take its lock in {}\n", store.display());
+    let _lock = match taken {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return String::new(),
+        Err(_) => return format!("trucker gc cannot take its lock in {}\n", store.display()),
     };
     let started = Instant::now();
     let (cap, _) = store_cap(store);
@@ -233,6 +239,12 @@ pub fn trigger(store: &Path, wrapper: &Path) -> bool {
     if next.is_some_and(|next| crate::now() < next) {
         return false;
     }
+    // A store over its cap leaves no room, so the check of the room below would let every miss during a run start
+    // another, and each would queue behind it to remove nothing.
+    let running = fs::File::create(store.join("gc.lock")).map(|lock| lock.try_lock().is_err());
+    if running.unwrap_or(true) {
+        return false;
+    }
     if gained <= room.unwrap_or(ADDED_LIMIT)
         && modified(&stamp).is_some_and(|time| time > crate::now().saturating_sub(INTERVAL))
     {
@@ -245,7 +257,11 @@ pub fn trigger(store: &Path, wrapper: &Path) -> bool {
     // The run must not inherit the lock, or a miss would find it held until the run had started.
     drop(deciding);
     let mut command = Command::new(wrapper);
-    command.arg("gc").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .args(["gc", "--if-idle"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     touched.is_ok() && detached(&mut command).spawn().is_ok()
 }
 
