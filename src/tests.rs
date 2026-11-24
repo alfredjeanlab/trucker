@@ -1351,8 +1351,7 @@ fn gc_removes_the_fixed_out_dirs_and_markers_that_no_script_used_for_three_days(
 }
 
 #[test]
-fn gc_removes_the_least_recently_used_over_the_cap_or_the_free_space_but_none_used_in_the_last_hour()
- {
+fn gc_removes_the_least_recently_used_over_the_cap_or_the_free_space_however_recently_used() {
     let fixture = fixture("gc-cap", "");
     let store = fixture.root.join("store");
     let entry = |name: &str, seconds| {
@@ -1371,18 +1370,26 @@ fn gc_removes_the_least_recently_used_over_the_cap_or_the_free_space_but_none_us
     );
     assert!(!store.join("entries/oldest").exists() && store.join("entries/older").exists());
     let collected = gc::collect(&store, 0, 0, false, || (10_000, 10_000));
-    assert_eq!((collected.entries, collected.size), (1, size - 2000));
+    assert_eq!((collected.entries, collected.size), (2, size - 3000));
+    assert!(!store.join("entries/recent").exists(), "an entry used half an hour ago");
 
     entry("unused", 2 * 3600);
-    let collected = gc::collect(&store, 0, u64::MAX, false, || (100, 9));
-    assert_eq!(collected.entries, 1, "the free space is below a tenth of the filesystem");
-    assert!(store.join("entries/recent").exists());
+    entry("recent", 1800);
+    let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
+    // The free space is below a tenth of the filesystem until the first removal.
+    let calls = std::cell::Cell::new(0);
+    let space = || {
+        calls.set(calls.get() + 1);
+        (100_000, if calls.get() == 1 { 9_000 } else { 20_000 })
+    };
+    assert_eq!(gc::collect(&store, 0, size + 1, false, space).entries, 1);
+    assert!(!store.join("entries/unused").exists() && store.join("entries/recent").exists());
 
     // A cap that the variable sets keeps the floor of free space.
     entry("overridden", 2 * 3600);
     let (cap, _) = gc::cap(100, Some("1T"));
-    assert_eq!(gc::collect(&store, 0, cap, false, || (100, 9)).entries, 1);
-    assert!(!store.join("entries/overridden").exists() && store.join("entries/recent").exists());
+    assert_eq!(gc::collect(&store, 0, cap, false, || (100, 9)).entries, 2);
+    assert!(!store.join("entries/overridden").exists());
     entry("kept", 2 * 3600);
     assert_eq!(gc::collect(&store, 0, cap, false, || (100, 10)).entries, 0, "a tenth is free");
     assert!(store.join("entries/kept").exists());
@@ -1501,29 +1508,55 @@ fn stored(store: &Path, path: &str, bytes: usize, seconds: u64) -> PathBuf {
 }
 
 #[test]
-fn gc_short_of_its_target_waits_until_enough_kept_items_turn_an_hour_old_to_reach_it() {
-    let fixture = fixture("gc-next", "");
-    let store = fixture.root.join("store");
+fn gc_over_its_cap_removes_recent_entries_and_idle_slots_least_recently_used_first_but_no_held_slot()
+ {
+    let fixture = fixture("gc-recent", "");
+    let (store, pool) = (fixture.root.join("store"), fixture.root.join("store/slots/foo"));
     let entry = |name: &str, seconds| {
-        let entry = store.join("entries").join(name);
-        fs::create_dir_all(&entry).and_then(|()| fs::write(entry.join("lib"), [0; 1000])).unwrap();
-        age(&entry, seconds);
-        let used = fs::metadata(&entry).unwrap().modified().unwrap();
-        used.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+        stored(&store, &format!("entries/{name}/lib"), 1000, 0);
+        age(&store.join("entries").join(name), seconds);
     };
-    let older = entry("older", 1800);
-    let newer = entry("newer", 600);
+    entry("first", 50 * 60);
+    entry("third", 20 * 60);
+    for (number, minutes) in [("0", 40), ("1", 10), ("2", 5)] {
+        stored(&store, &format!("slots/foo/{number}.slot/lib"), 1000, 0);
+        stored(&store, &format!("slots/foo/{number}.lock"), 0, minutes * 60);
+    }
+    let held = fs::File::open(pool.join("1.lock")).unwrap();
+    held.try_lock().unwrap();
+
     let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
-    // A cap whose target, a tenth below it, needs both entries gone.
+    // A cap whose target, a tenth below it, needs two items gone.
     let cap = (0..size).find(|cap| (1001..=2000).contains(&(size - (cap - cap / 10)))).unwrap();
     let collected = gc::collect(&store, 0, cap, false, || (100_000, 100_000));
-    assert_eq!(collected.entries, 0, "both were used in the last hour");
-    assert_ne!(older, newer);
-    assert_eq!(
-        collected.next,
-        newer + 3601,
-        "one entry is not enough, so the run waits for the second"
+    let expected = gc::Collected { entries: 1, slots: 1, freed: 2000, size: size - 2000, next: 0 };
+    assert_eq!(collected, expected, "the entry used 50 minutes ago, then the slot used 40");
+    assert!(!store.join("entries/first").exists() && !pool.join("0.slot").exists());
+    assert!(store.join("entries/third").exists());
+
+    let collected = gc::collect(&store, 0, 0, false, || (100_000, 100_000));
+    assert_eq!((collected.entries, collected.slots, collected.freed), (1, 1, 2000));
+    assert_eq!(collected.size, size - 4000, "the held slot still counts");
+    assert!(pool.join("1.slot").exists() && pool.join("1.lock").exists(), "a held slot stays");
+    assert!(!store.join("entries/third").exists() && !pool.join("2.slot").exists());
+    assert!(collected.next >= crate::now() + 3599, "the held slot keeps the store over its cap");
+}
+
+#[test]
+fn gc_removes_staging_left_by_a_killed_process_only_once_it_is_an_hour_old() {
+    let fixture = fixture("gc-staging", "");
+    let store = fixture.root.join("store");
+    for (name, seconds) in [("young", 50 * 60), ("old", 3601)] {
+        for path in [format!("entries/{name}.123"), format!("slots/foo/0.{name}.123")] {
+            stored(&store, &format!("{path}/lib"), 1000, 0);
+            age(&store.join(&path), seconds);
+        }
+    }
+    gc::collect(&store, crate::now() - 3 * 86400, 0, false, || (100_000, 100_000));
+    assert!(
+        store.join("entries/young.123").exists() && store.join("slots/foo/0.young.123").exists()
     );
+    assert!(!store.join("entries/old.123").exists() && !store.join("slots/foo/0.old.123").exists());
 }
 
 #[test]
@@ -1557,16 +1590,14 @@ fn gc_counts_slots_under_the_cap_and_removes_the_least_recently_used_of_entries_
         assert!(!pool.join(part).exists(), "{part}");
     }
     let collected = gc::collect(&store, 0, 0, false, || (10_000, 10_000));
-    assert_eq!((collected.slots, collected.freed), (1, 1000), "a held slot stays");
-    assert_eq!(collected.size, size - 5000 - 1500, "a linked library counted half");
+    assert_eq!((collected.slots, collected.freed), (2, 2000), "a held slot stays");
+    assert_eq!(collected.size, size - 5000 - 1500 - 1000, "a linked library counted half");
     assert!(pool.join("2.slot").exists() && !pool.join("1.slot").exists() && library.exists());
+    assert!(!pool.join("3.slot").exists(), "a slot used in the last minute goes too");
     drop(held);
     let collected = gc::collect(&store, 0, 0, false, || (10_000, 10_000));
     assert_eq!(collected.slots, 1);
-    assert!(pool.join("3.slot").exists(), "a slot used in the last hour stays");
-    let used = fs::metadata(pool.join("3.lock")).unwrap().modified().unwrap();
-    let used = used.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-    assert_eq!(collected.next, used + 3601, "the oldest slot that stays turns an hour old");
+    assert!(!pool.join("2.slot").exists());
 }
 
 #[test]
@@ -1680,7 +1711,7 @@ fn gc_that_must_evict_evicts_a_tenth_of_the_cap_more_and_leaves_that_room_to_the
 }
 
 #[test]
-fn trigger_waits_until_an_item_can_be_due_after_a_run_that_left_the_store_over_its_bounds() {
+fn trigger_waits_for_the_next_run_after_one_that_left_the_store_over_its_bounds() {
     let fixture = fixture("gc-futile", "");
     let store = fixture.root.join("store");
     fs::write(store.join("gc.stamp"), (crate::now() + 100).to_string()).unwrap();
@@ -3097,10 +3128,10 @@ fn gc_removes_the_slots_that_no_compile_used_for_three_days_with_their_snapshots
     }
     age(&pool.join("2.lock"), 4 * 86400);
     let cut = crate::now() - 3 * 86400;
-    let size = gc::collect(&store, 0, u64::MAX, false, || (100, 100)).size;
+    let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
     assert!(!pool.join("0.session.1").exists(), "a snapshot left in staging is removed");
     assert!(pool.join("1.session.1").exists(), "a leftover of the last hour stays");
-    let collected = gc::collect(&store, cut, size - 1, false, || (100, 100));
+    let collected = gc::collect(&store, cut, size - 1, false, || (100_000, 100_000));
     assert_eq!((collected.entries, collected.freed), (1, 1000));
     assert!(!store.join("entries/old").exists());
     assert!(pool.join("0.source").exists(), "a record stays with its slot");

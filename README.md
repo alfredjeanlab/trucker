@@ -46,6 +46,8 @@ trucker stats                   # cache hits, misses and build timers
 Trucker automatically decides whether to run `trucker gc` after a miss so it rarely needs to be run by hand.
 Trucker will use up to 10% of the filesystem, between 16 GiB and 100 GiB,
 and always leaves behind at least 10% free space on the disk.
+To stay within those bounds, gc removes the least recently used entries, however recently used,
+and keeps only what a running compile holds.
 
 Use `TRUCKER_CACHE_SIZE` to adjust the cache size, in bytes or with a suffix K, M, G or T (e.g. `=200G`).
 

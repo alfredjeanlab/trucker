@@ -81,8 +81,9 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
   - `session.rs` carries the incremental sessions of own crates between worktrees through slots.
   - `script.rs` is the stand-in that cargo runs in place of a third-party build script, which replays a stored run.
   - `gc.rs` removes what no build has used for three days, then the least recently used entries and slots while the
-    store is over its cap. Nothing used in the last hour goes, and a run reads remembered sizes rather than walking
-    the store. `trucker gc --all` keeps staging younger than an hour, the lock files and the log.
+    store is over its cap, however recently used. Only a slot that a compile holds stays, and a run reads
+    remembered sizes rather than walking the store. Staging counts as abandoned once it is an hour old, so
+    `trucker gc --all` keeps younger staging, the lock files and the log.
   - `duplicates.rs` is the report of `trucker stats --duplicates`.
   - `windows.rs` holds the Windows twins of the Unix system calls, and `windows_scan.rs` the scan for baked paths on
     Windows, which the tests run everywhere.

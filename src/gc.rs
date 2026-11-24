@@ -54,11 +54,12 @@ pub const SIZE_VARIABLE: &str = "TRUCKER_CACHE_SIZE";
 /// The share in percent of its filesystem that is kept free, because builds and the system start to fail below it.
 const FREE_PERCENT: u64 = 10;
 
-/// The age in seconds below which nothing is removed, even over the cap or on a full disk.
+/// The age in seconds at which a staging directory or another leftover counts as left by a killed process.
 ///
-/// A running build thus keeps what it uses. It is also the age at which a staging directory counts as left by a killed
-/// process.
-const RECENT: u64 = 3600;
+/// No compile holds a slot that long, so gc measures an older slot without its lock. Eviction does not wait for an
+/// age, because gc takes the lock of a slot before it removes it, and a hit on an entry that gc removes compiles as on
+/// a miss.
+const ABANDONED_AGE: u64 = 3600;
 
 /// The share in percent of the cap that a run evicts beyond the cap or the floor of free space, once it must evict.
 ///
@@ -96,7 +97,9 @@ pub struct Collected {
     pub slots: usize,
     pub freed: u64,
     pub size: u64,
-    /// The time before which another run would remove nothing, where the store stays over its bounds, or 0.
+    /// The time before which a miss starts no other run, where the store stays over its bounds, or 0.
+    ///
+    /// Only what a run may not remove keeps the store over its bounds, as a slot that a compile holds does.
     pub next: u64,
 }
 
@@ -144,7 +147,7 @@ pub fn run(store: &Path, all: bool, wait: bool) -> String {
         started.elapsed().as_secs_f64(),
         megabytes(size),
         megabytes(cap),
-        if next > 0 { ", where the rest was used in the last hour" } else { "" }
+        if next > 0 { ", and the rest cannot be removed yet" } else { "" }
     )
 }
 
@@ -220,8 +223,8 @@ use crate::windows::space;
 /// Starts `wrapper gc` detached, where the last run that a miss started in `store` is older than [`INTERVAL`] or
 /// the store gained more since it than the room that the last run recorded, or [`ADDED_LIMIT`] without one.
 ///
-/// A run that left the store short of its target holds off the next until enough items turn [`RECENT`] old to bring it
-/// back, because until then none is due. Returns whether it started one.
+/// A run that left the store short of its target holds off the next for [`INTERVAL`], because only what it may not
+/// remove, such as a slot that a compile holds, kept the store over its bounds. Returns whether it started one.
 pub fn trigger(store: &Path, wrapper: &Path) -> bool {
     // Misses that end at once would each read the stamp before any touched it, so one decides at a time, and the others
     // leave it to that one.
@@ -292,9 +295,8 @@ struct Item {
 /// Removes what `store` has not used since `cut`, then the least recently used entries and slots while it is over `cap`.
 ///
 /// `space` gives the total size and the free space of the filesystem, and gc also removes the least recently used while
-/// less than [`FREE_PERCENT`] is free. An entry or slot used in the last [`RECENT`] seconds stays. The cleanups of what
+/// less than [`FREE_PERCENT`] is free. A slot whose lock a compile holds stays, however old. The cleanups of what
 /// entries leave follow the same `cut`.
-/// Removes what [`run`] describes, where an item last used before `cut` is unused.
 pub fn collect(
     store: &Path,
     cut: u64,
@@ -304,7 +306,7 @@ pub fn collect(
 ) -> Collected {
     let older = |path: &Path, cut: u64| modified(path).is_some_and(|time| time <= cut);
     let now = crate::now();
-    let recent = now.saturating_sub(RECENT);
+    let abandoned = now.saturating_sub(ABANDONED_AGE);
     // The cut of what only saves time, such as a memo, a record of reads, a candidate or a marker.
     let unused = if all { now } else { cut };
     let mut phase = Phase(Instant::now());
@@ -335,11 +337,11 @@ pub fn collect(
             // Only gc dooms an entry, and this run holds the lock of gc, so the run that doomed it was killed.
             remove(&path);
         } else if name.ends_with(".cand") {
-            memos.1 += swept.map_or_else(|| candidates(&path, unused, recent), |_| 0);
+            memos.1 += swept.map_or_else(|| candidates(&path, unused, abandoned), |_| 0);
         } else if swept.is_none() || !name.ends_with(".reads") {
             let reads = name.ends_with(".reads");
             match fs::symlink_metadata(&path) {
-                Ok(file) if seconds(file.modified()) <= if reads { unused } else { recent } => {
+                Ok(file) if seconds(file.modified()) <= if reads { unused } else { abandoned } => {
                     remove(&path)
                 }
                 Ok(file) if reads => memos.1 += file.len(),
@@ -355,7 +357,7 @@ pub fn collect(
     for path in children(&store.join("stand-in")) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let stale = if name.contains('.') {
-            changed(&path).is_some_and(|time| time <= recent)
+            changed(&path).is_some_and(|time| time <= abandoned)
         } else {
             current.as_ref().is_ok_and(|current| name != current.to_hex().as_str())
         };
@@ -398,7 +400,7 @@ pub fn collect(
                 }
                 // Only gc dooms the parts of a slot, under the lock of gc.
                 Some((_, DOOMED)) => remove(&path),
-                _ if older(&path, recent) => remove(&path),
+                _ if older(&path, abandoned) => remove(&path),
                 _ => rest += size(&path, false).0,
             }
         }
@@ -409,14 +411,17 @@ pub fn collect(
             let part = |kind: &str| pool.join(format!("{number}.{kind}"));
             let measure = || SLOT.iter().map(|kind| size(&part(kind), true).0).sum::<u64>();
             // A slot changes only under its lock, and a compile that takes the lock sets its mtime, so a size measured
-            // under the lock holds until the mtime changes. No compile holds a slot unused for an hour, and a lock
-            // without parts, as `wait.lock` is, guards nothing that gc measures.
+            // under the lock holds until the mtime changes. A size measured while a compile holds the lock may be stale,
+            // so it counts toward this run but is not remembered, and [`evict`] takes the lock again anyway. A lock
+            // without parts, as `wait.lock` is, guards nothing that gc measures, and a slot without a lock has no stamp.
             let (bytes, stamp) = match measured(&path, &stamp) {
                 Some(bytes) => (bytes, stamp),
-                None if time > recent && newest > 0 => match unlocked(&part("lock")) {
-                    Some(_lock) => (measure(), stamp),
-                    None => (measure(), None),
-                },
+                None if time > abandoned && stamp.is_some() && newest > 0 => {
+                    match unlocked(&part("lock")) {
+                        Some(_lock) => (measure(), stamp),
+                        None => (measure(), None),
+                    }
+                }
                 None => (measure(), stamp),
             };
             items.push(Item { time, path, bytes, stamp, slot: Some((pool.clone(), number)) });
@@ -454,9 +459,10 @@ pub fn collect(
     // A run that must evict evicts a further [`MARGIN_PERCENT`] of the cap, so that the next run is that far away.
     let margin = if size > cap || free < floor { cap / 100 * MARGIN_PERCENT } else { 0 };
     let short = |size: u64, free: u64| size > cap - margin || free < floor.saturating_add(margin);
-    let (mut sizes, mut kept) = (format!("{MEMOS}\t{}\t{}\n", memos.0, memos.1), Vec::new());
+    let mut sizes = format!("{MEMOS}\t{}\t{}\n", memos.0, memos.1);
     for item in items {
-        let due = all || item.time <= recent && (item.time <= cut || short(collected.size, free));
+        // An item that a compile holds stays, because [`evict`] does not take a lock that another process holds.
+        let due = all || item.time <= cut || short(collected.size, free);
         if let Some(unlinked) = due.then(|| evict(&item)).flatten() {
             *if item.slot.is_some() { &mut collected.slots } else { &mut collected.entries } += 1;
             collected.freed += unlinked;
@@ -466,7 +472,6 @@ pub fn collect(
             }
             continue;
         }
-        kept.push((item.time, item.bytes));
         if let Some(stamp) = &item.stamp {
             let relative = item.path.strip_prefix(store).unwrap_or(&item.path).to_string_lossy();
             let _ = writeln!(sizes, "{relative}\t{stamp}\t{}", item.bytes);
@@ -475,18 +480,9 @@ pub fn collect(
     for pool in &pools {
         let _ = fs::remove_dir(pool);
     }
-    // An item becomes due only once it is an hour old, so the next run waits until enough of the kept items are due to
-    // bring the store back within its target, or all of them where they are not enough.
+    // Only what this run may not remove keeps the store short, so a run that starts at once would remove little more.
     if short(collected.size, free) {
-        let excess = collected.size.saturating_sub(cap - margin);
-        let excess = excess.max(floor.saturating_add(margin).saturating_sub(free));
-        let mut covered = 0;
-        let enough = kept.iter().find(|(_, bytes)| {
-            covered += bytes;
-            covered >= excess
-        });
-        let last = enough.or(kept.last());
-        collected.next = last.map_or(now + INTERVAL, |(time, _)| time + RECENT + 1);
+        collected.next = now + INTERVAL;
     }
     let staging = store.join(format!("{SIZES}.new"));
     let _ =
@@ -496,11 +492,11 @@ pub fn collect(
 }
 
 /// Removes the candidates in `path` that are old or unable to make their entries, and returns the bytes of the rest.
-fn candidates(path: &Path, cut: u64, recent: u64) -> u64 {
+fn candidates(path: &Path, cut: u64, abandoned: u64) -> u64 {
     let mut bytes = 0;
     for file in children(path) {
         let temporary = file.extension().is_some();
-        if modified(&file).is_some_and(|time| time <= if temporary { recent } else { cut })
+        if modified(&file).is_some_and(|time| time <= if temporary { abandoned } else { cut })
             || (!temporary && !crate::lazy::is_alive(&file))
         {
             remove(&file);
