@@ -8,7 +8,7 @@ use std::{env, fs, thread};
 use crate::script::{self, Run, replay_or_run};
 use crate::store::Files;
 use crate::unit::{self, CARGO_HOME, Roots, TARGET, Unit, WORKTREE};
-use crate::{cached, gc, is_program, lazy, session, stats, store};
+use crate::{cached, gc, is_program, lazy, note, session, stats, store};
 
 /// A directory of one test, with a stand-in rustc and a CARGO_HOME, on the filesystem of the temporary directory.
 struct Fixture {
@@ -1391,7 +1391,12 @@ fn gc_removes_the_least_recently_used_over_the_cap_or_the_free_space_however_rec
     assert_eq!(gc::collect(&store, 0, cap, false, || (100, 9)).entries, 2);
     assert!(!store.join("entries/overridden").exists());
     entry("kept", 2 * 3600);
-    assert_eq!(gc::collect(&store, 0, cap, false, || (100, 10)).entries, 0, "a tenth is free");
+    let space = || (100, 20);
+    assert_eq!(
+        gc::collect(&store, 0, cap, false, space).entries,
+        0,
+        "a tenth and the margin are free"
+    );
     assert!(store.join("entries/kept").exists());
 }
 
@@ -1600,6 +1605,94 @@ fn gc_counts_slots_under_the_cap_and_removes_the_least_recently_used_of_entries_
     assert!(!pool.join("2.slot").exists());
 }
 
+// A clone on APFS is a file of its own, so the slots that clone one library counted it once each.
+#[test]
+#[cfg(target_os = "macos")]
+fn gc_counts_the_blocks_that_slots_share_as_clones_once_and_equal_bytes_elsewhere_twice() {
+    let fixture = fixture("gc-clones", "");
+    let store = fixture.root.join("store");
+    let library = stored(&fixture.root, "worktree/liba.rlib", 8192, 0);
+    let mut manifests = BTreeMap::new();
+    for (pool, hours) in [("foo", 3), ("bar", 2), ("baz", 1)] {
+        let copy = store.join(format!("slots/{pool}/0.slot/.trucker-libraries/liba.rlib"));
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        match pool {
+            "baz" => fs::write(&copy, vec![0; 8192]).unwrap(),
+            _ => store::clone(&library, &copy).unwrap(),
+        }
+        let (library, copy) = (unit::identity(&library).unwrap(), unit::identity(&copy).unwrap());
+        let extent = session::extent(
+            &store.join(format!("slots/{pool}/0.slot/.trucker-libraries/liba.rlib")),
+        );
+        let line = format!("liba.rlib\t{library}\t{copy}\t{}\n", extent.unwrap());
+        fs::write(store.join(format!("slots/{pool}/0.libraries")), &line).unwrap();
+        manifests.insert(pool, line.len() as u64);
+        stored(&store, &format!("slots/{pool}/0.lock"), 0, hours * 3600);
+    }
+    let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
+    assert_eq!(
+        size,
+        2 * 8192 + manifests.values().sum::<u64>(),
+        "the clones once and the copy apart"
+    );
+    let held = ["bar", "baz"]
+        .map(|pool| fs::File::open(store.join(format!("slots/{pool}/0.lock"))).unwrap());
+    held.iter().for_each(|lock| lock.try_lock().unwrap());
+    let collected = gc::collect(&store, 0, 0, false, || (100_000, 100_000));
+    assert_eq!(collected.slots, 1);
+    assert_eq!(collected.size, size - manifests["foo"], "another slot still holds the clone");
+}
+
+#[test]
+fn gc_removes_an_entry_that_no_build_hit_for_an_hour_before_what_builds_used_earlier() {
+    let fixture = fixture("gc-unhit", "");
+    let store = fixture.root.join("store");
+    // A stored entry that no build hit has an mtime within a second of its birth, as one aged here does.
+    stored(&store, "entries/unhit/lib", 1000, 0);
+    age(&store.join("entries/unhit"), 2 * 3600);
+    stored(&store, "slots/foo/0.slot/lib", 1000, 0);
+    stored(&store, "slots/foo/0.lock", 0, 3 * 3600);
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::FileTimesExt;
+        stored(&store, "entries/hit/lib", 1000, 0);
+        let born =
+            fs::FileTimes::new().set_created(SystemTime::now() - Duration::from_secs(5 * 3600));
+        let used = born.set_modified(SystemTime::now() - Duration::from_secs(4 * 3600));
+        fs::File::open(store.join("entries/hit")).unwrap().set_times(used).unwrap();
+    }
+    let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
+    let cap = (0..size).find(|cap| (1..=1000).contains(&(size - (cap - cap / 10)))).unwrap();
+    let collected = gc::collect(&store, 0, cap, false, || (100_000, 100_000));
+    assert_eq!((collected.entries, collected.slots), (1, 0));
+    assert!(!store.join("entries/unhit").exists() && store.join("slots/foo/0.slot").exists());
+    #[cfg(target_os = "macos")]
+    assert!(store.join("entries/hit").exists(), "an entry hit four hours ago");
+}
+
+#[test]
+fn gc_does_not_prefer_an_entry_that_no_build_hit_but_that_is_younger_than_an_hour() {
+    let fixture = fixture("gc-young", "");
+    let store = fixture.root.join("store");
+    stored(&store, "entries/young/lib", 1000, 0);
+    age(&store.join("entries/young"), 10 * 60);
+    stored(&store, "slots/foo/0.slot/lib", 1000, 0);
+    stored(&store, "slots/foo/0.lock", 0, 30 * 60);
+    let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
+    let cap = (0..size).find(|cap| (1..=1000).contains(&(size - (cap - cap / 10)))).unwrap();
+    let collected = gc::collect(&store, 0, cap, false, || (100_000, 100_000));
+    assert_eq!((collected.entries, collected.slots), (0, 1), "the slot used 30 minutes ago");
+    assert!(store.join("entries/young").exists());
+}
+
+#[test]
+fn gc_orders_by_last_use_alone_where_the_filesystem_reports_no_birth_time() {
+    let used = SystemTime::now() - Duration::from_secs(2 * 3600);
+    assert!(gc::spent(Ok(used), Ok(used), crate::now()));
+    let unknown = std::io::Error::from(std::io::ErrorKind::Unsupported);
+    assert!(!gc::spent(Err(unknown), Ok(used), crate::now()));
+}
+
 #[test]
 fn gc_of_all_removes_what_was_used_just_now_but_keeps_held_slots_staging_and_locks() {
     let fixture = fixture("gc-all", "");
@@ -1706,6 +1799,33 @@ fn gc_that_must_evict_evicts_a_tenth_of_the_cap_more_and_leaves_that_room_to_the
     fs::write(store.join("gc.stamp"), "0 5000").unwrap();
     gc::add_bytes(&store, 5000);
     assert!(!gc::trigger(&store, Path::new("/usr/bin/true")), "the room that the last run left");
+    gc::add_bytes(&store, 1);
+    assert!(triggered(&store));
+}
+
+// A store just below its cap once made each run remove nothing and leave the trigger a room of a few entries.
+#[test]
+fn gc_of_a_store_within_a_tenth_of_its_cap_evicts_down_to_that_tenth_below_it() {
+    let fixture = fixture("gc-gap", "");
+    let store = fixture.root.join("store");
+    for number in 0..20 {
+        stored(&store, &format!("entries/{number}/lib"), 1000, 0);
+        age(&store.join(format!("entries/{number}")), 7200 - number);
+    }
+    let space = || (1 << 40, 1 << 40);
+    let size = gc::collect(&store, 0, u64::MAX, false, space).size;
+    assert_eq!(gc::collect(&store, 0, size * 2, false, space).entries, 0, "far below the cap");
+    let cap = size + 1;
+    let margin = cap / 100 * 10;
+    let collected = gc::collect(&store, 0, cap, false, space);
+    assert!(collected.entries > 0 && collected.next == 0);
+    let room = cap - collected.size;
+    assert!((margin..margin + 1000).contains(&room), "a room of {room} for a margin of {margin}");
+    assert_eq!(gc::collect(&store, 0, cap, false, space).entries, 0, "a run inside the room");
+
+    fs::write(store.join("gc.stamp"), format!("0 {room}")).unwrap();
+    gc::add_bytes(&store, room);
+    assert!(!gc::trigger(&store, Path::new("/usr/bin/true")), "the room that the run left");
     gc::add_bytes(&store, 1);
     assert!(triggered(&store));
 }
@@ -2049,7 +2169,7 @@ fn own_crate_compiled_for_coverage_runs_as_plain_rustc_unless_a_later_flag_turns
     fs::write(store.join("gc.stamp"), "").unwrap();
     args.push("-Cinstrument-coverage=off".to_string());
     assert_eq!(wrap(&args), 0);
-    assert!(fs::read_to_string(store.join("log")).unwrap().ends_with(" miss\n"));
+    assert!(fs::read_to_string(store.join("log")).unwrap().contains(" miss\n"));
     assert!(fs::read_to_string(out.join("args")).unwrap().contains("--remap-path-prefix"));
 }
 
@@ -2574,6 +2694,9 @@ fn carried_compile_runs_in_a_slot_and_names_only_the_worktree_to_cargo_and_the_s
             settled,
             "a clone of the same contents stays"
         );
+        let manifest = fs::read_to_string(linking.replace(".slot", ".libraries")).unwrap();
+        let extent = session::extent(Path::new(&rmeta)).map(|offset| offset.to_string());
+        assert!(manifest.ends_with(&format!("\t{}\n", extent.unwrap_or_default())), "{manifest}");
         let library = format!("{libraries}/libdep-def.rmeta");
         fs::remove_file(&library).and_then(|()| fs::write(&library, "rmeta")).unwrap();
         retaken();
@@ -3611,4 +3734,29 @@ fn store_is_marked_once_as_a_cache_that_backups_skip() {
         "kept",
         "a marked store is left alone"
     );
+}
+
+// cargo names the source of a package outside the workspace root by its absolute path, as the fixture does.
+#[test]
+fn miss_of_an_own_crate_outside_the_workspace_root_is_noted() {
+    let fixture = own("outside");
+    let (root, target) = (fixture.root.join("a"), fixture.worktree("a", "metadata"));
+    fs::create_dir_all(root.join(".git"))
+        .and_then(|()| fs::create_dir_all(root.join("src")))
+        .unwrap();
+    write_source(&root.join("src/lib.rs"), "pub fn a() {}");
+    let mut args = fixture.args(&target);
+    args[2] = root.join("src/lib.rs").display().to_string();
+    let store = fixture.root.join("store");
+    // A recent stamp keeps the miss from starting gc, which would run the test binary.
+    fs::write(store.join("gc.stamp"), "").unwrap();
+    assert_eq!(crate::wrap(&fixture.rustc, &args, &store, fixture.cargo_home.clone()), 0);
+    let log = fs::read_to_string(store.join("log")).unwrap();
+    let outcomes = Vec::from_iter(log.lines().map(|line| line.splitn(4, ' ').nth(3).unwrap()));
+    assert_eq!(outcomes, ["miss", "note outside-workspace"]);
+
+    let note = |source, own, outcome| note(Some(source), own, outcome);
+    assert_eq!(note("a/src/lib.rs", true, "miss"), None);
+    assert_eq!(note("/repo/other/b/src/lib.rs", true, "hit"), None);
+    assert_eq!(note("/home/cargo/registry/src/index/b-1.0.0/src/lib.rs", false, "miss"), None);
 }

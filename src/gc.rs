@@ -1,15 +1,14 @@
-//! The removal of the entries and slots that no build has used for a while, least recently used first, and of what they
+//! The removal of the entries and slots that no build has used for a while, in the order of [`Item`], and of what they
 //! leave.
 //!
-//! A hit sets the mtime of the entry and of the `.reads` file of the key to the time of use, and a compile that takes a
-//! slot sets the mtime of its lock, so an mtime is the last use. Before an entry or a part of a slot is deleted, it is
-//! renamed to a name that readers do not look up, and a build that reads it at that moment falls back as on a miss.
-//! Removal never follows a symlink.
+//! A hit sets the mtime of the entry and of the `.reads` file of the key, and a compile that takes a slot sets the mtime
+//! of its lock, so an mtime is the last use. An entry or a part of a slot is renamed out of reach before it is deleted,
+//! so a build that reads it then falls back as on a miss. Removal never follows a symlink.
 //!
 //! The cap bounds the length of the files of the store. A file of an entry counts whole even where a worktree links it
 //! too, because the removal of that worktree leaves the file to the store. A file of a slot counts its length divided
-//! among its links, so a library that many slots link counts once. The space reported as freed counts only files with
-//! one link, and on disk it can be less, because clones share blocks.
+//! among its links, and a block that several slot libraries share as [`clones`] counts once. The space reported as
+//! freed counts only files with one link, and on disk it can be less, because clones share blocks.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -61,9 +60,15 @@ const FREE_PERCENT: u64 = 10;
 /// a miss.
 const ABANDONED_AGE: u64 = 3600;
 
-/// The share in percent of the cap that a run evicts beyond the cap or the floor of free space, once it must evict.
+/// The age in seconds under which an entry that no build has hit is not removed before what builds used.
 ///
-/// The next run that a miss starts is then that far away, rather than at the next entry stored.
+/// Another worktree at the same commit may be about to hit it.
+const UNHIT_AGE: u64 = 3600;
+
+/// The share in percent of the cap that a run keeps clear below the cap and above the floor of free space.
+///
+/// A run that finds the store within that gap evicts down to its far side, so the next run that a miss starts is about
+/// that far away, rather than at the next entry stored. The gap is a share of the filesystem where that is smaller.
 const MARGIN_PERCENT: u64 = 10;
 
 /// The interval in seconds between the runs of gc that misses start, so that a build pays for at most one stat.
@@ -280,7 +285,10 @@ fn detached(command: &mut Command) -> &mut Command {
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
 }
 
-/// An entry or a slot, which gc removes as a whole, least recently used first.
+/// An entry or a slot, which gc removes as a whole, the [`spent`] entries first and then least recently used first.
+///
+/// A slot is never spent, because its session serves the next sources of its crate, while an entry serves only its
+/// exact inputs. So an hour without a hit says little about a slot and much about an entry.
 struct Item {
     /// The last use in seconds since 1970.
     time: u64,
@@ -290,12 +298,16 @@ struct Item {
     stamp: Option<String>,
     /// The pool and number of a slot, which is `None` for an entry.
     slot: Option<(PathBuf, String)>,
+    /// The libraries that the slot holds as [`clones`], which `bytes` leaves out.
+    clones: Vec<(String, u64)>,
+    spent: bool,
 }
 
-/// Removes what `store` has not used since `cut`, then the least recently used entries and slots while it is over `cap`.
+/// Removes what `store` has not used since `cut`, then the entries and slots in the order of [`Item`] while it is near
+/// `cap`.
 ///
-/// `space` gives the total size and the free space of the filesystem, and gc also removes the least recently used while
-/// less than [`FREE_PERCENT`] is free. A slot whose lock a compile holds stays, however old. The cleanups of what
+/// Near means within [`MARGIN_PERCENT`] of the cap. `space` gives the total size and the free space of the filesystem,
+/// and gc also removes the least recently used while less than [`FREE_PERCENT`] and that margin are free. A slot whose lock a compile holds stays, however old. The cleanups of what
 /// entries leave follow the same `cut`.
 pub fn collect(
     store: &Path,
@@ -331,8 +343,10 @@ pub fn collect(
             let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
             let stamp = Some(stamp(&path, &metadata));
             let bytes = measured(&path, &stamp).unwrap_or_else(|| size(&path, false).0);
-            let time = seconds(metadata.modified());
-            items.push(Item { time, path: path.clone(), bytes, stamp, slot: None });
+            let (time, spent) =
+                (seconds(metadata.modified()), spent(metadata.created(), metadata.modified(), now));
+            let path = path.clone();
+            items.push(Item { time, path, bytes, stamp, slot: None, clones: Vec::new(), spent });
         } else if path.extension() == Some(DOOMED.as_ref()) {
             // Only gc dooms an entry, and this run holds the lock of gc, so the run that doomed it was killed.
             remove(&path);
@@ -406,10 +420,16 @@ pub fn collect(
         }
         for (number, (lock, newest)) in slots {
             let time = lock.as_ref().map_or(newest, |lock| seconds(lock.modified()));
-            let stamp = lock.map(|lock| nanos(lock.modified()).to_string());
             let path = pool.join(&number);
             let part = |kind: &str| pool.join(format!("{number}.{kind}"));
-            let measure = || SLOT.iter().map(|kind| size(&part(kind), true).0).sum::<u64>();
+            // The size leaves out the clones that the manifest of the libraries lists, so it holds while both stay.
+            let listed =
+                nanos(fs::symlink_metadata(part("libraries")).and_then(|file| file.modified()));
+            let stamp = lock.map(|lock| format!("{}.{listed}", nanos(lock.modified())));
+            let clones = clones(&part("libraries"));
+            let own =
+                |bytes: u64| bytes.saturating_sub(clones.iter().map(|(_, length)| length).sum());
+            let measure = || own(SLOT.iter().map(|kind| size(&part(kind), true).0).sum::<u64>());
             // A slot changes only under its lock, and a compile that takes the lock sets its mtime, so a size measured
             // under the lock holds until the mtime changes. A size measured while a compile holds the lock may be stale,
             // so it counts toward this run but is not remembered, and [`evict`] takes the lock again anyway. A lock
@@ -424,7 +444,8 @@ pub fn collect(
                 }
                 None => (measure(), stamp),
             };
-            items.push(Item { time, path, bytes, stamp, slot: Some((pool.clone(), number)) });
+            let slot = Some((pool.clone(), number));
+            items.push(Item { time, path, bytes, stamp, slot, clones, spent: false });
         }
     }
     phase.end("listed the slots");
@@ -451,13 +472,19 @@ pub fn collect(
     let files = children(store).into_iter().filter(|path| !path.ends_with(SIZES));
     let files = files.filter_map(|path| fs::symlink_metadata(path).ok());
     rest += files.filter(fs::Metadata::is_file).map(|file| file.len()).sum::<u64>();
-    items.sort_by_key(|item| item.time);
-    let size = rest + memos.1 + items.iter().map(|item| item.bytes).sum::<u64>();
+    items.sort_by_key(|item| (!item.spent, item.time));
+    // The slots that hold each block as a clone, and its length, which counts until the last of them goes.
+    let mut holders = HashMap::<String, (usize, u64)>::new();
+    for (extent, length) in items.iter().flat_map(|item| &item.clones) {
+        holders.entry(extent.clone()).or_insert((0, *length)).0 += 1;
+    }
+    let shared = holders.values().map(|(_, length)| length).sum::<u64>();
+    let size = rest + memos.1 + shared + items.iter().map(|item| item.bytes).sum::<u64>();
     let mut collected = Collected { entries: 0, slots: 0, freed: 0, size, next: 0 };
     let (total, mut free) = space();
     let floor = total / 100 * FREE_PERCENT;
-    // A run that must evict evicts a further [`MARGIN_PERCENT`] of the cap, so that the next run is that far away.
-    let margin = if size > cap || free < floor { cap / 100 * MARGIN_PERCENT } else { 0 };
+    // A store over its cap and one just below it would otherwise both leave the next run a room of a few entries.
+    let margin = cap.min(total) / 100 * MARGIN_PERCENT;
     let short = |size: u64, free: u64| size > cap - margin || free < floor.saturating_add(margin);
     let mut sizes = format!("{MEMOS}\t{}\t{}\n", memos.0, memos.1);
     for item in items {
@@ -467,7 +494,15 @@ pub fn collect(
             *if item.slot.is_some() { &mut collected.slots } else { &mut collected.entries } += 1;
             collected.freed += unlinked;
             collected.size = collected.size.saturating_sub(item.bytes);
-            if margin > 0 {
+            for (extent, _) in &item.clones {
+                if let Some((slots, length)) = holders.get_mut(extent) {
+                    *slots -= 1;
+                    if *slots == 0 {
+                        collected.size = collected.size.saturating_sub(*length);
+                    }
+                }
+            }
+            if free < floor.saturating_add(margin) {
                 free = space().1;
             }
             continue;
@@ -489,6 +524,31 @@ pub fn collect(
         fs::write(&staging, sizes).and_then(|()| crate::store::rename(&staging, store.join(SIZES)));
     phase.end(&format!("removed {} entries and {} slots", collected.entries, collected.slots));
     collected
+}
+
+/// The clones that the libraries manifest at `path` lists with an extent, each by that extent and with its length.
+///
+/// Clones that start at one extent share their blocks, so the slots that hold them count their length once. A clone
+/// without an extent, or a manifest in another format, counts whole.
+fn clones(path: &Path) -> Vec<(String, u64)> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let line = |line: &str| {
+        let [_, _, clone, extent] = Vec::from_iter(line.split('\t'))[..] else { return None };
+        let length = clone.split(' ').nth(2)?.parse().ok()?;
+        (!extent.is_empty()).then(|| (format!("{extent} {length}"), length))
+    };
+    text.lines().filter_map(line).collect()
+}
+
+/// Whether no build has hit an entry of these birth and modification times since it was stored over [`UNHIT_AGE`]
+/// before `now`.
+///
+/// A hit sets the mtime, which staging leaves within a second of the birth time. Where the filesystem reports no birth
+/// time, no entry is spent, so the order is that of the last use alone.
+pub fn spent(birth: io::Result<SystemTime>, modified: io::Result<SystemTime>, now: u64) -> bool {
+    let (Ok(birth), Ok(modified)) = (birth, modified) else { return false };
+    let unhit = modified.duration_since(birth).map_or(true, |late| late.as_secs() < 1);
+    unhit && seconds(Ok(modified)) <= now.saturating_sub(UNHIT_AGE)
 }
 
 /// Removes the candidates in `path` that are old or unable to make their entries, and returns the bytes of the rest.

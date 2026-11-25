@@ -80,8 +80,10 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
   - `lazy.rs` records a rebuilt own crate as a candidate, which a later miss promotes into an entry.
   - `session.rs` carries the incremental sessions of own crates between worktrees through slots.
   - `script.rs` is the stand-in that cargo runs in place of a third-party build script, which replays a stored run.
-  - `gc.rs` removes what no build has used for three days, then the least recently used entries and slots while the
-    store is over its cap, however recently used. Only a slot that a compile holds stays, and a run reads
+  - `gc.rs` removes what no build has used for three days, then the entries and slots while the store is within a
+    tenth of its cap, however recently used. An entry that no build hit and that is over an hour old goes first, and
+    the rest go least recently used first. A hit sets the mtime, so an entry whose mtime is within a second of its
+    birth time was never hit. Only a slot that a compile holds stays, and a run reads
     remembered sizes rather than walking the store. Staging counts as abandoned once it is an hour old, so
     `trucker gc --all` keeps younger staging, the lock files and the log.
   - `duplicates.rs` is the report of `trucker stats --duplicates`.
@@ -116,6 +118,23 @@ directory.
     cargo-llvm-cov matches.
   - The first compile of a unit in a target directory is stored at once. A rebuild, as after an edit, is stored lazily
     through `lazy.rs`, which checks the hash and mode of each output before promoting it.
+
+### Path dependencies outside the workspace root
+
+cargo hashes the absolute path of a path package outside the workspace root into its `-C metadata` and
+`-C extra-filename`, and both pass into every dependent. Such crates are cached per worktree, because no rewrite shares
+them soundly.
+
+  - A `-C metadata` without the path changes the StableCrateId, so symbols, TypeIds and dependents differ from what
+    cargo's compile gives. A wrapper cannot prove such a value unique, because cargo hashes inputs that rustc never sees.
+  - An entry that is keyed without the path and restored under cargo's names carries the StableCrateId of another
+    worktree, which a fresh compile would not give.
+  - A member outside the root, `package.workspace` and `[patch]` keep the path. From cargo 1.101, `trim-paths` drops it
+    from `-C metadata` but not from `-C extra-filename`.
+
+Under `trim-paths`, a non-incremental rlib and rmeta then differ between worktrees only by the string of
+`-C extra-filename`, which a substitution of equal length could restore exactly. A linked output cannot be restored so,
+because a linker may hash its contents into a build id or `LC_UUID`.
 
 ### Build scripts that bake OUT_DIR
 
@@ -152,7 +171,8 @@ worktree's in the arguments and the environment.
     worktree and marked so that its crate is not carried again.
   - cargo receives no line of stderr twice, because it panics at a second artifact notification.
   - A carried compile that links reads its libraries in the slot. Linux hard-links them, so that worktrees share
-    their page cache, and macOS clones them.
+    their page cache, and macOS clones them. `<number>.libraries` lists the extent of each clone, so gc counts a block
+    that slots share once.
 
 A compile is not carried where cargo runs rustc from outside the worktree, where the target directory lies outside it,
 or under local ThinLTO, which rewrites the previous session in place.

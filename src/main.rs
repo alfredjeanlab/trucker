@@ -144,8 +144,8 @@ fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
             &format!("ignores {variable}, which is not a size such as 200G or 1.5T"),
         );
     }
-    let input = args.iter().find(|arg| arg.ends_with(".rs") && !arg.starts_with('-'));
-    let input = input.and_then(|input| Some(unit::lexical(&env::current_dir().ok()?.join(input))));
+    let source = args.iter().find(|arg| arg.ends_with(".rs") && !arg.starts_with('-'));
+    let input = source.and_then(|input| Some(unit::lexical(&env::current_dir().ok()?.join(input))));
     let local = input.filter(|input| !unit::is_third_party(input, &cargo_home));
     // An own crate on Windows runs as plain rustc would, without a remap, a slot or a candidate.
     #[cfg(windows)]
@@ -175,6 +175,9 @@ fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
         (format!("passthrough {reason}"), code)
     });
     log(store, crate_name(args), started, &outcome);
+    if let Some(note) = note(source.map(String::as_str), worktree.is_some(), &outcome) {
+        log(store, crate_name(args), started, note);
+    }
     if outcome.starts_with("miss") {
         let _ = env::current_exe().map(|wrapper| gc::trigger(store, &wrapper));
     }
@@ -184,6 +187,16 @@ fn wrap(rustc: &str, args: &[String], store: &Path, cargo_home: String) -> i32 {
 fn crate_name(args: &[String]) -> &str {
     let name = args.iter().position(|arg| arg == "--crate-name").and_then(|at| args.get(at + 1));
     name.map_or("-", String::as_str)
+}
+
+/// The note that follows the outcome of an invocation in the log, which says why an own crate misses in each worktree.
+///
+/// cargo names the source of a package under the workspace root relative to that root. It names any other path
+/// package by its absolute path, which it also hashes into `-C metadata`, so that crate and its dependents get a key of
+/// their own in each worktree. The note follows only a miss, which is once per crate and build.
+fn note(source: Option<&str>, own: bool, outcome: &str) -> Option<&'static str> {
+    let absolute = source.is_some_and(|source| Path::new(source).is_absolute());
+    (own && absolute && outcome.starts_with("miss")).then_some("note outside-workspace")
 }
 
 /// Appends the outcome of one invocation named `name` to the log in `store`.
