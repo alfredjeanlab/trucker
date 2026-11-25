@@ -76,7 +76,9 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
     finds it whole or missing. A miss compiles under the lock of the entry that its inputs select, so a process with
     other sources never waits. A probe finds out once per store whether its filesystem clones, and a copy is renamed
     into place only once its blake3 hash matches. A store on another filesystem than the target directory leaves every
-    crate uncached and says so once per build.
+    crate uncached and says so once per build. Memos and locks lie in 256 shards named by the first two digits of their
+    hash, because a store holds millions of them, and some filesystems list or search a flat directory of that many
+    names slowly.
   - `lazy.rs` records a rebuilt own crate as a candidate, which a later miss promotes into an entry.
   - `session.rs` carries the incremental sessions of own crates between worktrees through slots.
   - `script.rs` is the stand-in that cargo runs in place of a third-party build script, which replays a stored run.
@@ -85,7 +87,9 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
     the rest go least recently used first. A hit sets the mtime, so an entry whose mtime is within a second of its
     birth time was never hit. Only a slot that a compile holds stays, and a run reads
     remembered sizes rather than walking the store. Staging counts as abandoned once it is an hour old, so
-    `trucker gc --all` keeps younger staging, the lock files and the log.
+    `trucker gc --all` keeps younger staging, the lock files and the log. It removes each directory of memos whole,
+    without reading the metadata of each memo. A memo or another small file beside the items counts the blocks that it
+    takes, which can be 128 times its length.
   - `duplicates.rs` is the report of `trucker stats --duplicates`.
   - `windows.rs` holds the Windows twins of the Unix system calls, and `windows_scan.rs` the scan for baked paths on
     Windows, which the tests run everywhere.

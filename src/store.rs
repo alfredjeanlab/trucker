@@ -415,6 +415,15 @@ pub fn reads_of(entries: &Path, key: &str) -> std::path::PathBuf {
     entries.join(format!("{key}.reads"))
 }
 
+/// The path of `name` in `directory`, inside the shard that its first two characters name.
+///
+/// A store holds millions of memos and locks, which some filesystems list or search slowly in one directory. Their
+/// names are hashes, which spread evenly over the 256 shards of two hexadecimal digits.
+pub fn shard(directory: &Path, name: &str) -> PathBuf {
+    let split = name.char_indices().nth(2).map_or(name.len(), |(at, _)| at);
+    directory.join(&name[..split]).join(&name[split..])
+}
+
 /// An exclusive lock on `inputs`, a key or the name of an entry, that a process in `store` takes so that others wait
 /// while it compiles them.
 ///
@@ -422,8 +431,9 @@ pub fn reads_of(entries: &Path, key: &str) -> std::path::PathBuf {
 /// After a minute the wait is said once on stderr. It is `None` where the lock file cannot be opened, or after
 /// [`PATIENCE`].
 pub fn lock(store: &Path, inputs: &str, name: &str) -> Option<fs::File> {
-    fs::create_dir_all(store.join("locks")).ok()?;
-    let file = fs::File::create(store.join("locks").join(inputs)).ok()?;
+    let path = shard(&store.join("locks"), inputs);
+    fs::create_dir_all(path.parent()?).ok()?;
+    let file = fs::File::create(path).ok()?;
     let (started, mut said) = (Instant::now(), false);
     loop {
         match file.try_lock() {

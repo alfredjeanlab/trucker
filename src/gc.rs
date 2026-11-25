@@ -5,10 +5,11 @@
 //! of its lock, so an mtime is the last use. An entry or a part of a slot is renamed out of reach before it is deleted,
 //! so a build that reads it then falls back as on a miss. Removal never follows a symlink.
 //!
-//! The cap bounds the length of the files of the store. A file of an entry counts whole even where a worktree links it
-//! too, because the removal of that worktree leaves the file to the store. A file of a slot counts its length divided
-//! among its links, and a block that several slot libraries share as [`clones`] counts once. The space reported as
-//! freed counts only files with one link, and on disk it can be less, because clones share blocks.
+//! The cap bounds the length of the files of the store. A file beside the entries and slots, such as a memo, counts
+//! its [`allocated`] blocks where they exceed its length. A file of an entry counts whole even where a worktree links
+//! it too, because the removal of that worktree leaves the file to the store. A file of a slot counts its length
+//! divided among its links, and a block that several slot libraries share as [`clones`] counts once. The space reported
+//! as freed counts only files with one link, and on disk it can be less, because clones share blocks.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -358,8 +359,8 @@ pub fn collect(
                 Ok(file) if seconds(file.modified()) <= if reads { unused } else { abandoned } => {
                     remove(&path)
                 }
-                Ok(file) if reads => memos.1 += file.len(),
-                Ok(file) => rest += file.len(),
+                Ok(file) if reads => memos.1 += allocated(&file),
+                Ok(file) => rest += allocated(&file),
                 Err(_) => {}
             }
         }
@@ -384,10 +385,10 @@ pub fn collect(
     let memos = match swept {
         Some(swept) => swept,
         None => {
-            memos.1 += sweep(store, unused);
-            for path in children(&store.join("locks")).iter().filter(|path| older(path, cut)) {
-                if let Some(_lock) = unlocked(path) {
-                    remove(path);
+            memos.1 += sweep(store, unused, all);
+            for path in files_in_shards(&store.join("locks")).filter(|path| older(path, cut)) {
+                if let Some(_lock) = unlocked(&path) {
+                    remove(&path);
                 }
             }
             trim(&store.join("log"), cut);
@@ -471,7 +472,7 @@ pub fn collect(
     // The file of the sizes does not count, so that a run sees the size that the last one left.
     let files = children(store).into_iter().filter(|path| !path.ends_with(SIZES));
     let files = files.filter_map(|path| fs::symlink_metadata(path).ok());
-    rest += files.filter(fs::Metadata::is_file).map(|file| file.len()).sum::<u64>();
+    rest += files.filter(fs::Metadata::is_file).map(|file| allocated(&file)).sum::<u64>();
     items.sort_by_key(|item| (!item.spent, item.time));
     // The slots that hold each block as a clone, and its length, which counts until the last of them goes.
     let mut holders = HashMap::<String, (usize, u64)>::new();
@@ -561,7 +562,7 @@ fn candidates(path: &Path, cut: u64, abandoned: u64) -> u64 {
         {
             remove(&file);
         } else {
-            bytes += size(&file, false).0;
+            bytes += fs::symlink_metadata(&file).map_or(0, |file| allocated(&file));
         }
     }
     let _ = fs::remove_dir(path);
@@ -620,18 +621,56 @@ fn evict(item: &Item) -> Option<u64> {
 }
 
 /// Removes the memos of `store` that no build has used since `cut`, and returns the bytes of those that stay.
-fn sweep(store: &Path, cut: u64) -> u64 {
-    let memos =
-        ["rustc", "cc", "hashes", "notices"].iter().flat_map(|name| children(&store.join(name)));
+///
+/// Where `all`, each directory of memos is renamed out of reach and removed whole, without reading the metadata of
+/// each memo. A directory that a killed run doomed is removed first, because only gc dooms one, under its lock.
+fn sweep(store: &Path, cut: u64, all: bool) -> u64 {
     let mut bytes = 0;
-    for path in memos {
-        match fs::symlink_metadata(&path) {
-            Ok(memo) if seconds(memo.modified()) <= cut => remove(&path),
-            Ok(memo) => bytes += memo.len(),
-            Err(_) => {}
+    for name in ["rustc", "cc", "hashes", "notices"] {
+        let (directory, doomed) = (store.join(name), store.join(format!("{name}.{DOOMED}")));
+        remove(&doomed);
+        if all {
+            if crate::store::rename(&directory, &doomed).is_ok() {
+                remove(&doomed);
+            }
+            continue;
+        }
+        for path in files_in_shards(&directory) {
+            match fs::symlink_metadata(&path) {
+                Ok(memo) if seconds(memo.modified()) <= cut => remove(&path),
+                Ok(memo) => bytes += allocated(&memo),
+                Err(_) => {}
+            }
         }
     }
     bytes
+}
+
+/// The files in the shards of `directory` that [`crate::store::shard`] names, and those beside the shards.
+///
+/// A file beside the shards is left by a store from before them, and nothing reads it, so it ages out. A shard is
+/// listed only once the files of the one before it are handled, which keeps a removal within one directory at a time.
+fn files_in_shards(directory: &Path) -> impl Iterator<Item = PathBuf> {
+    let entries = fs::read_dir(directory).into_iter().flatten().flatten();
+    entries.flat_map(|entry| match entry.file_type() {
+        Ok(kind) if kind.is_dir() => children(&entry.path()),
+        _ => vec![entry.path()],
+    })
+}
+
+/// The bytes that `file` takes on disk, which exceed its length where it is smaller than a block.
+///
+/// A memo of 32 bytes takes a block of 4 KiB on APFS, ext4 and XFS. A filesystem that keeps a small file in its
+/// metadata, as btrfs does, allocates no block to it, so the length is the least that a file counts.
+#[cfg(unix)]
+fn allocated(file: &fs::Metadata) -> u64 {
+    file.len().max(file.blocks() * 512)
+}
+
+/// The length of `file`, because NTFS keeps a small file within its record in the master file table.
+#[cfg(windows)]
+fn allocated(file: &fs::Metadata) -> u64 {
+    file.len()
 }
 
 /// The size of each item that [`SIZES`] remembers by its path in the store, with the stamp that it holds for.

@@ -546,17 +546,21 @@ pub fn remembered(
 
 /// The output remembered in `directory` under the hash of `identity`, where there is one.
 pub fn recalled(directory: &Path, identity: &str) -> Option<Vec<u8>> {
-    fs::read(directory.join(blake3::hash(identity.as_bytes()).to_hex().as_str())).ok()
+    fs::read(memo(directory, identity)).ok()
 }
 
 /// Remembers `output` in `directory` under the hash of `identity`.
 ///
 /// The memo is staged and renamed into place, so a reader finds it whole or missing.
 pub fn remember(directory: &Path, identity: &str, output: &[u8]) -> io::Result<()> {
-    let memo = directory.join(blake3::hash(identity.as_bytes()).to_hex().as_str());
+    let memo = memo(directory, identity);
     let staging = memo.with_extension(std::process::id().to_string());
-    fs::create_dir_all(directory)?;
+    fs::create_dir_all(memo.parent().unwrap_or(directory))?;
     fs::write(&staging, output).and_then(|()| crate::store::rename(&staging, &memo))
+}
+
+fn memo(directory: &Path, identity: &str) -> PathBuf {
+    crate::store::shard(directory, blake3::hash(identity.as_bytes()).to_hex().as_str())
 }
 
 /// The target directory that holds `out_dir` as the output directory of one unit in the layout of cargo.

@@ -1211,7 +1211,7 @@ fn lock_of_a_killed_process_does_not_delay_the_compile() {
     let key = fixture.key(&fixture.args(&target));
     let holder = store::lock(&store, &key, "foo").unwrap();
     let mut holder = Command::new("sleep").arg("60").stdin(holder).spawn().unwrap();
-    let file = fs::File::open(store.join("locks").join(&key)).unwrap();
+    let file = fs::File::open(store::shard(&store.join("locks"), &key)).unwrap();
     assert!(file.try_lock().is_err(), "the child process shares the lock");
     holder.kill().and_then(|()| holder.wait()).unwrap();
     let started = Instant::now();
@@ -1276,12 +1276,13 @@ fn gc_removes_what_no_build_used_for_three_days_and_keeps_a_hit_entry() {
     for (path, seconds) in ages.into_iter().chain([(&fresh, 60)]) {
         age(path, seconds);
     }
-    fs::create_dir_all(store.join("locks")).unwrap();
+    let lock = |name: &str| store::shard(&store.join("locks"), name);
     for name in ["old", "held", "fresh"] {
-        fs::write(store.join("locks").join(name), "").unwrap();
-        age(&store.join("locks").join(name), if name == "fresh" { 60 } else { 4 * 86400 });
+        stored(&store, lock(name).strip_prefix(&store).unwrap().to_str().unwrap(), 0, 0);
+        age(&lock(name), if name == "fresh" { 60 } else { 4 * 86400 });
     }
-    let held = fs::File::open(store.join("locks/held")).unwrap();
+    let flat = stored(&store, "locks/flat", 0, 4 * 86400);
+    let held = fs::File::open(lock("held")).unwrap();
     held.try_lock().unwrap();
     fs::write(fixture.root.join("build_script_build"), "real").unwrap();
     script::install(&fixture.root.join("build_script_build"), &store, Files::Clones).unwrap();
@@ -1297,8 +1298,9 @@ fn gc_removes_what_no_build_used_for_three_days_and_keeps_a_hit_entry() {
     assert_eq!(kept, [hit.file_name().unwrap(), "unused.456".as_ref(), "used.reads".as_ref()]);
     assert!(fixture.root.join("rustc").is_file(), "removal must not follow a symlink");
     assert_eq!(fs::read_dir(store.join("stand-in")).unwrap().count(), 1);
-    let locks = ["old", "held", "fresh"].map(|name| store.join("locks").join(name).exists());
+    let locks = ["old", "held", "fresh"].map(|name| lock(name).exists());
     assert_eq!(locks, [false, true, true], "a held lock stays");
+    assert!(!flat.exists(), "a lock from before the shards ages out");
     let report = stats(&[], &store).unwrap();
     let (counts, cap) = report.split_at(report.find("the store may take").unwrap());
     assert_eq!(counts, "      1       0.0 s  hit\n100.0% of the cached invocations hit\n");
@@ -1503,6 +1505,14 @@ fn trigger_starts_at_most_one_gc_an_hour_and_none_while_one_runs() {
 }
 
 /// Writes `bytes` zeros to `path` under `store`, in new directories where needed, and ages it by `seconds`.
+/// The memos in the shards of `directory`, each of which holds no other directory.
+fn memos_in(directory: &Path) -> Vec<PathBuf> {
+    let shards = fs::read_dir(directory).unwrap().map(|shard| shard.unwrap().path());
+    let shards = Vec::from_iter(shards.inspect(|shard| assert!(shard.is_dir(), "{shard:?}")));
+    let memos = shards.iter().flat_map(|shard| fs::read_dir(shard).unwrap());
+    Vec::from_iter(memos.map(|memo| memo.unwrap().path()))
+}
+
 fn stored(store: &Path, path: &str, bytes: usize, seconds: u64) -> PathBuf {
     let path = store.join(path);
     fs::create_dir_all(path.parent().unwrap())
@@ -1700,7 +1710,9 @@ fn gc_of_all_removes_what_was_used_just_now_but_keeps_held_slots_staging_and_loc
     stored(&store, "entries/recent/lib", 1000, 0);
     stored(&store, "entries/key.reads", 10, 0);
     stored(&store, "entries/staged.123/lib", 1000, 0);
-    stored(&store, "hashes/memo", 10, 0);
+    stored(&store, "hashes/ab/memo", 10, 0);
+    stored(&store, "hashes/flat", 10, 0);
+    stored(&store, "rustc.gc/ab/left", 10, 0);
     stored(&store, "out/key.never", 0, 0);
     stored(&store, "locks/inputs", 0, 0);
     for number in ["0", "1"] {
@@ -1712,9 +1724,8 @@ fn gc_of_all_removes_what_was_used_just_now_but_keeps_held_slots_staging_and_loc
 
     let collected = gc::collect(&store, 0, u64::MAX, true, || (10_000, 10_000));
     assert_eq!((collected.entries, collected.slots, collected.next), (1, 1, 0));
-    for gone in
-        ["entries/recent", "entries/key.reads", "hashes/memo", "out/key.never", "slots/foo/0.slot"]
-    {
+    let gone = ["entries/recent", "entries/key.reads", "hashes", "hashes.gc", "rustc.gc"];
+    for gone in gone.into_iter().chain(["out/key.never", "slots/foo/0.slot"]) {
         assert!(!store.join(gone).exists(), "{gone}");
     }
     for kept in ["entries/staged.123", "locks/inputs", "slots/foo/1.slot"] {
@@ -1758,11 +1769,13 @@ fn gc_sweeps_the_memos_once_a_day() {
     let fixture = fixture("gc-memos", "");
     let store = fixture.root.join("store");
     let cut = crate::now() - 3 * 86400;
-    let old = stored(&store, "hashes/old", 32, 4 * 86400);
-    let kept = stored(&store, "hashes/kept", 32, 86400);
+    let old = stored(&store, "hashes/ab/old", 32, 4 * 86400);
+    let kept = stored(&store, "hashes/ab/kept", 32, 86400);
+    let flat = stored(&store, "hashes/flat", 32, 4 * 86400);
     let size = gc::collect(&store, cut, u64::MAX, false, || (100, 100)).size;
     assert!(!old.exists() && kept.exists());
-    let old = stored(&store, "hashes/old", 32, 4 * 86400);
+    assert!(!flat.exists(), "a memo from before the shards ages out");
+    let old = stored(&store, "hashes/ab/old", 32, 4 * 86400);
     assert_eq!(gc::collect(&store, cut, u64::MAX, false, || (100, 100)).size, size);
     assert!(old.exists(), "a sweep waits for a day");
     let sizes = fs::read_to_string(store.join("gc.sizes")).unwrap();
@@ -1772,6 +1785,18 @@ fn gc_sweeps_the_memos_once_a_day() {
     fs::write(store.join("gc.sizes"), swept).unwrap();
     gc::collect(&store, cut, u64::MAX, false, || (100, 100));
     assert!(!old.exists() && kept.exists());
+}
+
+#[test]
+fn gc_counts_the_blocks_that_a_memo_takes_rather_than_its_length() {
+    let fixture = fixture("gc-blocks", "");
+    let store = fixture.root.join("store");
+    let size = || gc::collect(&store, 0, u64::MAX, false, || (100, 100)).size;
+    let empty = size();
+    let memo = stored(&store, "hashes/ab/memo", 32, 0);
+    fs::remove_file(store.join("gc.sizes")).unwrap();
+    let blocks = fs::metadata(&memo).unwrap().blocks() * 512;
+    assert_eq!(size() - empty, blocks.max(32));
 }
 
 #[test]
@@ -2242,7 +2267,7 @@ fn walk_of_a_settled_package_is_remembered_until_one_of_its_files_changes() {
     assert!(!memos.exists(), "a file whose ctime is new is not remembered");
     thread::sleep(Duration::from_secs(2));
     assert_eq!(variant(), first);
-    let memo = Vec::from_iter(fs::read_dir(&memos).unwrap().map(|entry| entry.unwrap().path()));
+    let memo = memos_in(&memos);
     assert_eq!(memo.len(), 1);
     fs::write(&memo[0], [7; 32]).unwrap();
     let recalled = variant();
@@ -3387,15 +3412,15 @@ fn a_remembered_hash_is_read_from_its_memo_until_the_file_changes() {
     assert!(!memos.exists(), "a file that changed in the last second is not remembered");
     thread::sleep(Duration::from_secs(2));
     assert_eq!(unit::remembered_hash(&path, &memos).unwrap(), blake3::hash(b"one"));
-    let memo = fs::read_dir(&memos).unwrap().next().unwrap().unwrap().path();
+    let memo = memos_in(&memos).remove(0);
     fs::write(&memo, blake3::hash(b"remembered").as_bytes()).unwrap();
     assert_eq!(unit::remembered_hash(&path, &memos).unwrap(), blake3::hash(b"remembered"));
     // Linux sets file times from a clock that advances every few milliseconds.
     thread::sleep(Duration::from_millis(20));
     fs::write(&path, "two").unwrap();
     assert_eq!(unit::remembered_hash(&path, &memos).unwrap(), blake3::hash(b"two"));
-    for memo in fs::read_dir(&memos).unwrap() {
-        fs::write(memo.unwrap().path(), "not a hash").unwrap();
+    for memo in memos_in(&memos) {
+        fs::write(memo, "not a hash").unwrap();
     }
     assert_eq!(unit::remembered_hash(&path, &memos).unwrap(), blake3::hash(b"two"));
 }
@@ -3434,10 +3459,10 @@ fn a_tree_hashes_alike_under_its_roots_and_is_remembered_under_its_listing() {
     );
     thread::sleep(Duration::from_secs(2));
     assert_eq!(fed(&first, &memos), hashed);
-    let remembered = Vec::from_iter(fs::read_dir(&memos).unwrap().flatten());
+    let remembered = memos_in(&memos);
     assert_eq!(remembered.len(), 2, "the tree and the file that is not UTF-8 are remembered");
     for memo in &remembered {
-        fs::write(memo.path(), blake3::hash(b"remembered").as_bytes()).unwrap();
+        fs::write(memo, blake3::hash(b"remembered").as_bytes()).unwrap();
     }
     assert_eq!(fed(&first, &memos), [blake3::hash(b"remembered").as_bytes()]);
     thread::sleep(Duration::from_millis(20));
