@@ -89,7 +89,8 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
     remembered sizes rather than walking the store. Staging counts as abandoned once it is an hour old, so
     `trucker gc --all` keeps younger staging, the lock files and the log. It removes each directory of memos whole,
     without reading the metadata of each memo. A memo or another small file beside the items counts the blocks that it
-    takes, which can be 128 times its length.
+    takes, which can be 128 times its length. Every run removes the memos that are four hours old, even those that a
+    build read since, because most name a library that a later build replaced, and a live memo costs one hash.
   - `duplicates.rs` is the report of `trucker stats --duplicates`.
   - `windows.rs` holds the Windows twins of the Unix system calls, and `windows_scan.rs` the scan for baked paths on
     Windows, which the tests run everywhere.

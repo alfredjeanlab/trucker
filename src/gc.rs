@@ -26,10 +26,16 @@ use std::{env, fs, io};
 
 use crate::unit::file_hash;
 
-/// The age in seconds after which an entry, a memo, a notice marker, a lock file or a log line is removed.
+/// The age in seconds after which an entry, a record of reads, a lock file or a log line is removed.
 ///
 /// It outlasts a weekend.
 const UNUSED_AGE: u64 = 3 * 86400;
+
+/// The age in seconds after which a memo or a notice marker is removed, whether or not a build read it since.
+///
+/// A read does not set the mtime of a memo, and the memo of a library is dead once a build replaces the library. So a
+/// longer age mostly keeps dead memos, and a live memo that goes costs one hash of its file.
+const MEMO_AGE: u64 = 4 * 3600;
 
 const GIB: u64 = 1 << 30;
 
@@ -78,16 +84,18 @@ const INTERVAL: u64 = 3600;
 /// The bytes that the store may gain before a miss starts gc within [`INTERVAL`], where no run recorded its room.
 const ADDED_LIMIT: u64 = GIB;
 
-/// The file of the store that remembers the size of each entry and idle slot, and the last sweep of the memos.
+/// The file of the store that remembers the size of each entry and idle slot, and the last [`SWEEP`].
 ///
 /// An entry never changes once it is renamed into place, and a slot changes only under its lock, so a run measures only
 /// what is new or was used since the last one.
 const SIZES: &str = "gc.sizes";
 
-/// The name in [`SIZES`] of the time and bytes of the last sweep of the memos.
-const MEMOS: &str = "memos";
+/// The name in [`SIZES`] of the time of the last [`SWEEP`] and of the bytes of the records of reads and candidates.
+const RECORDS: &str = "records";
 
-/// The interval in seconds between two sweeps of the memos, which keeps a memo for at most a day past [`UNUSED_AGE`].
+/// The interval in seconds between two sweeps of the records of reads, candidates, locks and log.
+///
+/// It keeps each for at most a day past [`UNUSED_AGE`]. The memos are swept on every run, as [`MEMO_AGE`] is short.
 const SWEEP: u64 = 86400;
 
 /// The parts of a slot other than its lock, in the order that gc removes them.
@@ -320,7 +328,7 @@ pub fn collect(
     let older = |path: &Path, cut: u64| modified(path).is_some_and(|time| time <= cut);
     let now = crate::now();
     let abandoned = now.saturating_sub(ABANDONED_AGE);
-    // The cut of what only saves time, such as a memo, a record of reads, a candidate or a marker.
+    // The cut of what only saves time, such as a record of reads, a candidate or a marker.
     let unused = if all { now } else { cut };
     let mut phase = Phase(Instant::now());
     let known = remembered(store);
@@ -329,12 +337,12 @@ pub fn collect(
         let known = known.get(&*relative).filter(|(was, _)| Some(was) == stamp.as_ref());
         known.map(|(_, bytes)| *bytes)
     };
-    // What builds leave beside the items, such as memos, records of reads, candidates and lock files, lies in
-    // directories of tens or hundreds of thousands of names, so it is swept and counted once per [`SWEEP`].
+    // What builds leave beside the items, such as records of reads, candidates and lock files, lies in directories of
+    // tens of thousands of names, so it is swept and counted once per [`SWEEP`].
     let swept =
-        known.get(MEMOS).and_then(|(time, bytes)| Some((time.parse::<u64>().ok()?, *bytes)));
+        known.get(RECORDS).and_then(|(time, bytes)| Some((time.parse::<u64>().ok()?, *bytes)));
     let swept = swept.filter(|(time, _)| !all && *time > now.saturating_sub(SWEEP) && *time <= now);
-    let mut memos = (now, 0);
+    let mut records = (now, 0);
     // The bytes of what is not an entry or a slot, which each run lists anyway.
     let mut rest = 0;
     let mut items = Vec::new();
@@ -352,14 +360,14 @@ pub fn collect(
             // Only gc dooms an entry, and this run holds the lock of gc, so the run that doomed it was killed.
             remove(&path);
         } else if name.ends_with(".cand") {
-            memos.1 += swept.map_or_else(|| candidates(&path, unused, abandoned), |_| 0);
+            records.1 += swept.map_or_else(|| candidates(&path, unused, abandoned), |_| 0);
         } else if swept.is_none() || !name.ends_with(".reads") {
             let reads = name.ends_with(".reads");
             match fs::symlink_metadata(&path) {
                 Ok(file) if seconds(file.modified()) <= if reads { unused } else { abandoned } => {
                     remove(&path)
                 }
-                Ok(file) if reads => memos.1 += allocated(&file),
+                Ok(file) if reads => records.1 += allocated(&file),
                 Ok(file) => rest += allocated(&file),
                 Err(_) => {}
             }
@@ -382,18 +390,19 @@ pub fn collect(
             rest += size(&path, false).0;
         }
     }
-    let memos = match swept {
+    let memos = sweep(store, if all { now } else { now.saturating_sub(MEMO_AGE) }, all);
+    phase.end("swept the memos");
+    let records = match swept {
         Some(swept) => swept,
         None => {
-            memos.1 += sweep(store, unused, all);
             for path in files_in_shards(&store.join("locks")).filter(|path| older(path, cut)) {
                 if let Some(_lock) = unlocked(&path) {
                     remove(&path);
                 }
             }
             trim(&store.join("log"), cut);
-            phase.end("swept the memos, locks and log");
-            memos
+            phase.end("swept the records of reads, locks and log");
+            records
         }
     };
     // A slot is the lock, directory, record, snapshot, manifest and compile times of one number in a pool, and its last
@@ -451,7 +460,7 @@ pub fn collect(
     }
     phase.end("listed the slots");
     // A slot of a fixed OUT_DIR and its symlink to a target directory follow its lock. A marker of a key, a package or a
-    // baked crate follows the rule of the memos.
+    // baked crate follows the rule of the records of reads.
     for path in children(&store.join("out")) {
         for lock in children(&path).iter().filter(|path| path.extension() == Some("lock".as_ref()))
         {
@@ -480,14 +489,14 @@ pub fn collect(
         holders.entry(extent.clone()).or_insert((0, *length)).0 += 1;
     }
     let shared = holders.values().map(|(_, length)| length).sum::<u64>();
-    let size = rest + memos.1 + shared + items.iter().map(|item| item.bytes).sum::<u64>();
+    let size = rest + memos + records.1 + shared + items.iter().map(|item| item.bytes).sum::<u64>();
     let mut collected = Collected { entries: 0, slots: 0, freed: 0, size, next: 0 };
     let (total, mut free) = space();
     let floor = total / 100 * FREE_PERCENT;
     // A store over its cap and one just below it would otherwise both leave the next run a room of a few entries.
     let margin = cap.min(total) / 100 * MARGIN_PERCENT;
     let short = |size: u64, free: u64| size > cap - margin || free < floor.saturating_add(margin);
-    let mut sizes = format!("{MEMOS}\t{}\t{}\n", memos.0, memos.1);
+    let mut sizes = format!("{RECORDS}\t{}\t{}\n", records.0, records.1);
     for item in items {
         // An item that a compile holds stays, because [`evict`] does not take a lock that another process holds.
         let due = all || item.time <= cut || short(collected.size, free);
@@ -620,7 +629,7 @@ fn evict(item: &Item) -> Option<u64> {
     Some(unlinked)
 }
 
-/// Removes the memos of `store` that no build has used since `cut`, and returns the bytes of those that stay.
+/// Removes the memos of `store` that were written before `cut`, and returns the bytes of those that stay.
 ///
 /// Where `all`, each directory of memos is renamed out of reach and removed whole, without reading the metadata of
 /// each memo. A directory that a killed run doomed is removed first, because only gc dooms one, under its lock.

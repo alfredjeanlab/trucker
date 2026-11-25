@@ -1765,26 +1765,27 @@ fn gc_measures_only_the_entries_and_slots_that_changed_since_its_last_run() {
 }
 
 #[test]
-fn gc_sweeps_the_memos_once_a_day() {
+fn gc_sweeps_the_memos_on_every_run_and_the_records_of_reads_once_a_day() {
     let fixture = fixture("gc-memos", "");
     let store = fixture.root.join("store");
-    let cut = crate::now() - 3 * 86400;
-    let old = stored(&store, "hashes/ab/old", 32, 4 * 86400);
-    let kept = stored(&store, "hashes/ab/kept", 32, 86400);
-    let flat = stored(&store, "hashes/flat", 32, 4 * 86400);
-    let size = gc::collect(&store, cut, u64::MAX, false, || (100, 100)).size;
-    assert!(!old.exists() && kept.exists());
-    assert!(!flat.exists(), "a memo from before the shards ages out");
-    let old = stored(&store, "hashes/ab/old", 32, 4 * 86400);
-    assert_eq!(gc::collect(&store, cut, u64::MAX, false, || (100, 100)).size, size);
-    assert!(old.exists(), "a sweep waits for a day");
+    let collect = || gc::collect(&store, crate::now() - 3 * 86400, u64::MAX, false, || (100, 100));
+    let kept = stored(&store, "hashes/ab/kept", 32, 3 * 3600);
+    let reads = stored(&store, "entries/key.reads", 32, 4 * 86400);
+    let size = collect().size;
+    assert!(kept.exists() && !reads.exists());
+    let old = stored(&store, "hashes/ab/old", 32, 5 * 3600);
+    let flat = stored(&store, "hashes/flat", 32, 5 * 3600);
+    let reads = stored(&store, "entries/key.reads", 32, 4 * 86400);
+    assert_eq!(collect().size, size);
+    assert!(!old.exists() && !flat.exists() && kept.exists(), "a memo goes at four hours");
+    assert!(reads.exists(), "a sweep of the records of reads waits for a day");
     let sizes = fs::read_to_string(store.join("gc.sizes")).unwrap();
-    let (memos, items) = sizes.split_once('\n').unwrap();
-    let bytes = memos.rsplit('\t').next().unwrap();
-    let swept = format!("memos\t{}\t{bytes}\n{items}", crate::now() - 86400);
+    let (records, items) = sizes.split_once('\n').unwrap();
+    let bytes = records.rsplit('\t').next().unwrap();
+    let swept = format!("records\t{}\t{bytes}\n{items}", crate::now() - 86400);
     fs::write(store.join("gc.sizes"), swept).unwrap();
-    gc::collect(&store, cut, u64::MAX, false, || (100, 100));
-    assert!(!old.exists() && kept.exists());
+    collect();
+    assert!(!reads.exists());
 }
 
 #[test]
@@ -1794,7 +1795,6 @@ fn gc_counts_the_blocks_that_a_memo_takes_rather_than_its_length() {
     let size = || gc::collect(&store, 0, u64::MAX, false, || (100, 100)).size;
     let empty = size();
     let memo = stored(&store, "hashes/ab/memo", 32, 0);
-    fs::remove_file(store.join("gc.sizes")).unwrap();
     let blocks = fs::metadata(&memo).unwrap().blocks() * 512;
     assert_eq!(size() - empty, blocks.max(32));
 }
