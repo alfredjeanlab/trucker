@@ -41,6 +41,7 @@ RUSTC_WRAPPER= cargo build      # build without trucker
 trucker gc                      # removes entries that no build has used lately
 trucker gc --all                # empties the cache, but keeps what a running build holds
 trucker stats                   # cache hits, misses and build timers
+trucker --version               # the version, and a hash of the binary that tells two builds apart
 ```
 
 Trucker automatically decides whether to run `trucker gc` after a miss so it rarely needs to be run by hand.

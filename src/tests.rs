@@ -1765,6 +1765,13 @@ fn gc_measures_only_the_entries_and_slots_that_changed_since_its_last_run() {
 }
 
 #[test]
+fn version_names_the_version_of_the_package_and_the_start_of_the_hash_of_the_binary() {
+    let hash = unit::file_hash(&env::current_exe().unwrap()).unwrap().to_hex();
+    let version = format!("trucker {} ({})\n", env!("CARGO_PKG_VERSION"), &hash[..12]);
+    assert_eq!(crate::version(), version);
+}
+
+#[test]
 fn gc_sweeps_the_memos_on_every_run_and_the_records_of_reads_once_a_day() {
     let fixture = fixture("gc-memos", "");
     let store = fixture.root.join("store");

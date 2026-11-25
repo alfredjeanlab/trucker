@@ -47,6 +47,7 @@ fn main() {
     let Some((rustc, rest)) = args.split_first() else { usage() };
     let text = rest.iter().map(|arg| arg.to_str().map(str::to_string)).collect::<Option<Vec<_>>>();
     match (rustc.to_str(), text) {
+        (Some("--version" | "-V"), Some(rest)) if rest.is_empty() => print!("{}", version()),
         (Some("stats"), Some(rest)) => {
             print!("{}", stats(&rest, &store_directory()).unwrap_or_else(|| usage()))
         }
@@ -84,7 +85,15 @@ fn usage() -> ! {
         "       trucker stats [--duplicates] [--since <seconds since 1970, or an age such as 90s, 15m, 2h or 3d>]"
     );
     eprintln!("       trucker gc [--all]");
+    eprintln!("       trucker --version");
     exit(2)
+}
+
+/// The version of trucker and the start of the hash of its binary, which tells apart two builds of one version.
+fn version() -> String {
+    let hash = env::current_exe().and_then(|wrapper| unit::file_hash(&wrapper));
+    let hash = hash.map_or_else(|_| "unknown".to_string(), |hash| hash.to_hex()[..12].to_string());
+    format!("trucker {} ({hash})\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn report(rustc: &Path, error: io::Error) -> i32 {
