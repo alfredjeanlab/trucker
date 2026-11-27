@@ -124,6 +124,8 @@ Use `TRUCKER_CACHE_SIZE` to adjust the cache size, in bytes or with a suffix K, 
 Use `TRUCKER_STORE` to put the store in another directory, which takes the place of `$XDG_CACHE_HOME/trucker`
 (e.g. `TRUCKER_STORE=/Volumes/build/trucker`).
 An empty value counts as unset, and a relative one is refused, so rustc runs uncached and says why.
+An empty or relative `XDG_CACHE_HOME` is ignored, as the XDG Base Directory Specification asks, so the store is then
+`~/.cache/trucker`.
 `trucker stats` ends with the store that it read and what placed it there.
 
 ## When to use Trucker

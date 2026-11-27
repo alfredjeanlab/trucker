@@ -4304,3 +4304,27 @@ fn a_relative_trucker_store_is_refused() {
     let refused = placed(variable, || PathBuf::from("/home/.cache"));
     assert_eq!(refused, Err("trucker: TRUCKER_STORE must be an absolute path, not store".into()));
 }
+
+// cargo runs rustc in the directory of each package, so an empty or relative XDG_CACHE_HOME made a store in each.
+#[test]
+fn an_empty_or_relative_xdg_cache_home_is_ignored_for_the_home_directory() {
+    let placed_by = |xdg: &str| {
+        let variable = |name: &str| (name == "XDG_CACHE_HOME").then(|| xdg.into());
+        placed(variable, || PathBuf::from("/home/.cache"))
+    };
+    let home = Ok((PathBuf::from("/home/.cache/trucker"), "the home directory"));
+    assert_eq!(placed_by(""), home);
+    assert_eq!(placed_by("cache"), home);
+    assert_eq!(placed_by("./cache"), home);
+    assert_eq!(placed_by("/xdg"), Ok((PathBuf::from("/xdg/trucker"), "XDG_CACHE_HOME")));
+}
+
+#[test]
+fn trucker_store_names_the_store_above_any_xdg_cache_home() {
+    for xdg in ["", "cache", "/xdg"] {
+        let vars = BTreeMap::from([("TRUCKER_STORE", "/store"), ("XDG_CACHE_HOME", xdg)]);
+        let variable = |name: &str| vars.get(name).map(|value| value.into());
+        let placed = placed(variable, || PathBuf::from("/home/.cache"));
+        assert_eq!(placed, Ok((PathBuf::from("/store"), "TRUCKER_STORE")));
+    }
+}

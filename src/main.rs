@@ -150,9 +150,10 @@ fn placed(
             "trucker: {STORE_VARIABLE} must be an absolute path, not {}",
             store.display()
         )),
-        None => Ok(match variable("XDG_CACHE_HOME") {
-            Some(cache) => (PathBuf::from(cache).join("trucker"), "XDG_CACHE_HOME"),
-            None => (home().join("trucker"), "the home directory"),
+        // The XDG Base Directory Specification has an empty or relative value ignored, as if it were unset.
+        None => Ok(match variable("XDG_CACHE_HOME").map(PathBuf::from) {
+            Some(cache) if cache.is_absolute() => (cache.join("trucker"), "XDG_CACHE_HOME"),
+            _ => (home().join("trucker"), "the home directory"),
         }),
     }
 }
