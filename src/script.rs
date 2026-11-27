@@ -90,7 +90,14 @@ pub fn dispatch() {
     let run = env::current_dir().map_err(|_| "no-working-directory").and_then(|directory| {
         Run::model(&real, directory, environment.collect(), unit::cargo_home())
     });
-    let store = crate::store_directory();
+    let Ok((store, _)) = crate::located() else {
+        exit(
+            Command::new(&real).status().map_or_else(
+                |error| crate::report(&real, error),
+                |status| status.code().unwrap_or(1),
+            ),
+        )
+    };
     let (outcome, code) = replay_or_run(&real, run, &store);
     let package = env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "-".to_string());
     crate::log(&store, &format!("{package}/build-script"), started, &outcome);

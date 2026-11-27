@@ -13,7 +13,7 @@ so a fresh worktree builds in a fraction of the time and uses much less disk spa
   - Rust and cargo 1.100 or later. Trucker runs an older rustc untouched.
   - macOS, Linux or Windows, as [supported platforms](#supported-platforms) says.
   - The store and the target directories on one filesystem.  
-    The store is `~/.cache/trucker` or `$XDG_CACHE_HOME/trucker`.  
+    The store is `~/.cache/trucker` or `$XDG_CACHE_HOME/trucker`, or the directory that `TRUCKER_STORE` names.  
 
 ## Installation
 
@@ -120,6 +120,11 @@ then the least recently used, however recently used, until it is a tenth of its 
 It keeps only what a running compile holds.
 
 Use `TRUCKER_CACHE_SIZE` to adjust the cache size, in bytes or with a suffix K, M, G or T (e.g. `=200G`).
+
+Use `TRUCKER_STORE` to put the store in another directory, which takes the place of `$XDG_CACHE_HOME/trucker`
+(e.g. `TRUCKER_STORE=/Volumes/build/trucker`).
+An empty value counts as unset, and a relative one is refused, so rustc runs uncached and says why.
+`trucker stats` ends with the store that it read and what placed it there.
 
 ## When to use Trucker
 

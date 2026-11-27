@@ -51,7 +51,9 @@ fn main() {
     match (rustc.to_str(), text) {
         (Some("--version" | "-V"), Some(rest)) if rest.is_empty() => print!("{}", version()),
         (Some("stats"), Some(rest)) => {
-            print!("{}", stats(&rest, &store_directory()).unwrap_or_else(|| usage()))
+            let report = stats(&rest, &store_directory()).unwrap_or_else(|| usage());
+            let (store, source) = located().unwrap_or_default();
+            println!("{report}store: {} (from {source})", store.display())
         }
         (Some("missed"), Some(rest)) => {
             print!("{}", missed::report(&rest, &store_directory()).unwrap_or_else(|| usage()))
@@ -64,9 +66,14 @@ fn main() {
             print!("{}", gc::run(&store_directory(), false, false))
         }
         (Some(word), _) if !is_program(word) => usage(),
-        (Some(rustc), Some(rest)) => {
-            exit(wrap(rustc, &rest, &store_directory(), unit::cargo_home()))
-        }
+        (Some(rustc), Some(rest)) => match located() {
+            Ok((store, _)) => exit(wrap(rustc, &rest, &store, unit::cargo_home())),
+            // A build that cannot be cached still compiles, and cargo shows the reason with the output of rustc.
+            Err(error) => {
+                eprintln!("{error}, so rustc runs uncached");
+                exit(replace(Command::new(rustc).args(&rest), rustc.as_ref()))
+            }
+        },
         _ => exit(replace(Command::new(rustc).args(rest), rustc.as_ref())),
     }
 }
@@ -121,8 +128,44 @@ fn replace(command: &mut Command, program: &Path) -> i32 {
     windows::run(command).unwrap_or_else(|error| report(program, error))
 }
 
+/// The variable that names the store, above `XDG_CACHE_HOME`.
+const STORE_VARIABLE: &str = "TRUCKER_STORE";
+
+/// The store, and the variable or the directory that placed it.
+///
+/// A relative value of [`STORE_VARIABLE`] is refused, because cargo runs rustc in the directory of each package, so
+/// every package would keep a store of its own.
+fn located() -> Result<(PathBuf, &'static str), String> {
+    placed(|name| env::var_os(name), cache_home)
+}
+
+/// The store that [`located`] gives where `variable` reads the environment and `home` gives the cache directory.
+fn placed(
+    variable: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: impl FnOnce() -> PathBuf,
+) -> Result<(PathBuf, &'static str), String> {
+    match variable(STORE_VARIABLE).filter(|value| !value.is_empty()).map(PathBuf::from) {
+        Some(store) if store.is_absolute() => Ok((store, STORE_VARIABLE)),
+        Some(store) => Err(format!(
+            "trucker: {STORE_VARIABLE} must be an absolute path, not {}",
+            store.display()
+        )),
+        None => Ok(match variable("XDG_CACHE_HOME") {
+            Some(cache) => (PathBuf::from(cache).join("trucker"), "XDG_CACHE_HOME"),
+            None => (home().join("trucker"), "the home directory"),
+        }),
+    }
+}
+
+/// The store, or an exit with the reason where [`located`] refuses it.
 fn store_directory() -> PathBuf {
-    env::var_os("XDG_CACHE_HOME").map_or_else(cache_home, PathBuf::from).join("trucker")
+    located().map_or_else(
+        |error| {
+            eprintln!("{error}");
+            exit(2)
+        },
+        |(store, _)| store,
+    )
 }
 
 #[cfg(unix)]

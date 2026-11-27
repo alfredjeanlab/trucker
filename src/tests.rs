@@ -8,7 +8,7 @@ use std::{env, fs, thread};
 use crate::script::{self, Run, replay_or_run};
 use crate::store::Files;
 use crate::unit::{self, CARGO_HOME, Roots, TARGET, Unit, WORKTREE};
-use crate::{cached, gc, is_program, lazy, missed, note, session, stats, store};
+use crate::{cached, gc, is_program, lazy, missed, note, placed, session, stats, store};
 
 /// A directory of one test, with a stand-in rustc and a CARGO_HOME, on the filesystem of the temporary directory.
 struct Fixture {
@@ -4279,4 +4279,28 @@ fn miss_names_the_file_of_a_link_argument_that_differs() {
         notes(&store),
         [format!("note missed foo-abc against another target: named {object}")]
     );
+}
+
+#[test]
+fn trucker_store_names_the_store_above_xdg_cache_home_and_the_home_directory() {
+    let placed_by = |vars: &[(&str, &str)]| {
+        let vars = BTreeMap::from_iter(vars.iter().map(|&(name, value)| (name, value)));
+        let variable = |name: &str| vars.get(name).map(|value| value.into());
+        placed(variable, || PathBuf::from("/home/.cache"))
+    };
+    let both = [("TRUCKER_STORE", "/store"), ("XDG_CACHE_HOME", "/xdg")];
+    assert_eq!(placed_by(&both), Ok((PathBuf::from("/store"), "TRUCKER_STORE")));
+    let empty = [("TRUCKER_STORE", ""), ("XDG_CACHE_HOME", "/xdg")];
+    assert_eq!(placed_by(&empty), Ok((PathBuf::from("/xdg/trucker"), "XDG_CACHE_HOME")));
+    let home = Ok((PathBuf::from("/home/.cache/trucker"), "the home directory"));
+    assert_eq!(placed_by(&[("TRUCKER_STORE", "")]), home);
+    assert_eq!(placed_by(&[]), home);
+}
+
+// cargo runs rustc in the directory of each package, so a relative store would be one per package.
+#[test]
+fn a_relative_trucker_store_is_refused() {
+    let variable = |name: &str| (name == "TRUCKER_STORE").then(|| "store".into());
+    let refused = placed(variable, || PathBuf::from("/home/.cache"));
+    assert_eq!(refused, Err("trucker: TRUCKER_STORE must be an absolute path, not store".into()));
 }
