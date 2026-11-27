@@ -141,5 +141,6 @@ expect "crates compiled by a repeated build on ext4" "$(build "$HOME/e2e-ext4" "
 strip "$HOME/e2e-ext4/target/debug/e2e"
 workspace "$HOME/e2e-ext4-third" && cp /work/e2e/first/Cargo.lock "$HOME/e2e-ext4-third/" && sleep 1.1
 build "$HOME/e2e-ext4-third" "$HOME/cache-ext4" > /dev/null
-file "$HOME/e2e-ext4-third/target/debug/e2e" | grep -q 'not stripped' || { echo "FAILED: a stripped binary was restored"; exit 1; }
+# readelf comes with strip, and a binary that keeps its symbol table is not stripped.
+readelf -S "$HOME/e2e-ext4-third/target/debug/e2e" | grep -q '\.symtab' || { echo "FAILED: a stripped binary was restored"; exit 1; }
 echo "linux: passed, with $misses entries stored and restored, $runs of them build-script runs"

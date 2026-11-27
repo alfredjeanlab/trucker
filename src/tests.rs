@@ -1292,7 +1292,7 @@ fn gc_removes_what_no_build_used_for_three_days_and_keeps_a_hit_entry() {
     }
     let flat = stored(&store, "locks/flat", 0, 4 * 86400);
     let held = fs::File::open(lock("held")).unwrap();
-    held.try_lock().unwrap();
+    locked(&held);
     fs::write(fixture.root.join("build_script_build"), "real").unwrap();
     script::install(&fixture.root.join("build_script_build"), &store, Files::Clones).unwrap();
     fs::write(store.join("stand-in/other"), "an older wrapper").unwrap();
@@ -1336,7 +1336,7 @@ fn gc_removes_the_fixed_out_dirs_and_markers_that_no_script_used_for_three_days(
         age(&pool.join(format!("{number}.lock")), if number == "2" { 60 } else { 4 * 86400 });
     }
     let held = fs::File::open(pool.join("1.lock")).unwrap();
-    held.try_lock().unwrap();
+    locked(&held);
     for (name, old) in [("old.fixed", true), ("old.never", true), ("new.never", false)]
         .into_iter()
         .chain([("old.fixed-package", true), ("new.fixed-package", false)])
@@ -1448,6 +1448,17 @@ fn size_variable_replaces_the_cap_unless_it_is_not_a_size() {
 /// Whether [`gc::trigger`] starts a run in `store` within 10 s.
 ///
 /// A child that another test forks shares the lock of the trigger until it runs exec, so a trigger may find it held.
+/// Takes the lock of `file`, waiting while a child that another test forked still holds it.
+///
+/// A forked child keeps a copy of each open file until it execs, and with it any lock on that file.
+fn locked(file: &fs::File) {
+    let waited = Instant::now();
+    while file.try_lock().is_err() {
+        assert!(waited.elapsed() < Duration::from_secs(10), "the lock stays taken");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn triggered(store: &Path) -> bool {
     let waited = Instant::now();
     while waited.elapsed() < Duration::from_secs(10) {
@@ -1490,13 +1501,13 @@ fn trigger_starts_at_most_one_gc_an_hour_and_none_while_one_runs() {
     // A miss that ends while another decides leaves gc to that one.
     age(&store.join("gc.stamp"), 7200);
     let deciding = fs::File::create(store.join("gc.trigger")).unwrap();
-    deciding.try_lock().unwrap();
+    locked(&deciding);
     assert!(!gc::trigger(&store, Path::new("/usr/bin/true")));
     drop(deciding);
     assert!(triggered(&store));
 
     let lock = fs::File::create(store.join("gc.lock")).unwrap();
-    lock.try_lock().unwrap();
+    locked(&lock);
     let started = Instant::now();
     let report = thread::scope(|scope| {
         scope.spawn(|| {
@@ -1552,7 +1563,7 @@ fn gc_over_its_cap_removes_recent_entries_and_idle_slots_least_recently_used_fir
         stored(&store, &format!("slots/foo/{number}.lock"), 0, minutes * 60);
     }
     let held = fs::File::open(pool.join("1.lock")).unwrap();
-    held.try_lock().unwrap();
+    locked(&held);
 
     let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
     // A cap whose target, a tenth below it, needs two items gone.
@@ -1563,12 +1574,13 @@ fn gc_over_its_cap_removes_recent_entries_and_idle_slots_least_recently_used_fir
     assert!(!store.join("entries/first").exists() && !pool.join("0.slot").exists());
     assert!(store.join("entries/third").exists());
 
+    let started = crate::now();
     let collected = gc::collect(&store, 0, 0, false, || (100_000, 100_000));
     assert_eq!((collected.entries, collected.slots, collected.freed), (1, 1, 8192));
     assert_eq!(collected.size, size - 4 * 4096, "the held slot still counts");
     assert!(pool.join("1.slot").exists() && pool.join("1.lock").exists(), "a held slot stays");
     assert!(!store.join("entries/third").exists() && !pool.join("2.slot").exists());
-    assert!(collected.next >= crate::now() + 3599, "the held slot keeps the store over its cap");
+    assert!(collected.next >= started + 3600, "the held slot keeps the store over its cap");
 }
 
 #[test]
@@ -1607,7 +1619,7 @@ fn gc_counts_slots_under_the_cap_and_removes_the_least_recently_used_of_entries_
     stored(&store, "entries/doomed.gc/lib", 1000, 0);
     stored(&store, "slots/foo/3.session.gc/query", 1000, 0);
     let held = fs::File::open(pool.join("2.lock")).unwrap();
-    held.try_lock().unwrap();
+    locked(&held);
 
     let size = gc::collect(&store, 0, u64::MAX, false, || (10_000, 10_000)).size;
     assert!(!store.join("entries/doomed.gc").exists() && !pool.join("3.session.gc").exists());
@@ -1664,7 +1676,7 @@ fn gc_counts_a_clone_that_a_worktree_holds_as_nothing_and_one_that_only_slots_ho
     assert_eq!(collect(u64::MAX).size, size + counted, "the newest measure counts the clones");
     let held = ["bar", "baz"]
         .map(|pool| fs::File::open(store.join(format!("slots/{pool}/0.lock"))).unwrap());
-    held.iter().for_each(|lock| lock.try_lock().unwrap());
+    held.iter().for_each(locked);
     let collected = collect(0);
     assert_eq!((collected.slots, collected.freed), (1, 0), "another slot still holds the clone");
 }
@@ -1736,7 +1748,7 @@ fn gc_of_all_removes_what_was_used_just_now_but_keeps_held_slots_staging_and_loc
         stored(&store, &format!("slots/foo/{number}.lock"), 0, 0);
     }
     let held = fs::File::open(pool.join("1.lock")).unwrap();
-    held.try_lock().unwrap();
+    locked(&held);
 
     let collected = gc::collect(&store, 0, u64::MAX, true, || (10_000, 10_000));
     assert_eq!((collected.entries, collected.slots, collected.next), (1, 1, 0));
@@ -1760,7 +1772,7 @@ fn gc_measures_only_the_entries_and_slots_that_changed_since_its_last_run() {
     let lock = stored(&store, "slots/foo/0.lock", 0, 7200);
     let busy_lock = stored(&store, "slots/foo/1.lock", 0, 60);
     let held_lock = fs::File::create(stored(&store, "slots/foo/2.lock", 0, 60)).unwrap();
-    held_lock.try_lock().unwrap();
+    locked(&held_lock);
     let size = || gc::collect(&store, 0, u64::MAX, false, || (100, 100)).size;
     let first = size();
     for path in [&entry, &idle, &busy, &held] {
