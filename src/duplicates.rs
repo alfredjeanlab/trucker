@@ -102,7 +102,7 @@ fn compatible(version: &str) -> String {
     parts[..(1 + usize::from(parts[0] == "0")).min(parts.len())].join(".")
 }
 
-/// The report of `stats --duplicates` on the compiles in `entries` that were stored at or after `start`.
+/// The report of `trucker missed --duplicates` on the compiles in `entries` that were stored at or after `start`.
 ///
 /// One crate is reported where different workspaces compiled it with other features and otherwise equal arguments,
 /// or at semver-compatible versions with equal arguments other than its features and sources. Its extra time is that
@@ -153,14 +153,16 @@ pub fn report(entries: &Path, start: u64) -> String {
         let workspaces =
             BTreeSet::from_iter(variants.values().flat_map(|(_, names)| names.iter().copied()));
         let workspaces = Vec::from_iter(workspaces).join(", ");
+        let class = if class == "features" { "with features" } else { "at versions" };
         rows.push((extra, format!("{package} {version}  {class} {differing}  in {workspaces}")));
     }
     rows.sort_by(|a, b| b.cmp(a));
     let seconds = |milliseconds: u64| milliseconds as f64 / 1000.0;
     let total = seconds(compiles.iter().map(|compile| compile.milliseconds).sum());
     let extra = seconds(rows.iter().map(|(extra, _)| extra).sum());
-    let mut text =
-        format!("{total:.1} s compiled, of which {extra:.1} s for other features or versions\n");
+    let mut text = format!(
+        "{total:.1} s went to the saved compiles, and {extra:.1} s of it to other features or versions\n"
+    );
     for (extra, row) in rows {
         let _ = writeln!(text, "{:>8.1} s  {row}", seconds(extra));
     }
@@ -174,8 +176,8 @@ pub fn report(entries: &Path, start: u64) -> String {
     slow.sort_by_key(|(_, time)| std::cmp::Reverse(*time));
     if !slow.is_empty() {
         text.push_str(
-            "\nOwn crates that run ThinLTO between their codegen units, which slows every build and incremental edit \
-             of them, unless their profile sets lto = \"off\":\n",
+            "\nYour crates that run ThinLTO between their codegen units, which slows every build and edit of them, \
+             unless their profile sets lto = \"off\":\n",
         );
     }
     for ((package, workspace), time) in slow {

@@ -65,7 +65,9 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
 
   - `main.rs` dispatches the subcommands, and for a compile decides whether it is cached, runs rustc, and logs the
     outcome of each invocation to the store's `log`. A failure runs rustc unchanged, logged as `passthrough <reason>`.
-    A panic would fail the build, so clippy denies `unwrap`, `expect` and `panic` outside tests.
+    A panic would fail the build, so clippy denies `unwrap`, `expect` and `panic` outside tests. A new outcome gets a
+    description in `OUTCOMES`, which `trucker stats` prints, and a row in the table of README.md, which a test checks.
+    The log keeps the codes, because the bench and older logs read them.
   - `unit.rs` reads rustc's arguments into a `Unit` and computes its key. It relies on the layout of cargo 1.100 and
     later, which gives each unit a directory of its own. The paths of the target directory,
     CARGO_HOME and the worktree enter a key through placeholders, so two worktrees of one repository compute the same
@@ -97,7 +99,17 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
   - `usage.rs` measures the disk that files take, as their removal would free it. A block that a worktree shares
     counts nothing, and one that only the store holds counts once. APFS reports clone counts, and FIEMAP reports
     shared extents on XFS and btrfs.
-  - `duplicates.rs` is the report of `trucker stats --duplicates`.
+  - `duplicates.rs` is the report of `trucker missed --duplicates`, the compiles that workspaces repeat for other
+    features or versions. It reads the record of every entry rather than the log, so the ranking of causes leaves it
+    to the flag.
+  - `missed.rs` writes the note that follows a stored miss in the log. It names each part of the key that differs from
+    the last stored compile of the crate with the same normalized arguments, whose digests a memo under `hashes` keeps.
+    A key keeps the values of its parts, so a hit hashes nothing more. A tree that differs is compared file by file with
+    the earlier tree, where that tree still hashes as the memo recorded. A note names a path only through the
+    placeholders, because the bench commits its logs, and `trucker stats` does not count notes.
+    `trucker missed` ranks the causes in the notes. A miss follows from the latest notes of the libraries that differ,
+    and of the trees of other packages that differ, because cargo passes the link search directories of a build
+    script to every dependent. A miss that differs in a part that none of those notes names is a cause.
   - `windows.rs` holds the Windows twins of the Unix system calls, and `windows_scan.rs` the scan for baked paths on
     Windows, which the tests run everywhere.
 

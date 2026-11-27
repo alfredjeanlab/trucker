@@ -8,7 +8,7 @@ use std::{env, fs, thread};
 use crate::script::{self, Run, replay_or_run};
 use crate::store::Files;
 use crate::unit::{self, CARGO_HOME, Roots, TARGET, Unit, WORKTREE};
-use crate::{cached, gc, is_program, lazy, note, session, stats, store};
+use crate::{cached, gc, is_program, lazy, missed, note, session, stats, store};
 
 /// A directory of one test, with a stand-in rustc and a CARGO_HOME, on the filesystem of the temporary directory.
 struct Fixture {
@@ -113,7 +113,7 @@ impl Fixture {
 
     fn key(&self, args: &[String]) -> String {
         let store = self.root.join("store");
-        self.unit(args).unwrap().key(&self.rustc, args, &store, env::vars_os()).unwrap()
+        self.unit(args).unwrap().key(&self.rustc, args, &store, env::vars_os()).unwrap().hex
     }
 
     /// A run of the build script `body` in a worktree, with `variables` added, and its OUT_DIR.
@@ -1150,11 +1150,13 @@ fn duplicates_are_reported_only_between_workspaces_and_for_features_or_compatibl
         .unwrap();
     let before = stats(&[], &root).unwrap();
     let rows = [
-        "      1       0.5 s  hit",
-        "      1       0.8 s  hit waited",
-        "      1       2.0 s  miss",
+        "      1       0.8 s  hit waited | waited for another build, then restored from cache",
+        "      1       0.5 s  hit        | restored from cache",
+        "      1       2.0 s  miss       | compiled fresh and cached",
+        "Each time is the total that trucker took, to restore for a hit and to compile otherwise.",
+        "66.7% of the compiles that could be cached were restored from cache (hits 2, misses 1)",
     ];
-    let counts = format!("{}\n66.7% of the cached invocations hit\ncap: ", rows.join("\n"));
+    let counts = format!("{}\ncap: ", rows.join("\n"));
     assert!(before.starts_with(&counts), "{before}");
     let features = "--cfg\nfeature=\"std\"\n";
     recorded(&root, "foo\n1.0.0\nengine/target\n3000", features);
@@ -1169,20 +1171,25 @@ fn duplicates_are_reported_only_between_workspaces_and_for_features_or_compatibl
     recorded(&root, "foo-cli\n0.3.1\nengine/target\n400", "");
     recorded(&root, "foo-cli\n0.4.0\nmarket/target\n300", "");
     recorded(&root, "foo-cli\n0.4.2\nengine/target\n200", "");
-    let report = stats(&["--duplicates".to_string()], &root).unwrap();
+    let report = missed::report(&["--duplicates".to_string()], &root).unwrap();
     let rows = [
-        "8.3 s compiled, of which 2.2 s for other features or versions",
-        "     2.0 s  foo 1.0.0  features alloc  in engine/target, market/target",
-        "     0.2 s  foo-cli foo 0.4  versions 0.4.0, 0.4.2  in engine/target, market/target",
+        "8.3 s went to the saved compiles, and 2.2 s of it to other features or versions",
+        "     2.0 s  foo 1.0.0  with features alloc  in engine/target, market/target",
+        "     0.2 s  foo-cli foo 0.4  at versions 0.4.0, 0.4.2  in engine/target, market/target",
     ];
     assert_eq!(report, format!("{}\n", rows.join("\n")));
     assert_eq!(stats(&[], &root).unwrap(), before);
     assert_eq!(
-        stats(&["--duplicates".to_string(), "--since".to_string(), "1d".to_string()], &root)
-            .unwrap(),
+        missed::report(
+            &["--since".to_string(), "1d".to_string(), "--duplicates".to_string()],
+            &root
+        )
+        .unwrap(),
         report
     );
     assert!(stats(&["--since".to_string()], &root).is_none());
+    assert!(stats(&["--duplicates".to_string()], &root).is_none());
+    assert!(missed::report(&["--duplicates".to_string(), "foo".to_string()], &root).is_none());
 }
 
 #[test]
@@ -1305,7 +1312,12 @@ fn gc_removes_what_no_build_used_for_three_days_and_keeps_a_hit_entry() {
     assert!(!flat.exists(), "a lock from before the shards ages out");
     let report = stats(&[], &store).unwrap();
     let (counts, cap) = report.split_at(report.find("cap: ").unwrap());
-    assert_eq!(counts, "      1       0.0 s  hit\n100.0% of the cached invocations hit\n");
+    let rows = [
+        "      1       0.0 s  hit | restored from cache",
+        "Each time is the total that trucker took, to restore for a hit and to compile otherwise.",
+        "100.0% of the compiles that could be cached were restored from cache (hits 1, misses 0)",
+    ];
+    assert_eq!(counts, format!("{}\n", rows.join("\n")));
     assert!(
         cap.ends_with(" GB (from the filesystem)\n") || cap.contains(gc::SIZE_VARIABLE),
         "{cap}"
@@ -1898,6 +1910,35 @@ fn stats_gives_the_cap_that_the_last_gc_applied() {
 }
 
 #[test]
+fn readme_describes_every_outcome_that_stats_describes() {
+    let readme = include_str!("../README.md");
+    for (code, _) in crate::OUTCOMES {
+        assert!(readme.contains(&format!("| `{code}` |")), "{code}");
+    }
+}
+
+#[test]
+fn stats_describes_an_outcome_after_its_code_and_falls_back_to_the_code() {
+    let fixture = fixture("stats-groups", "");
+    let store = fixture.root.join("store");
+    let log = "100 a 1000 passthrough rustc-failed\n100 a 3000 passthrough future\n100 a 2000 note unkept-session \
+               StorageFull\n100 a 500 note outside-workspace\n";
+    fs::write(store.join("log"), log).unwrap();
+    let report = stats(&[], &store).unwrap();
+    let rows = [
+        "      1       3.0 s  passthrough future",
+        "      1       1.0 s  passthrough rustc-failed        | rustc failed, nothing cached",
+        "      1       2.0 s  note unkept-session StorageFull | note on a compile: its work could not be shared with \
+         other builds",
+        "      1       0.5 s  note outside-workspace          | note on a miss: crate outside the workspace is cached \
+         per worktree",
+        "Each time is the total that trucker took, to restore for a hit and to compile otherwise.",
+        "cap: ",
+    ];
+    assert!(report.starts_with(&rows.join("\n")), "{report}");
+}
+
+#[test]
 fn a_word_that_names_no_program_is_not_taken_for_rustc() {
     for word in ["status", "g", "--help", ""] {
         assert!(!is_program(word), "{word}");
@@ -2421,7 +2462,7 @@ fn variable_that_cargo_leaves_unset_selects_an_entry_only_where_the_crate_reads_
     let key = |name: &str| {
         let args = fixture.args(&fixture.worktree(name, "metadata"));
         let environment = env::vars_os().chain([(variable.into(), checkout(name).into())]);
-        fixture.unit(&args).unwrap().key(&fixture.rustc, &args, &store, environment).unwrap()
+        fixture.unit(&args).unwrap().key(&fixture.rustc, &args, &store, environment).unwrap().hex
     };
     assert_eq!(key("first"), key("second"));
     let target = fixture.root.join("first/target");
@@ -3443,7 +3484,7 @@ fn own_crate_that_runs_thin_lto_in_a_slow_incremental_compile_is_reported_and_no
     compile("release", "release/target\n60000", "");
     compile("single", "single/target\n60000", "-C\nincremental\n-C\ncodegen-units=1");
     compile("registry", "registry/target\n60000", "-C\nincremental");
-    let report = stats(&["--duplicates".to_string()], &root).unwrap();
+    let report = missed::report(&["--duplicates".to_string()], &root).unwrap();
     let section = "unless their profile sets lto = \"off\":\n    26.0 s  model  in model/target\n";
     assert!(report.ends_with(section), "{report}");
 }
@@ -3930,4 +3971,300 @@ fn a_clone_counts_once_where_the_store_holds_all_of_its_clones() {
     assert_eq!(usage.shared[0].freed_by(2), !cfg!(target_os = "macos"), "{usage:?}");
     let usage = crate::usage::measure(&inside.join("a"));
     assert!(!usage.shared[0].freed_by(1), "{usage:?}");
+}
+
+/// The note lines in the log of `store`, each without its time, crate and milliseconds.
+fn notes(store: &Path) -> Vec<String> {
+    let log = fs::read_to_string(store.join("log")).unwrap_or_default();
+    let outcomes = log.lines().filter_map(|line| line.splitn(4, ' ').nth(3));
+    Vec::from_iter(outcomes.filter(|outcome| outcome.starts_with(missed::NOTE)).map(str::to_string))
+}
+
+#[test]
+fn miss_names_the_parts_of_its_key_that_differ_from_the_last_stored_compile() {
+    let fixture = fixture("parts", "");
+    let store = fixture.root.join("store");
+    let tree = format!("{TARGET}debug/build/foo/run/out");
+    let build = |name: &str, dependency: &str, record: &str| {
+        let target = fixture.worktree(name, dependency);
+        let out = target.join("debug/build/foo/run/out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("c.record"), record).unwrap();
+        fs::write(out.join("libfoo_c.a"), "archive").unwrap();
+        let native = format!("native={}", out.display());
+        let args = [&fixture.args(&target)[..], &["-L".to_string(), native]].concat();
+        fixture.build(&args, &store, None).unwrap().0
+    };
+    assert_eq!(build("a", "metadata", "one"), "miss");
+    assert_eq!(build("b", "metadata", "one"), "hit");
+    assert!(notes(&store).is_empty(), "{:?}", notes(&store));
+    assert_eq!(build("c", "other", "two"), "miss");
+    assert_eq!(
+        notes(&store),
+        [format!(
+            "note missed foo-abc against another target: libraries dep-def; tree {tree} in c.record"
+        )]
+    );
+    assert_eq!(build("c", "other", "three"), "miss");
+    assert_eq!(
+        notes(&store)[1],
+        format!(
+            "note missed foo-abc against this target: tree {tree}, which this target rewrote since"
+        )
+    );
+    fs::remove_dir_all(fixture.root.join("c/target/debug/build/foo/run")).unwrap();
+    assert_eq!(build("d", "other", "four"), "miss");
+    assert_eq!(
+        notes(&store)[2],
+        format!(
+            "note missed foo-abc against another target: tree {tree}, whose earlier copy is gone"
+        )
+    );
+    fs::write(fixture.root.join("d/target/debug/build/foo/run/out/c.record"), "six").unwrap();
+    assert_eq!(build("e", "other", "five"), "miss");
+    assert_eq!(
+        notes(&store)[3],
+        format!(
+            "note missed foo-abc against another target: tree {tree}, whose earlier copy changed since"
+        )
+    );
+    for entry in fs::read_dir(store.join("entries")).unwrap() {
+        let entry = entry.unwrap().path();
+        if entry.is_dir() {
+            fs::remove_dir_all(entry).unwrap();
+        }
+    }
+    assert_eq!(build("f", "other", "five"), "miss");
+    assert_eq!(notes(&store)[4], "note missed foo-abc against another target: gone");
+    let report = stats(&[], &store).unwrap();
+    assert!(!report.contains("note"), "{report}");
+}
+
+#[test]
+fn miss_of_equal_parts_whose_reads_select_another_entry_names_sources() {
+    let fixture = fixture("sources", "$out/../../run/out/read.rs");
+    let store = fixture.root.join("store");
+    let build = |name: &str, read: &str| {
+        let target = fixture.worktree(name, "metadata");
+        let (unit, _) = fixture.generated(&target, read, "unread");
+        let args = fixture.args(&target);
+        cached(&fixture.rustc, &args, &store, &unit, &mut std::io::stderr()).unwrap().0
+    };
+    assert_eq!(build("a", "one"), "miss");
+    assert_eq!(build("b", "two"), "miss");
+    assert_eq!(notes(&store), ["note missed foo-abc against another target: sources"]);
+}
+
+/// A checkout `name` of a workspace whose crate `pycc` has a build script and dependents `d1` and `app`, with the
+/// arguments of each crate's compile.
+///
+/// The script records a hash of its absolute OUT_DIR in `c.record`, beside the archive whose directory it names in
+/// `rustc-link-search`, as pycc's build script did. cargo passes that directory to the dependents too. `d1` reads the
+/// metadata of pycc, as a pipelined library does, and `app` its library.
+fn checkout(fixture: &Fixture, name: &str) -> [Vec<String>; 3] {
+    let (root, build) =
+        (fixture.root.join(name), fixture.root.join(name).join("target/debug/build"));
+    let script = build.join("pycc/run/out");
+    for directory in [".git", "pycc/src", "d1/src", "app/src"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    for directory in [script.clone(), build.join("pycc/aaa/out"), build.join("d1/ccc/out")] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::create_dir_all(build.join("app/bbb/out")).unwrap();
+    write_source(&root.join("pycc/src/lib.rs"), "pub fn libm() {}");
+    write_source(&root.join("d1/src/lib.rs"), "pub fn d1() {}");
+    write_source(&root.join("app/src/main.rs"), "fn main() {}");
+    let record =
+        "printf '%s %s\\n' \"$(printf %s \"$OUT_DIR\" | cksum)\" libm > \"$OUT_DIR/c.record\"";
+    let ran = Command::new("sh").args(["-c", record]).env("OUT_DIR", &script).status().unwrap();
+    assert!(ran.success());
+    fs::write(script.join("libpycc_libm.a"), "archive").unwrap();
+    let (root, build, script) = (root.display(), build.display(), script.display());
+    let pycc = format!(
+        "--crate-name pycc {root}/pycc/src/lib.rs --crate-type lib --emit=dep-info,link -C extra-filename=-aaa \
+         --out-dir {build}/pycc/aaa/out -L native={script} -l static=pycc_libm"
+    );
+    let app = format!(
+        "--crate-name app {root}/app/src/main.rs --crate-type bin --emit=dep-info,link -C extra-filename=-bbb \
+         --out-dir {build}/app/bbb/out -L dependency={build}/pycc/aaa/out -L native={script} \
+         --extern pycc={build}/pycc/aaa/out/libpycc-aaa.rlib"
+    );
+    let d1 = format!(
+        "--crate-name d1 {root}/d1/src/lib.rs --crate-type lib --emit=dep-info,metadata,link -C extra-filename=-ccc \
+         --out-dir {build}/d1/ccc/out -L dependency={build}/pycc/aaa/out -L native={script} \
+         --extern pycc={build}/pycc/aaa/out/libpycc-aaa.rmeta"
+    );
+    [pycc, d1, app].map(|args| args.split(' ').map(str::to_string).collect())
+}
+
+// pycc's record held a hash of its worktree's path, so pycc and its 9 dependents compiled again in every worktree,
+// and finding that took two builds and a diff of binaries.
+#[test]
+fn miss_in_a_new_checkout_names_the_file_of_a_search_directory_that_differs() {
+    let fixture = fixture("incident", "");
+    // Each compile gives its library other bytes, as an incremental compile of rustc does.
+    let rustc = r#"#!/bin/sh
+[ "$1" = -vV ] && { printf 'stand-in\nrelease: 1.100.0\n'; exit 0; }
+while [ $# -gt 0 ]; do case "$1" in --out-dir) out=$2;; --crate-name) name=$2;; extra-filename=*) extra=${1#extra-filename=};; *.rs) src=$1;; esac; shift; done
+printf "rlib $$" > "$out/lib$name$extra.rlib"
+printf rmeta > "$out/lib$name$extra.rmeta"
+printf '%s/lib%s%s.rlib: %s\n' "$out" "$name" "$extra" "$src" > "$out/$name$extra.d"
+"#;
+    executable(Path::new(&fixture.rustc), rustc);
+    let store = fixture.root.join("store");
+    // A recent stamp keeps a miss from starting gc, which would run the test binary.
+    fs::write(store.join("gc.stamp"), "").unwrap();
+    let build = |name| {
+        for args in checkout(&fixture, name) {
+            assert_eq!(crate::wrap(&fixture.rustc, &args, &store, fixture.cargo_home.clone()), 0);
+        }
+    };
+    build("a");
+    build("b");
+    let log = fs::read_to_string(store.join("log")).unwrap();
+    let outcomes = Vec::from_iter(log.lines().map(|line| line.splitn(4, ' ').nth(3).unwrap()));
+    assert_eq!(outcomes.iter().filter(|outcome| **outcome == "miss").count(), 6, "{log}");
+    let tree = format!("{TARGET}debug/build/pycc/run/out");
+    assert_eq!(
+        notes(&store),
+        [
+            format!("note missed pycc-aaa against another worktree: tree {tree} in c.record"),
+            format!("note missed d1-ccc against another worktree: tree {tree} in c.record"),
+            format!(
+                "note missed app-bbb against another worktree: libraries pycc-aaa; tree {tree} in c.record"
+            ),
+        ]
+    );
+    assert!(!log.contains(&fixture.root.display().to_string()), "the log names no absolute path");
+    // The times of the stand-in vary, so each line is compared from where its time ends.
+    let report = missed::report(&[], &store).unwrap();
+    let lines = Vec::from_iter(report.lines().map(|line| line.split(" s  ").last().unwrap()));
+    assert_eq!(
+        lines[1..4],
+        [
+            "2 of these 3 missed only because a crate that they use missed first".to_string(),
+            "3 other misses ran a build script or had no recent compile to compare with"
+                .to_string(),
+            format!(
+                "pycc | missed once, because the file c.record in the library folder {tree} differs from the \
+                 compile in another worktree"
+            ),
+        ]
+    );
+    assert!(
+        report
+            .lines()
+            .nth(4)
+            .unwrap()
+            .starts_with("                 | then 2 crates that use it missed in "),
+        "{report}"
+    );
+    assert!(report.ends_with(" s: app, d1\n"), "{report}");
+    let app = missed::report(&["app".to_string()], &store).unwrap();
+    assert!(app.ends_with(&format!("pycc | missed first and led to this miss, because the file c.record in the library folder {tree} differs from the compile in another worktree\n")), "{app}");
+}
+
+#[test]
+fn missed_ranks_the_causes_by_the_time_that_they_and_their_dependents_took() {
+    let root = fixture("ranked", "").root.join("store");
+    let (now, tree) = (crate::now(), format!("{TARGET}debug/build/pycc/r/out"));
+    let mut lines = vec![
+        "100 old 9000 note missed old-g against this target: sources".to_string(),
+        format!(
+            "{now} pycc 4000 note missed pycc-a against another worktree: tree {tree} in c.record"
+        ),
+        format!("{now} pycc 4000 miss"),
+        format!(
+            "{now} keys 1000 note missed keys-b against another worktree: libraries pycc-a; tree {tree} in c.record"
+        ),
+        format!("{now} keys 1000 miss session"),
+        format!(
+            "{now} jobs 3000 note missed jobs-c against another worktree: libraries keys-b, pycc-a; tree {tree} in c.record"
+        ),
+        format!(
+            "{now} lib 500 note missed lib-h against another worktree: tree {tree} in c.record"
+        ),
+        format!(
+            "{now} env 500 note missed env-d against this target: env CARGO_PKG_VERSION; libraries pycc-a"
+        ),
+        format!("{now} orphan 200 note missed orphan-e against another worktree: libraries gone-z"),
+    ];
+    lines.extend(
+        (1..=5)
+            .map(|at| format!("{now} x{at} 20 note missed x{at}-f against this target: sources")),
+    );
+    // A later miss of the crate whose build directory holds the tree is a cause again, as in another worktree.
+    lines.push(format!(
+        "{now} pycc 4000 note missed pycc-a against another worktree: tree {tree} in c.record"
+    ));
+    lines.push(format!(
+        "{now} keys 1000 note missed keys-b against another worktree: libraries pycc-a; tree {tree} in c.record"
+    ));
+    fs::write(root.join("log"), lines.join("\n") + "\n").unwrap();
+    let since = ["--since".to_string(), "1d".to_string()];
+    let rows = [
+        "13 misses in the last 24 h took 14.3 s and could be compared with an earlier compile".to_string(),
+        "4 of these 13 missed only because a crate that they use missed first".to_string(),
+        format!(
+            "    13.5 s  pycc   | missed 2 times, because the file c.record in the library folder {tree} differs from the \
+             compile in another worktree"
+        ),
+        "                   | then 3 crates that use it missed 4 times in 5.5 s: jobs, keys, lib".to_string(),
+        "     0.5 s  env    | missed once, because the environment variable CARGO_PKG_VERSION differs and the dependencies \
+         pycc-a differ from the last compile here"
+            .to_string(),
+        "     0.2 s  orphan | missed once, because the dependencies gone-z differ from the compile in another worktree"
+            .to_string(),
+        "     0.0 s  x1     | missed once, because a source or variable that it read differs from the last compile here"
+            .to_string(),
+        "     0.0 s  x2     | missed once, because a source or variable that it read differs from the last compile here"
+            .to_string(),
+        "and 3 more causes took 0.1 s".to_string(),
+    ];
+    assert_eq!(missed::report(&since, &root).unwrap(), format!("{}\n", rows.join("\n")));
+    let all = missed::report(&[], &root).unwrap();
+    assert!(all.lines().nth(4).unwrap().starts_with("     9.0 s  old    | missed once"), "{all}");
+    assert_eq!(
+        missed::report(&["jobs".to_string()], &root).unwrap(),
+        format!(
+            "jobs | missed 0 s ago in 3.0 s, because the dependencies keys-b, pycc-a differ and the file c.record in the \
+             library folder {tree} differs from the compile in another worktree\npycc | missed first and led to this \
+             miss, because the file c.record in the library folder {tree} differs from the compile in another worktree\n"
+        )
+    );
+    assert_eq!(
+        missed::report(&["none".to_string()], &root).unwrap(),
+        "no miss of none in the log could be compared with an earlier compile\n"
+    );
+    assert!(missed::report(&["--since".to_string()], &root).is_none());
+    assert!(missed::report(&["a".to_string(), "b".to_string()], &root).is_none());
+    let stats = stats(&[], &root).unwrap();
+    let rows = "      1       4.0 s  miss         | compiled fresh and cached\n      1       1.0 s  miss session | \
+                compiled from earlier work and cached\n";
+    assert!(stats.starts_with(rows), "{stats}");
+}
+
+#[test]
+fn miss_names_the_file_of_a_link_argument_that_differs() {
+    let fixture = fixture("named-part", "");
+    let store = fixture.root.join("store");
+    let build = |name: &str, object: &[u8]| {
+        let target = fixture.worktree(name, "metadata");
+        let out = target.join("debug/build/foo/run/out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("value.o"), object).unwrap();
+        let link = format!("link-arg={}/value.o", out.display());
+        let linked = ["--crate-type", "bin", "-C", &link].map(str::to_string);
+        fixture.build(&[&fixture.args(&target)[..], &linked].concat(), &store, None).unwrap().0
+    };
+    assert_eq!(build("a", b"\xcf\xfa object 1"), "miss");
+    assert_eq!(build("b", b"\xcf\xfa object 1"), "hit");
+    assert!(notes(&store).is_empty(), "{:?}", notes(&store));
+    assert_eq!(build("c", b"\xcf\xfa object 2"), "miss");
+    let object = format!("{TARGET}debug/build/foo/run/out/value.o");
+    assert_eq!(
+        notes(&store),
+        [format!("note missed foo-abc against another target: named {object}")]
+    );
 }

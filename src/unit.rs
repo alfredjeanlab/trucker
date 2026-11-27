@@ -150,7 +150,7 @@ pub struct Unit {
     /// The working directory, against which a relative path of the arguments or the dep-info resolves.
     pub directory: PathBuf,
     /// The crate name and `-C extra-filename`, which start the name of every output after an optional `lib`.
-    stem: String,
+    pub stem: String,
     externs: Vec<PathBuf>,
     /// Each `-L dependency=` directory, from which rustc loads the crates that the externs depend on.
     search: Vec<PathBuf>,
@@ -170,6 +170,33 @@ pub struct Unit {
     link_paths: Vec<String>,
     /// The directory of the package, from CARGO_MANIFEST_DIR, whose files a proc macro may read without declaring them.
     pub package: Option<PathBuf>,
+}
+
+/// The key of an invocation, as hex, and the [`Parts`] that it was computed from.
+pub struct Key {
+    pub hex: String,
+    pub parts: Parts,
+}
+
+/// The values that each part of a [`Key`] was hashed from, which a miss compares with those of an earlier compile.
+///
+/// A key keeps them rather than hashing each part apart, so that a hit costs nothing more.
+pub struct Parts {
+    /// The output of `rustc -vV`.
+    pub compiler: Vec<u8>,
+    /// The working directory, the arguments and the remap flags, through the placeholders.
+    pub arguments: Vec<String>,
+    /// Each keyed variable, with its value through the placeholders.
+    pub variables: Vec<(String, String)>,
+    pub libraries: Vec<PathBuf>,
+    /// The hash of each of `libraries`, in order.
+    pub hashes: Vec<blake3::Hash>,
+    /// Each tree under the target directory through the placeholders, with the hash that [`hash_tree`] fed.
+    pub trees: Vec<(String, [u8; 32])>,
+    /// Each `-l`, with the hash of the file that it resolves to, if any.
+    pub links: Vec<(String, Option<blake3::Hash>)>,
+    /// Each file or directory that an argument names through the placeholders, with the hash that the key took.
+    pub named: Vec<(String, [u8; 32])>,
 }
 
 /// CARGO_HOME with a trailing slash.
@@ -389,9 +416,8 @@ enum Listed {
 /// A UTF-8 file is hashed through the placeholders of `roots`, because a file such as a pkg-config file names the target
 /// directory, and a key covers that only through its placeholder. The hash is remembered in `memos` under the roots and
 /// the name and [`identity_of`] of every entry, where each file is [`settled`] and keeps its identity while it is
-/// hashed. The key of every dependent lists the tree, which for libwebrtc holds tens of thousands of headers, so each
-/// level of directories is listed on every core. A file is hashed on every core through [`tree_file_hash`], because a
-/// native library such as that of RocksDB takes a gigabyte.
+/// hashed. The key of every dependent lists the tree through [`list_tree`]. A file is hashed on every core through
+/// [`tree_file_hash`], because a native library such as that of RocksDB takes a gigabyte.
 pub fn hash_tree(
     roots: &Roots,
     root: &Path,
@@ -399,31 +425,7 @@ pub fn hash_tree(
     field: &mut impl FnMut(&[u8]),
 ) -> io::Result<()> {
     let start = crate::now() as i64;
-    let list = |directory: &PathBuf| {
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(root.join(directory))? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            let listed = if kind.is_dir() {
-                Listed::Directory
-            } else if kind.is_symlink() {
-                Listed::Link(link_target(roots, &entry.path())?)
-            } else {
-                Listed::File(entry.metadata()?)
-            };
-            entries.push((directory.join(entry.file_name()), listed));
-        }
-        Ok(entries)
-    };
-    let (mut listed, mut level) = (Vec::new(), vec![PathBuf::new()]);
-    while !level.is_empty() {
-        let entries = Vec::from_iter(on_every_core(&level, list)?.into_iter().flatten());
-        let directories = entries.iter().filter(|(_, entry)| matches!(entry, Listed::Directory));
-        level = Vec::from_iter(directories.map(|(path, _)| path.clone()));
-        listed.extend(entries);
-    }
-    // A path sorts by its components, so a directory comes right before its own entries.
-    listed.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let listed = list_tree(roots, root)?;
     let feed = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
         hasher.update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
     };
@@ -473,6 +475,54 @@ pub fn hash_tree(
     }
     field(tree.as_bytes());
     Ok(())
+}
+
+/// Every entry under `root`, by its path relative to `root`, sorted so that a directory comes right before its own
+/// entries.
+///
+/// Each level of directories is listed on every core, because the key of every dependent lists the tree, and that of
+/// libwebrtc holds tens of thousands of headers.
+fn list_tree(roots: &Roots, root: &Path) -> io::Result<Vec<(PathBuf, Listed)>> {
+    let list = |directory: &PathBuf| {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(root.join(directory))? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let listed = if kind.is_dir() {
+                Listed::Directory
+            } else if kind.is_symlink() {
+                Listed::Link(link_target(roots, &entry.path())?)
+            } else {
+                Listed::File(entry.metadata()?)
+            };
+            entries.push((directory.join(entry.file_name()), listed));
+        }
+        Ok(entries)
+    };
+    let (mut listed, mut level) = (Vec::new(), vec![PathBuf::new()]);
+    while !level.is_empty() {
+        let entries = Vec::from_iter(on_every_core(&level, list)?.into_iter().flatten());
+        let directories = entries.iter().filter(|(_, entry)| matches!(entry, Listed::Directory));
+        level = Vec::from_iter(directories.map(|(path, _)| path.clone()));
+        listed.extend(entries);
+    }
+    listed.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(listed)
+}
+
+/// What [`hash_tree`] feeds for each entry under `root`, by its path relative to `root`.
+pub fn tree_entries(
+    roots: &Roots,
+    root: &Path,
+    memos: &Path,
+) -> io::Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+    let listed = list_tree(roots, root)?;
+    let fed = on_every_core(&listed, |(path, entry)| match entry {
+        Listed::Directory => Ok(b"directory".to_vec()),
+        Listed::Link(target) => Ok([b"link ", &target[..]].concat()),
+        Listed::File(_) => Ok(tree_file_hash(roots, &root.join(path), memos)?.as_bytes().to_vec()),
+    })?;
+    Ok(listed.into_iter().map(|(path, _)| path).zip(fed).collect())
 }
 
 /// What [`hash_tree`] feeds for the symlink at `link`.
@@ -997,7 +1047,7 @@ impl Unit {
         normalized
     }
 
-    /// The key of this invocation by `rustc` with `args` in `environment`, as hex.
+    /// The key of this invocation by `rustc` with `args` in `environment`, with what each of its parts came from.
     ///
     /// A crate that only needs metadata is keyed by the `.rmeta` of each dependency, because cargo
     /// starts it while their other files are still being written.
@@ -1007,21 +1057,21 @@ impl Unit {
         args: &[String],
         store: &Path,
         environment: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-    ) -> io::Result<String> {
+    ) -> io::Result<Key> {
         let mut hasher = blake3::Hasher::new();
         let mut field = |bytes: &[u8]| {
             hasher.update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
         };
-        field(&compiler(rustc, store)?);
+        let compiler = compiler(rustc, store)?;
+        field(&compiler);
         if self.roots.worktree.is_some() {
             field(OWN);
         }
-        field(self.roots.normalized(&self.directory.to_string_lossy()).as_bytes());
-        for arg in self.normalized_args(args) {
-            field(arg.as_bytes());
-        }
-        for flag in self.remap() {
-            field(self.roots.normalized(&flag).as_bytes());
+        let mut arguments = vec![self.roots.normalized(&self.directory.to_string_lossy())];
+        arguments.extend(self.normalized_args(args));
+        arguments.extend(self.remap().iter().map(|flag| self.roots.normalized(flag)));
+        for argument in &arguments {
+            field(argument.as_bytes());
         }
         field(b"environment");
         let lossy = |text: std::ffi::OsString| text.to_string_lossy().into_owned();
@@ -1031,9 +1081,11 @@ impl Unit {
         #[cfg(windows)]
         variables.iter_mut().for_each(|(name, _)| name.make_ascii_uppercase());
         variables.sort();
-        for (name, value) in variables.iter().filter(|(name, _)| is_keyed(name)) {
+        variables.retain(|(name, _)| is_keyed(name));
+        for (name, value) in &mut variables {
+            *value = self.roots.normalized(value);
             field(name.as_bytes());
-            field(self.roots.normalized(value).as_bytes());
+            field(value.as_bytes());
         }
         field(b"libraries");
         let metadata_only =
@@ -1057,40 +1109,59 @@ impl Unit {
         }
         libraries.sort();
         libraries.dedup();
-        for (library, hash) in libraries.iter().zip(file_hashes(&libraries, &store.join("hashes"))?)
-        {
+        let hashes = file_hashes(&libraries, &store.join("hashes"))?;
+        for (library, hash) in libraries.iter().zip(&hashes) {
             field(library.file_name().unwrap_or_default().as_encoded_bytes());
             field(hash.as_bytes());
         }
         field(b"trees");
+        let mut trees = Vec::new();
         for tree in &self.trees {
             field(self.roots.normalized(tree).as_bytes());
             if tree.starts_with(&self.roots.target) {
-                hash_tree(&self.roots, Path::new(tree), &store.join("hashes"), &mut field)?;
+                let mut digest = None;
+                let mut fed = |bytes: &[u8]| {
+                    field(bytes);
+                    digest = <[u8; 32]>::try_from(bytes).ok();
+                };
+                hash_tree(&self.roots, Path::new(tree), &store.join("hashes"), &mut fed)?;
+                trees.extend(digest.map(|digest| (self.roots.normalized(tree), digest)));
             }
         }
+        let mut links = Vec::new();
         for link in &self.links {
             field(link.as_bytes());
             let memos = store.join("hashes");
             let library = self.native_library(link).map(|path| remembered_hash(&path, &memos));
             let library = library.transpose()?;
             field(library.as_ref().map_or(b"default".as_slice(), |hash| hash.as_bytes()));
+            links.push((link.clone(), library));
         }
         // The field is left out where no argument names a file, so that the key of such a compile stays as it was.
-        let named = self.named_files();
-        if !named.is_empty() {
+        let paths = self.named_files();
+        if !paths.is_empty() {
             field(b"named");
         }
-        for (path, directory) in &named {
-            field(self.roots.normalized(&path.to_string_lossy()).as_bytes());
+        let mut named = Vec::new();
+        for (path, directory) in &paths {
+            let name = self.roots.normalized(&path.to_string_lossy());
+            field(name.as_bytes());
             let memos = store.join("hashes");
+            let mut digest = None;
+            let mut fed = |bytes: &[u8]| {
+                field(bytes);
+                digest = <[u8; 32]>::try_from(bytes).ok();
+            };
             if *directory {
-                hash_tree(&self.roots, path, &memos, &mut field)?;
+                hash_tree(&self.roots, path, &memos, &mut fed)?;
             } else {
-                field(tree_file_hash(&self.roots, path, &memos)?.as_bytes());
+                fed(tree_file_hash(&self.roots, path, &memos)?.as_bytes());
             }
+            named.extend(digest.map(|digest| (name, digest)));
         }
-        Ok(hasher.finalize().to_hex().to_string())
+        let parts =
+            Parts { compiler, arguments, variables, libraries, hashes, trees, links, named };
+        Ok(Key { hex: hasher.finalize().to_hex().to_string(), parts })
     }
 
     /// The files that an argument names for rustc or the linker to read, marked where one is a search directory.

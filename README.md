@@ -41,8 +41,75 @@ RUSTC_WRAPPER= cargo build      # build without trucker
 trucker gc                      # removes entries that no build has used lately
 trucker gc --all                # empties the cache, but keeps what a running build holds
 trucker stats                   # cache hits, misses and build timers
+trucker missed                  # the causes of misses, ranked by the time that they and their dependents took
+trucker missed <crate>          # why the newest miss of a crate missed
+trucker missed --duplicates     # the crates that workspaces compile again for other features or versions
 trucker --version               # the version, and a hash of the binary that tells two builds apart
 ```
+
+`trucker stats` and `trucker missed` take `--since` with a time in seconds since 1970, or an age such as `90s`, `15m`,
+`2h` or `3d`. A miss is explained against the last compile of the crate with the same arguments in the last few hours.
+
+### What `trucker stats` reports
+
+`trucker stats` prints a line for each outcome in the log, with its count, the total time that trucker took for it, its
+code and a short description. The time is that to restore for a hit, and to compile or run the build script otherwise.
+The share of hits is the hits divided by the hits and misses, so it leaves out what could not be cached.
+
+A rebuild of your own crate, as after an edit, is cached lazily. Trucker records where its outputs lie in the target
+folder that built them, and copies them into the store only once another build asks for them. Most rebuilds are never
+asked for again, so an edit pays for no copy and the store does not grow with it.
+
+| Code | What happened | Next build with the same inputs | What you can do |
+| --- | --- | --- | --- |
+| `hit` | The outputs were restored from the store, and rustc or the build script did not run. | Hits. | Nothing. |
+| `hit waited` | Another build was compiling the same inputs, so this one waited for it and restored its result. | Hits. | Nothing. |
+| `hit promoted` | An earlier rebuild of your crate had left its outputs in its target folder. Trucker copied them into the store, checked them against the hashes recorded at the compile, and restored them. | Hits. | Nothing. |
+| `miss` | Nothing in the cache matched, so rustc or the build script ran and its result was cached. | Hits. | `trucker missed` says what differed from an earlier compile. |
+| `miss session` | Nothing in the cache matched, so rustc ran and its result was cached. Its incremental compile started from the work of an earlier compile, usually in another worktree. | Hits. | `trucker missed` says what differed from an earlier compile. |
+| `miss evicted` | A cached copy no longer matched its hash, as when a tool rewrote it through a hard link, so it was removed and the crate was compiled and cached again. | Hits. | Nothing, unless it repeats because a tool such as `strip` writes outputs in place. |
+| `passthrough rustc-failed` | rustc exited with an error, so nothing was cached. | Compiles. | Fix the error that cargo shows. |
+| `passthrough changed-source` | A source in the worktree changed in the second before the compile or during it, so rustc may have read other contents than trucker hashed. | Compiles. | Nothing, unless a tool writes sources during every build. |
+| `passthrough baked-path` | An output of your crate contains the path of its worktree or target folder, as `env!("CARGO_MANIFEST_DIR")` can leave, which a hit would carry into another worktree. | Compiles. | Keep absolute paths out of the outputs, or accept that the crate compiles in each worktree. |
+| `passthrough baked-slot` | The incremental compile of your crate ran in a folder of the store that other worktrees continue from, and an output named that folder. The crate was compiled again in the worktree. | Compiles, and no longer runs in such a folder. | Nothing. |
+| `passthrough baked-slot-late` | An output of your crate named the folder of the store that it compiled in, after cargo had started its dependents. Trucker failed the build, and the crate no longer compiles in such a folder. | Compiles in the worktree. | Run the build again. |
+| `passthrough dep-info` | The list of sources that rustc writes for cargo could not be rewritten to name the worktree, so the crate was compiled again in the worktree. | Compiles. | Nothing. |
+| `passthrough unkeyed-input` | The crate or its build script read a file whose changes trucker cannot follow, such as one outside the package, the target folder and CARGO_HOME. | Compiles. | Nothing, or move the file into the package. |
+| `passthrough undeclared-input` | Your crate uses the macros of sqlx, which query a database unless `SQLX_OFFLINE` is set and `SQLX_OFFLINE_DIR` is not. | Compiles. | Set `SQLX_OFFLINE=true` and commit the offline data in `.sqlx`. |
+| `passthrough unreadable-read` | A file that an earlier compile read, and that decides which cached result fits, could not be read or hashed. | Compiles. | Check the permissions of the files that the crate reads. |
+| `passthrough unreadable-input` | A file that the lookup hashes, such as the compiler or a library of a dependency, could not be read. | Compiles. | Check the permissions of the toolchain and the target folder. |
+| `passthrough no-source-read` | Your crate read no source in its worktree, as rustc lists them, so trucker cannot tell what its result depends on. | Compiles. | Nothing. |
+| `passthrough no-repository` | Your crate does not lie in a git repository, so trucker cannot tell which worktree it belongs to. | Compiles. | Build inside a git repository. |
+| `passthrough windows-own-crate` | Your crates compile as with plain cargo on Windows. | Compiles. | Nothing. |
+| `passthrough coverage` | Your crate is built with `-C instrument-coverage`, whose paths cargo-llvm-cov matches, so it compiles as with plain rustc. | Compiles. | Nothing. |
+| `passthrough incremental` | A crate that is not your own is compiled incrementally, as `-C incremental` in RUSTFLAGS does, which trucker caches only for your crates. | Compiles. | Set it through the profile or CARGO_INCREMENTAL instead. |
+| `passthrough argument-file` | rustc read its arguments from an `@file`, which trucker does not read. | Compiles. | Nothing. |
+| `passthrough explicit-output` | The arguments name the output file with `-o` rather than cargo's output folder. | Compiles. | Nothing. |
+| `passthrough emit` | The arguments ask for outputs other than those of a build, such as assembly, or leave out the list of sources. | Compiles. | Nothing. |
+| `passthrough no-crate-name` | The arguments do not name the crate with `--crate-name`. | Compiles. | Nothing. |
+| `passthrough no-out-dir` | The arguments do not name an output folder, or a build script runs without `OUT_DIR`. | Compiles. | Nothing. |
+| `passthrough no-target-dir` | The output folder does not lie where cargo puts the outputs of a target folder. | Compiles. | Nothing. |
+| `passthrough escaped-path` | The path of the target folder, CARGO_HOME or the worktree holds a quote, a control character or, outside Windows, a backslash, which rustc escapes in its messages. | Compiles. | Rename the folder. |
+| `passthrough path-spelling` | On Windows, a path can also be spelled another way, as through a `subst` or network drive. | Compiles. | Build from the path of the drive itself. |
+| `passthrough no-working-directory` | The current folder could not be read. | Compiles. | Nothing. |
+| `passthrough other-filesystem` | The store and the target folder lie on different filesystems, so no file can be cloned between them. | Compiles. | Put both on one filesystem, as [requirements](#requirements) says. |
+| `passthrough clone-failed` | The filesystem refused to clone an output into the store. | Compiles. | Check the free space on the disk. |
+| `passthrough store-error` | Trucker could not write into the store, as when the disk is full. | Compiles. | Check the free space on the disk and the permissions of the store. |
+| `passthrough unremovable-output` | An earlier output in the target folder could not be removed. | Compiles. | Check the permissions of the target folder. |
+| `passthrough rustc-not-started` | rustc could not be started. | Compiles. | Check the toolchain. |
+| `passthrough no-stand-in` | Trucker could not put its replay in place of a third-party build script, so cargo ran the script itself. | Runs the script. | Check the free space on the disk. |
+| `passthrough script-not-started` | A build script could not be started. | Runs the script. | Check the target folder. |
+| `passthrough script-failed` | A build script failed. Where trucker had added a prefix map to CFLAGS and CXXFLAGS, the script ran again without it, and nothing was cached. | Runs the script. | Fix the error, where the build fails. |
+| `passthrough binary-output` | A build script printed output that is not UTF-8 text. | Runs the script. | Nothing. |
+| `passthrough binary-target-path` | A build script left the path of the target folder in a binary file, and a run with its output in a fixed folder of the store failed or was ruled out before. | Runs the script, until gc removes the mark after three days. | Nothing. |
+| `passthrough fixed-run-failed` | A build script that leaves its path in a binary failed when it ran with its output in a fixed folder of the store, which keeps that path the same in every worktree. | Runs the script. | Nothing. |
+| `passthrough script-escaped` | A build script that ran with its output in a fixed folder of the store wrote outside that folder, or changed a file that the lookup hashes. | Runs the script. | Nothing. |
+| `passthrough unmovable-output` | The output of a build script that ran in a fixed folder of the store could not be moved into cargo's output folder. | Runs the script. | Check the permissions of the target folder. |
+| `passthrough symlink` | A build script left a symlink in its output folder that names a path outside it and outside the sources of dependencies. | Runs the script. | Nothing. |
+| `passthrough windows-fixed` | On Windows, a build script that leaves its path in a binary cannot run in a fixed folder of the store, because that needs a symlink. | Runs the script. | Nothing. |
+| `passthrough unnormalized-path` | On Windows, the output or messages of a build script spell the path of the target folder in a way that trucker cannot replace. | Runs the script. | Nothing. |
+| `note outside-workspace` | A note after a miss of your crate that is a path dependency outside the workspace root, which cargo names by its absolute path. Such a crate is cached once in each worktree. | Hits in the same worktree. | Move the package under the workspace root. |
+| `note unkept-session` | A note that the incremental work of a compile could not be kept for other worktrees, followed by the kind of error. | Hits. | Check the free space on the disk. |
 
 Trucker automatically decides whether to run `trucker gc` after a miss so it rarely needs to be run by hand.
 Trucker will use up to 10% of the filesystem, between 16 GiB and 100 GiB,

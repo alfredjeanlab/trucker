@@ -11,6 +11,7 @@ mod duplicates;
 mod gc;
 #[cfg(unix)]
 mod lazy;
+mod missed;
 mod script;
 #[cfg(unix)]
 mod session;
@@ -52,6 +53,9 @@ fn main() {
         (Some("stats"), Some(rest)) => {
             print!("{}", stats(&rest, &store_directory()).unwrap_or_else(|| usage()))
         }
+        (Some("missed"), Some(rest)) => {
+            print!("{}", missed::report(&rest, &store_directory()).unwrap_or_else(|| usage()))
+        }
         (Some("gc"), Some(rest)) if rest.is_empty() || rest == ["--all"] => {
             print!("{}", gc::run(&store_directory(), !rest.is_empty(), true))
         }
@@ -83,7 +87,10 @@ fn is_program(word: &str) -> bool {
 fn usage() -> ! {
     eprintln!("usage: RUSTC_WRAPPER=trucker cargo build");
     eprintln!(
-        "       trucker stats [--duplicates] [--since <seconds since 1970, or an age such as 90s, 15m, 2h or 3d>]"
+        "       trucker stats [--since <seconds since 1970, or an age such as 90s, 15m, 2h or 3d>]"
+    );
+    eprintln!(
+        "       trucker missed [--since <a time as stats takes it>] [--duplicates | <crate>]"
     );
     eprintln!("       trucker gc [--all]");
     eprintln!("       trucker --version");
@@ -238,6 +245,7 @@ fn cached(
     }
     let (entries, files) = (store.join("entries"), store::Files::probe(store));
     let key = unit.key(rustc, args, store, env::vars_os()).map_err(|_| "unreadable-input")?;
+    let (key, parts) = (key.hex, key.parts);
     let variant = |started| {
         let reads = fs::read_to_string(store::reads_of(&entries, &key)).unwrap_or_default();
         unit.variant(&key, &reads, started, &store.join("hashes"))
@@ -376,6 +384,15 @@ fn cached(
     };
     if stored.is_ok() {
         install();
+        // The memo names the entry that the reads now stored select, so that a later miss of equal parts and sources
+        // finds that entry gone.
+        let variant =
+            current_entry().and_then(|entry| Some(entry.file_name()?.to_str()?.to_string()));
+        let miss = missed::Miss::of(unit, &parts, &variant.unwrap_or_default());
+        if let Some(note) = miss.note(&unit.stem, &store.join("hashes")) {
+            log(store, crate_name(args), compiling, &note);
+        }
+        miss.remember(&store.join("hashes"));
     } else if stored == Err("clone-failed") {
         notice(store, "notice", "compiles a crate uncached, because its store refused a clone");
     }
@@ -534,20 +551,92 @@ fn since(time: &str) -> Option<u64> {
     time.parse().ok().or_else(|| ages.iter().find_map(|(unit, seconds)| ago(*unit, *seconds)))
 }
 
-/// The count and the total time of each outcome in the log of `store`, then the share of cached invocations that hit
-/// and the cap of the store.
+/// The start of the outcomes that `trucker stats` lists before those of the next start, so that hits come first.
 ///
-/// With `--duplicates` it is the report of [`duplicates::report`] instead. It is `None` where `args` are not valid.
+/// The empty start takes every other outcome, such as a note.
+const ORDER: [&str; 4] = ["hit", "miss", "passthrough ", ""];
+
+/// The plain description of each outcome that the log can hold, which `trucker stats` prints after its code.
+///
+/// The table of README.md describes each one more fully. A note of `note unkept-session` ends with the kind of its
+/// error, which the code keeps.
+const OUTCOMES: &[(&str, &str)] = &[
+    ("hit", "restored from cache"),
+    ("hit waited", "waited for another build, then restored from cache"),
+    ("hit promoted", "cached an earlier rebuild after checking it, then restored"),
+    ("miss", "compiled fresh and cached"),
+    ("miss session", "compiled from earlier work and cached"),
+    ("miss evicted", "compiled and cached again: its cached copy had changed"),
+    ("passthrough rustc-failed", "rustc failed, nothing cached"),
+    ("passthrough changed-source", "compiled, not cached: a source file just changed"),
+    ("passthrough baked-path", "compiled, not cached: output contains this worktree's path"),
+    ("passthrough baked-slot", "compiled twice, not cached: output named a cache folder"),
+    ("passthrough baked-slot-late", "build failed, run it again: output named a cache folder"),
+    ("passthrough dep-info", "compiled twice, not cached: could not rewrite its source list"),
+    ("passthrough unkeyed-input", "ran, not cached: read a file that the cache cannot track"),
+    ("passthrough undeclared-input", "compiled, not cached: sqlx macros can query a database"),
+    ("passthrough unreadable-read", "compiled, not cached: a file that it read is unreadable"),
+    ("passthrough unreadable-input", "ran, not cached: an input is unreadable"),
+    ("passthrough no-source-read", "compiled, not cached: read no source in its worktree"),
+    ("passthrough no-repository", "compiled, not cached: crate is not in a git repository"),
+    ("passthrough windows-own-crate", "compiled, not cached: your crates on Windows"),
+    ("passthrough coverage", "compiled, not cached: built for code coverage"),
+    ("passthrough incremental", "compiled, not cached: a dependency built incrementally"),
+    ("passthrough argument-file", "compiled, not cached: arguments come from a file"),
+    ("passthrough explicit-output", "compiled, not cached: output file named with -o"),
+    ("passthrough emit", "compiled, not cached: asks for outputs that are not cached"),
+    ("passthrough no-crate-name", "compiled, not cached: arguments name no crate"),
+    ("passthrough no-out-dir", "ran, not cached: no output folder given"),
+    ("passthrough no-target-dir", "ran, not cached: output folder is outside cargo's layout"),
+    ("passthrough escaped-path", "compiled, not cached: a path has a quote or control character"),
+    ("passthrough path-spelling", "ran, not cached: Windows can spell a path two ways"),
+    ("passthrough no-working-directory", "ran, not cached: current folder is unreadable"),
+    ("passthrough other-filesystem", "ran, not cached: cache is on another disk"),
+    ("passthrough clone-failed", "ran, not cached: the disk refused to clone a file"),
+    ("passthrough store-error", "ran, not cached: could not write to the cache"),
+    ("passthrough unremovable-output", "ran, not cached: could not remove an old output"),
+    ("passthrough rustc-not-started", "rustc did not start, nothing cached"),
+    ("passthrough no-stand-in", "build script not cached: could not set up its replay"),
+    ("passthrough script-not-started", "build script did not start, nothing cached"),
+    ("passthrough script-failed", "build script failed, nothing cached"),
+    ("passthrough binary-output", "build script ran, not cached: it printed non-text"),
+    ("passthrough binary-target-path", "build script ran, not cached: left its path in a binary"),
+    ("passthrough fixed-run-failed", "build script ran, not cached: failed in a fixed folder"),
+    ("passthrough script-escaped", "build script ran, not cached: wrote outside its folder"),
+    ("passthrough unmovable-output", "build script ran, not cached: could not move its output"),
+    ("passthrough symlink", "build script ran, not cached: left a link that cannot be cached"),
+    ("passthrough windows-fixed", "build script ran, not cached: left its path, on Windows"),
+    (
+        "passthrough unnormalized-path",
+        "build script ran, not cached: a path is spelled another way",
+    ),
+    (
+        "note outside-workspace",
+        "note on a miss: crate outside the workspace is cached per worktree",
+    ),
+    ("note unkept-session", "note on a compile: its work could not be shared with other builds"),
+];
+
+/// The description of `outcome` in [`OUTCOMES`], where it has one.
+fn described(outcome: &str) -> Option<&'static str> {
+    let matches = |code: &str| {
+        outcome == code
+            || code.starts_with("note ")
+                && outcome.strip_prefix(code).is_some_and(|kind| kind.starts_with(' '))
+    };
+    OUTCOMES.iter().find(|(code, _)| matches(code)).map(|(_, description)| *description)
+}
+
+/// The count, the total time, the code and the description of each outcome in the log of `store`, then the share of
+/// the hits and misses that hit, and the cap of the store.
+///
+/// It is `None` where `args` are not valid.
 fn stats(args: &[String], store: &Path) -> Option<String> {
-    let duplicates = args.first().is_some_and(|arg| arg == "--duplicates");
-    let start = match &args[usize::from(duplicates)..] {
+    let start = match args {
         [] => 0,
         [flag, time] if flag == "--since" => since(time)?,
         _ => return None,
     };
-    if duplicates {
-        return Some(duplicates::report(&store.join("entries"), start));
-    }
     let (mut totals, mut text) = (BTreeMap::<String, (u64, u64)>::new(), String::new());
     // The size that the last gc left, with the cap that it applied where its line records one.
     let mut last = None;
@@ -567,20 +656,40 @@ fn stats(args: &[String], store: &Path) -> Option<String> {
             }
         } else if let [time, _, milliseconds, outcome] = fields[..]
             && time.parse::<u64>().is_ok_and(|time| time >= start)
+            && !outcome.starts_with(missed::NOTE)
         {
             let total = totals.entry(outcome.to_string()).or_default();
             *total = (total.0 + 1, total.1 + milliseconds.parse::<u64>().unwrap_or(0));
         }
     }
-    for (outcome, (count, milliseconds)) in &totals {
-        let _ = writeln!(text, "{count:>7} {:>9.1} s  {outcome}", *milliseconds as f64 / 1000.0);
+    let rank = |outcome: &str| ORDER.iter().position(|start| outcome.starts_with(start));
+    let mut rows = Vec::from_iter(&totals);
+    rows.sort_by(|(a, (_, a_time)), (b, (_, b_time))| {
+        rank(a).cmp(&rank(b)).then(b_time.cmp(a_time)).then(a.cmp(b))
+    });
+    let width = rows.iter().map(|(outcome, _)| outcome.len()).max().unwrap_or(0);
+    for (outcome, (count, milliseconds)) in rows {
+        let line = described(outcome).map_or_else(
+            || outcome.to_string(),
+            |description| format!("{outcome:<width$} | {description}"),
+        );
+        let _ = writeln!(text, "{count:>7} {:>9.1} s  {line}", *milliseconds as f64 / 1000.0);
+    }
+    if !totals.is_empty() {
+        let _ = writeln!(
+            text,
+            "Each time is the total that trucker took, to restore for a hit and to compile otherwise."
+        );
     }
     let count = |outcome: &str| totals.get(outcome).map_or(0, |total| total.0);
     let misses = count("miss") + count("miss session") + count("miss evicted");
     let hits = count("hit") + count("hit waited") + count("hit promoted");
     if hits + misses > 0 {
         let share = 100.0 * hits as f64 / (hits + misses) as f64;
-        let _ = writeln!(text, "{share:.1}% of the cached invocations hit");
+        let _ = writeln!(
+            text,
+            "{share:.1}% of the compiles that could be cached were restored from cache (hits {hits}, misses {misses})"
+        );
     }
     let gigabytes = |bytes: u64| bytes as f64 / 1e9;
     let source = |set: bool| {
