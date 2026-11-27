@@ -418,9 +418,9 @@ pub fn collect(
     let records = match swept {
         Some(swept) => swept,
         None => {
-            for path in files_in_shards(&store.join("locks")).filter(|path| older(path, cut)) {
-                if let Some(_lock) = unlocked(&path) {
-                    remove(&path);
+            for lock in files_in_shards(&store.join("locks")).filter(|lock| lock.modified <= cut) {
+                if let Some(_lock) = unlocked(&lock.path) {
+                    remove(&lock.path);
                 }
             }
             trim(&store.join("log"), cut);
@@ -666,11 +666,11 @@ fn sweep(store: &Path, cut: u64, all: bool) -> u64 {
             }
             continue;
         }
-        for path in files_in_shards(&directory) {
-            match fs::symlink_metadata(&path) {
-                Ok(memo) if seconds(memo.modified()) <= cut => remove(&path),
-                Ok(memo) => bytes += allocated(&memo),
-                Err(_) => {}
+        for memo in files_in_shards(&directory) {
+            if memo.modified <= cut {
+                remove(&memo.path);
+            } else {
+                bytes += memo.allocated;
             }
         }
     }
@@ -681,11 +681,10 @@ fn sweep(store: &Path, cut: u64, all: bool) -> u64 {
 ///
 /// A file beside the shards is left by a store from before them, and nothing reads it, so it ages out. A shard is
 /// listed only once the files of the one before it are handled, which keeps a removal within one directory at a time.
-fn files_in_shards(directory: &Path) -> impl Iterator<Item = PathBuf> {
-    let entries = fs::read_dir(directory).into_iter().flatten().flatten();
-    entries.flat_map(|entry| match entry.file_type() {
-        Ok(kind) if kind.is_dir() => children(&entry.path()),
-        _ => vec![entry.path()],
+fn files_in_shards(directory: &Path) -> impl Iterator<Item = usage::Child> {
+    usage::scan(directory).into_iter().flat_map(|child| match child.directory {
+        true => usage::scan(&child.path).into_iter().filter(|file| !file.directory).collect(),
+        false => vec![child],
     })
 }
 

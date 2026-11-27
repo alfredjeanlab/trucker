@@ -9,7 +9,9 @@
 //! APFS it counts all of its blocks, because the private size of a file can lag behind a write.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
+use std::time::UNIX_EPOCH;
 
 /// What shares a [`Piece`] with other files, which no two pieces of different blocks have.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,6 +72,24 @@ impl Piece {
     }
 }
 
+/// What [`scan`] tells of a name in a directory.
+#[derive(Debug)]
+pub struct Child {
+    pub path: PathBuf,
+    pub directory: bool,
+    /// The mtime in seconds since 1970, or 0 where it is not known.
+    pub modified: u64,
+    /// The bytes that [`allocated`] gives, or 0 for a directory.
+    pub allocated: u64,
+}
+
+/// The names in `directory` with what a sweep needs of each, without following a symlink.
+///
+/// macOS lists a directory in bulk, which saves a call for each name.
+pub fn scan(directory: &Path) -> Vec<Child> {
+    platform::scan(directory)
+}
+
 /// The usage of the file or the files under the directory at `path`, without following a symlink.
 pub fn measure(path: &Path) -> Usage {
     let mut usage = Usage::default();
@@ -94,10 +114,29 @@ pub fn allocated(file: &fs::Metadata) -> u64 {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn children(directory: &Path) -> Vec<std::path::PathBuf> {
+fn children(directory: &Path) -> Vec<PathBuf> {
     Vec::from_iter(
         fs::read_dir(directory).into_iter().flatten().flatten().map(|entry| entry.path()),
     )
+}
+
+/// The scan of `directory` from the metadata of each name, where a filesystem cannot list in bulk.
+#[cfg(not(target_os = "macos"))]
+fn scan_one_by_one(directory: &Path) -> Vec<Child> {
+    let list = |path: PathBuf| {
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        let modified =
+            metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok());
+        let directory = metadata.is_dir();
+        let allocated = if directory { 0 } else { allocated(&metadata) };
+        Some(Child {
+            path,
+            directory,
+            modified: modified.map_or(0, |time| time.as_secs()),
+            allocated,
+        })
+    };
+    children(directory).into_iter().filter_map(list).collect()
 }
 
 /// The usage that a file of `links` links, of the identity `inode`, adds where `alone` is its usage as one link.
@@ -113,14 +152,14 @@ fn linked(usage: &mut Usage, inode: u64, links: u64, alone: u64) {
 mod platform {
     //! The walk of APFS, which asks a directory for the clone ids and clone counts of its files in bulk.
 
-    use std::ffi::CString;
+    use std::ffi::{CString, OsStr};
     use std::fs;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::Path;
 
-    use super::{Key, Piece, Usage};
+    use super::{Child, Key, Piece, Usage};
 
     /// The count of the full clones of a file, itself included, which libc does not define.
     const ATTR_CMNEXT_CLONE_REFCNT: u32 = 0x0000_1000;
@@ -148,39 +187,70 @@ mod platform {
                 | libc::ATTR_CMN_FILEID,
             volattr: 0,
             dirattr: 0,
-            fileattr: libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_DATAALLOCSIZE,
+            fileattr: libc::ATTR_FILE_LINKCOUNT
+                | libc::ATTR_FILE_DATALENGTH
+                | libc::ATTR_FILE_DATAALLOCSIZE,
             forkattr: libc::ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_CLONE_REFCNT,
         }
     }
 
-    /// The options of both calls, under which a record holds every attribute, and its mask says which are valid.
-    const OPTIONS: u32 =
-        libc::FSOPT_NOFOLLOW | libc::FSOPT_PACK_INVAL_ATTRS | libc::FSOPT_ATTR_CMN_EXTENDED;
+    /// The attributes that [`scan`] asks for, which leave out the clone ids because they make a listing about eight
+    /// times slower.
+    fn scanned() -> libc::attrlist {
+        libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: libc::ATTR_CMN_RETURNED_ATTRS
+                | libc::ATTR_CMN_NAME
+                | libc::ATTR_CMN_OBJTYPE
+                | libc::ATTR_CMN_MODTIME,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: libc::ATTR_FILE_DATALENGTH | libc::ATTR_FILE_DATAALLOCSIZE,
+            forkattr: 0,
+        }
+    }
 
-    /// The record at the start of `bytes`, whose attributes lie in the order of their bits in [`attributes`].
-    ///
-    /// The offsets follow from that order, with the length and the returned mask first.
-    fn record(bytes: &[u8]) -> Option<Record> {
-        let u32_at = |at: usize| Some(u32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
-        let u64_at = |at: usize| Some(u64::from_ne_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
-        // The length, then the returned mask of five groups, then a reference to the name.
-        let (file_mask, fork_mask) = (u32_at(16)?, u32_at(20)?);
+    /// The options under which a record holds every attribute that it asks for, and its mask says which are valid.
+    const OPTIONS: u32 = libc::FSOPT_NOFOLLOW | libc::FSOPT_PACK_INVAL_ATTRS;
+
+    /// The options of [`attributes`], whose clone ids are extended attributes.
+    const EXTENDED: u32 = OPTIONS | libc::FSOPT_ATTR_CMN_EXTENDED;
+
+    fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    }
+
+    fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
+        Some(u64::from_ne_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+    }
+
+    /// The name and type in a record, which follow its length and the returned mask of five groups.
+    fn named(bytes: &[u8]) -> Option<(Vec<u8>, u32)> {
         let offset = i32::from_ne_bytes(bytes.get(24..28)?.try_into().ok()?);
-        let length = usize::try_from(u32_at(28)?).ok()?;
+        let length = usize::try_from(u32_at(bytes, 28)?).ok()?;
         let start = usize::try_from(24 + offset).ok()?;
         let name = bytes.get(start..start + length)?;
-        let name = name.strip_suffix(&[0]).unwrap_or(name).to_vec();
-        let (kind, inode) = (u32_at(32)?, u64_at(36)?);
-        // A directory has no attributes of a file, which the record leaves out rather than packs.
+        Some((name.strip_suffix(&[0]).unwrap_or(name).to_vec(), u32_at(bytes, 32)?))
+    }
+
+    /// The record of [`attributes`] at the start of `bytes`, whose attributes lie in the order of their bits.
+    ///
+    /// A directory has no attributes of a file, which the record leaves out rather than packs.
+    fn record(bytes: &[u8]) -> Option<Record> {
+        let (name, kind) = named(bytes)?;
+        let inode = u64_at(bytes, 36)?;
         if kind == VDIR {
             return Some(Record { name, kind, inode, links: 1, allocated: 0, clone: None });
         }
-        let (links, allocated) = (u32_at(44)?, u64_at(48)?);
-        let (id, count) = (u64_at(56)?, u32_at(64)?);
+        let (file_mask, fork_mask) = (u32_at(bytes, 16)?, u32_at(bytes, 20)?);
+        let (links, length, blocks) = (u32_at(bytes, 44)?, u64_at(bytes, 48)?, u64_at(bytes, 56)?);
+        let (id, count) = (u64_at(bytes, 64)?, u32_at(bytes, 72)?);
         let all = libc::ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_CLONE_REFCNT;
         let clone = (fork_mask & all == all).then_some((id, u64::from(count)));
         let links = if file_mask & libc::ATTR_FILE_LINKCOUNT != 0 { u64::from(links) } else { 1 };
-        Some(Record { name, kind, inode, links, allocated, clone })
+        // The length is the least that a file counts, as [`super::allocated`] says.
+        Some(Record { name, kind, inode, links, allocated: length.max(blocks), clone })
     }
 
     fn add(usage: &mut Usage, record: &Record) {
@@ -221,7 +291,7 @@ mod platform {
                 (&raw mut list).cast(),
                 buffer.as_mut_ptr().cast(),
                 buffer.len(),
-                OPTIONS,
+                EXTENDED,
             )
         };
         if asked != 0 {
@@ -230,15 +300,19 @@ mod platform {
         record(&buffer)
     }
 
-    /// Adds the files under `path`, reading the records of each directory in bulk, and its subdirectories after it.
+    /// The records that `parse` reads from the names in the directory at `path`, asked for in bulk.
     #[allow(unsafe_code)]
-    fn directory(path: &Path, usage: &mut Usage) {
+    fn bulk<T>(
+        path: &Path,
+        mut list: libc::attrlist,
+        options: u32,
+        parse: impl Fn(&[u8]) -> Option<T>,
+    ) -> Vec<T> {
         let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW;
         let Ok(directory) = fs::OpenOptions::new().read(true).custom_flags(flags).open(path) else {
-            return;
+            return Vec::new();
         };
-        let (mut list, mut buffer) = (attributes(), vec![0u8; 128 * 1024]);
-        let mut below = Vec::new();
+        let (mut buffer, mut records) = (vec![0u8; 128 * 1024], Vec::new());
         loop {
             // SAFETY: the descriptor is an open directory, and the call writes at most the length of the buffer.
             let count = unsafe {
@@ -247,34 +321,51 @@ mod platform {
                     (&raw mut list).cast(),
                     buffer.as_mut_ptr().cast(),
                     buffer.len(),
-                    u64::from(OPTIONS),
+                    u64::from(options),
                 )
             };
             if count <= 0 {
-                break;
+                return records;
             }
             let mut at = 0;
             for _ in 0..count {
-                let Some(length) = buffer.get(at..at + 4).and_then(|length| length.try_into().ok())
-                else {
-                    break;
-                };
-                let length = u32::from_ne_bytes(length) as usize;
-                let record = buffer.get(at..at + length).and_then(record);
+                let Some(length) = u32_at(&buffer, at) else { break };
+                let length = length as usize;
+                records.extend(buffer.get(at..at + length).and_then(&parse));
                 at += length;
-                let Some(record) = record else { continue };
-                match record.kind {
-                    VDIR => below.push(path.join(std::ffi::OsStr::from_bytes(&record.name))),
-                    VREG => add(usage, &record),
-                    // A symlink takes at most the block of its target's name.
-                    _ => usage.own += record.allocated,
-                }
             }
         }
-        drop(directory);
-        for path in below {
-            self::directory(&path, usage);
+    }
+
+    /// Adds the files under `path`, and the files of its subdirectories after them.
+    fn directory(path: &Path, usage: &mut Usage) {
+        let mut below = Vec::new();
+        for record in bulk(path, attributes(), EXTENDED, record) {
+            match record.kind {
+                VDIR => below.push(path.join(OsStr::from_bytes(&record.name))),
+                VREG => add(usage, &record),
+                // A symlink takes at most the block of its target's name.
+                _ => usage.own += record.allocated,
+            }
         }
+        for path in below {
+            directory(&path, usage);
+        }
+    }
+
+    pub fn scan(directory: &Path) -> Vec<Child> {
+        // The mtime is a timespec of seconds and nanoseconds, and the sizes of a file follow it.
+        let child = |bytes: &[u8]| {
+            let (name, kind) = named(bytes)?;
+            let path = directory.join(OsStr::from_bytes(&name));
+            let modified = u64_at(bytes, 36)?;
+            if kind == VDIR {
+                return Some(Child { path, directory: true, modified, allocated: 0 });
+            }
+            let (length, blocks) = (u64_at(bytes, 52)?, u64_at(bytes, 60)?);
+            Some(Child { path, directory: false, modified, allocated: length.max(blocks) })
+        };
+        bulk(directory, scanned(), OPTIONS, child)
     }
 }
 
@@ -322,6 +413,8 @@ mod platform {
         reserved: u32,
         extents: [Extent; EXTENTS],
     }
+
+    pub(super) use super::scan_one_by_one as scan;
 
     pub fn measure(path: &Path, usage: &mut Usage) {
         let clones = clones(path);
@@ -405,6 +498,7 @@ mod platform {
     use std::path::Path;
 
     use super::Usage;
+    pub(super) use super::scan_one_by_one as scan;
 
     pub fn measure(path: &Path, usage: &mut Usage) {
         let Ok(metadata) = fs::symlink_metadata(path) else { return };
@@ -427,6 +521,7 @@ mod platform {
     use std::path::Path;
 
     use super::Usage;
+    pub(super) use super::scan_one_by_one as scan;
 
     pub fn measure(path: &Path, usage: &mut Usage) {
         let Ok(metadata) = fs::symlink_metadata(path) else { return };
