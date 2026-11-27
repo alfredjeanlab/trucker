@@ -2,6 +2,8 @@
 
 README.md says what trucker is, how it is used and configured, and where it runs.
 
+Agents may never add anything to README.md.  README.md must only be authored by humans.
+
     make check    # fmt, clippy with warnings denied, and every test
 
 The repository builds itself through `.cargo/rustc-wrapper`, which runs the installed trucker where there is one and
