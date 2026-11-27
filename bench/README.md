@@ -22,7 +22,8 @@ worktree A and with plain cargo in P, then with trucker in a new worktree B. B a
 sentinel names and build again. A sentinel passes where B's program gives P's output before and after the change, and
 A's output stays the same.
 
-Every sentinel passes with trucker 71d65a6. A passthrough is a compile that trucker left to rustc, with its reason.
+Every sentinel but link-arg passes with trucker 71d65a6, whose run did not include it. link-arg fails with trucker
+6897265 and passes from 2e7329d. A passthrough is a compile that trucker left to rustc, with its reason.
 
 | Sentinel | What it checks | Passthroughs |
 | -------- | -------------- | ------------ |
@@ -32,6 +33,7 @@ Every sentinel passes with trucker 71d65a6. A passthrough is a compile that truc
 | openssl | the `vendored` feature, whose build script bakes its `OUT_DIR` into the outputs | – |
 | cmake | zlib-ng through the cmake crate, which bakes `OUT_DIR` into CMake's cache | – |
 | cxx | an own crate whose build script links headers into `OUT_DIR` through cxx-build, with an edit of the C++ | 3 baked-path |
+| link-arg | an object that a build script compiles into `OUT_DIR` and names only in a link argument, with an edit of its C | – |
 | wasmtime | v50.0.2, whose build scripts generate Cranelift's code, with an edit of the `wasmtime` crate | 8 baked-path, 2 baked-slot |
 | prost | a build script that compiles a `.proto` file, which the edit extends | – |
 | embed | an asset through rust-embed with `debug-embed` and a template through askama | – |

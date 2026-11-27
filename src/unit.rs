@@ -52,6 +52,12 @@ const UNREAD: &[&str] = &[
 /// [`Unit::package_hash`] enters.
 const ROOT_MARKERS: &[&str] = &["Cargo.toml", ".git", "CACHEDIR.TAG"];
 
+/// The codegen and unstable options whose values rustc passes to the linker.
+const LINK_ARGUMENTS: &[&str] = &["link-arg", "link-args", "pre-link-arg", "pre-link-args"];
+
+/// The unstable options whose values name files that rustc reads but leaves out of its dep-info.
+const UNDECLARED_FILES: &[&str] = &["sanitizer-ignorelist", "sanitizer-dataflow-abilist"];
+
 /// How long before its compile started a source of the worktree must have last changed for the compile to be stored.
 ///
 /// It covers a filesystem that keeps mtimes to the second, and a kernel clock that lags the system's.
@@ -154,6 +160,10 @@ pub struct Unit {
     trees: Vec<String>,
     /// The value of each `-l`, such as `z` or `static=foo`.
     links: Vec<String>,
+    /// The value of each option of [`LINK_ARGUMENTS`], where the crate links.
+    link_args: Vec<String>,
+    /// The values that may name a file that rustc reads but leaves out of its dep-info, such as a custom target.
+    undeclared: Vec<String>,
     /// OUT_DIR, of which an entry covers only the files that rustc read.
     generated: Option<String>,
     /// The flags that make a link on macOS leave out the paths of the worktree and the target directory.
@@ -591,21 +601,37 @@ impl Unit {
     ) -> Result<Unit, &'static str> {
         let (mut name, mut extra, mut out_dir, mut emit, mut triple) = (None, "", None, "", None);
         let (mut externs, mut search, mut trees, mut links) = (vec![], vec![], vec![], vec![]);
+        let (mut link_args, mut undeclared) = (vec![], vec![]);
         let (mut linked, mut proc_macro, mut coverage) = (false, false, false);
         let mut rest = args.iter().map(String::as_str);
         while let Some(arg) = rest.next() {
             let (flag, value) = match arg {
-                "-C" | "--codegen" | "-L" | "-l" | "-o" | "--extern" | "--out-dir" | "--emit"
-                | "--crate-name" | "--crate-type" | "--target" => (arg, rest.next().unwrap_or("")),
+                "-C" | "--codegen" | "-Z" | "-L" | "-l" | "-o" | "--extern" | "--out-dir"
+                | "--emit" | "--crate-name" | "--crate-type" | "--target" => {
+                    (arg, rest.next().unwrap_or(""))
+                }
                 _ if arg.starts_with("--") => arg.split_once('=').unwrap_or((arg, "")),
                 _ if arg.starts_with('-') && arg.len() > 1 => arg.split_at(2),
                 _ => ("", arg),
             };
+            let option = value.split_once('=');
             match (flag, value) {
                 ("--crate-name", _) => name = Some(value),
                 ("--out-dir", _) => out_dir = Some(Path::new(value)),
                 ("--emit", _) => emit = value,
-                ("--target", _) => triple = Some(value),
+                ("--target", _) => {
+                    triple = Some(value);
+                    undeclared.push(value.to_string());
+                }
+                ("-C" | "--codegen" | "-Z", _)
+                    if option.is_some_and(|(name, _)| LINK_ARGUMENTS.contains(&name)) =>
+                {
+                    link_args.extend(option.map(|(_, value)| value.to_string()))
+                }
+                ("-Z", _) if option.is_some_and(|(name, _)| UNDECLARED_FILES.contains(&name)) => {
+                    let files = option.map_or("", |(_, files)| files).split(',');
+                    undeclared.extend(files.map(str::to_string))
+                }
                 ("--crate-type", _) => {
                     linked |= !matches!(value, "lib" | "rlib" | "staticlib");
                     proc_macro |= value == "proc-macro";
@@ -686,6 +712,9 @@ impl Unit {
             searched: std::sync::OnceLock::new(),
             trees,
             links,
+            // Only a link reads the arguments of the linker.
+            link_args: if linked { link_args } else { Vec::new() },
+            undeclared,
             generated,
             link_paths,
             package: env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
@@ -1047,7 +1076,77 @@ impl Unit {
             let library = library.transpose()?;
             field(library.as_ref().map_or(b"default".as_slice(), |hash| hash.as_bytes()));
         }
+        // The field is left out where no argument names a file, so that the key of such a compile stays as it was.
+        let named = self.named_files();
+        if !named.is_empty() {
+            field(b"named");
+        }
+        for (path, directory) in &named {
+            field(self.roots.normalized(&path.to_string_lossy()).as_bytes());
+            let memos = store.join("hashes");
+            if *directory {
+                hash_tree(&self.roots, path, &memos, &mut field)?;
+            } else {
+                field(tree_file_hash(&self.roots, path, &memos)?.as_bytes());
+            }
+        }
         Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    /// The files that an argument names for rustc or the linker to read, marked where one is a search directory.
+    ///
+    /// rustc leaves them out of its dep-info, so a key covers them by their contents. A word of a link argument names a
+    /// file as it reads, after `@`, after a flag of one letter, or after its first `=` or `:`. A response file adds its
+    /// own words. A directory counts only after `-L` or `-F` and under the target directory, as the trees do. A path
+    /// that names nothing, or a source of the registry or a git checkout, contributes nothing.
+    fn named_files(&self) -> Vec<(PathBuf, bool)> {
+        let resolved = |text: &str| (!text.is_empty()).then(|| lexical(&self.directory.join(text)));
+        let kept = |path: &PathBuf| !is_third_party(path, &self.roots.cargo_home);
+        let mut named = Vec::from_iter(
+            self.undeclared
+                .iter()
+                .filter_map(|value| resolved(value))
+                .filter(|path| path.is_file() && kept(path))
+                .map(|path| (path, false)),
+        );
+        let (mut pending, mut read) = (self.link_args.clone(), std::collections::HashSet::new());
+        while !pending.is_empty() {
+            let values = std::mem::take(&mut pending);
+            let words = values.iter().flat_map(|value| {
+                let split = value.split(|c: char| c == ',' || c.is_whitespace());
+                // A single argument may hold a path with a space or a comma.
+                split.filter(|word| !word.is_empty()).chain([value.as_str()])
+            });
+            let mut previous = "";
+            for word in words {
+                let after = |separator| word.split_once(separator).map(|(_, rest)| rest);
+                let flag = word.starts_with('-').then(|| word.get(2..)).flatten();
+                let search = word.get(..2).filter(|flag| ["-L", "-F"].contains(flag)).and(flag);
+                let search = search.or(["-L", "-F"].contains(&previous).then_some(word));
+                let directory = search.and_then(resolved).filter(|path| {
+                    path.is_dir() && path.starts_with(&self.roots.target) && kept(path)
+                });
+                named.extend(directory.map(|path| (path, true)));
+                for candidate in [Some(word), flag, after('='), after(':')].into_iter().flatten() {
+                    let path = resolved(candidate).filter(|path| path.is_file() && kept(path));
+                    named.extend(path.map(|path| (path, false)));
+                }
+                let response = word.strip_prefix('@').and_then(resolved);
+                if let Some(path) = response
+                    .filter(|path| path.is_file() && kept(path) && read.insert(path.clone()))
+                {
+                    named.push((path.clone(), false));
+                    let text = fs::read_to_string(&path).unwrap_or_default();
+                    let unquoted =
+                        text.split_whitespace().map(|word| word.trim_matches(['"', '\'']));
+                    pending.extend(unquoted.map(str::to_string));
+                }
+                previous = word;
+            }
+        }
+        named.sort();
+        named.dedup();
+        named
     }
 
     /// The file that the `-l` value `link` names, in the first native search directory that has one.

@@ -2463,6 +2463,109 @@ fn native_library_is_keyed_by_the_file_that_the_search_directories_resolve() {
     assert_ne!(first, fixture.key(&args));
 }
 
+// A build script compiled an object into its OUT_DIR, which is not a search directory, and named it only in a link
+// argument, so a binary that linked the old object was restored after the object changed.
+#[test]
+fn file_that_a_link_argument_names_is_keyed_by_its_contents() {
+    let fixture = fixture("link-arg", "");
+    let key = |name: &str, object: &[u8]| {
+        let target = fixture.worktree(name, "metadata");
+        let out = target.join("debug/build/foo/run/out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("value.o"), object).unwrap();
+        let link = format!("link-arg={}/value.o", out.display());
+        let linked = ["--crate-type", "bin", "-C", &link].map(str::to_string);
+        fixture.key(&[&fixture.args(&target)[..], &linked].concat())
+    };
+    let first = key("first", b"\xcf\xfa object 1");
+    assert_eq!(first, key("second", b"\xcf\xfa object 1"));
+    assert_ne!(first, key("changed", b"\xcf\xfa object 2"));
+}
+
+#[test]
+fn files_that_the_linker_reads_through_any_form_of_its_arguments_are_keyed() {
+    let fixture = fixture("link-forms", "");
+    let target = fixture.worktree("only", "metadata");
+    let out = target.join("debug/build/foo/run/out");
+    fs::create_dir_all(out.join("lib")).unwrap();
+    let file = |name: &str| out.join(name).display().to_string();
+    for name in ["archive.a", "link.x", "version.map", "listed.o", "early.o", "lib/libbar.a"] {
+        fs::write(out.join(name), name).unwrap();
+    }
+    fs::write(out.join("objects.rsp"), format!("\"{}\"\n", file("listed.o"))).unwrap();
+    let linked = [
+        "--crate-type".to_string(),
+        "bin".to_string(),
+        format!("-Clink-args=-Wl,-force_load,{} -T{}", file("archive.a"), file("link.x")),
+        format!("-Clink-arg=-Wl,--version-script={}", file("version.map")),
+        format!("-Clink-arg=@{}", file("objects.rsp")),
+        format!("-Zpre-link-arg={}", file("early.o")),
+        format!("-Clink-arg=-L{}", file("lib")),
+        format!("-Clink-arg=-Wl,-rpath,{}", out.display()),
+    ];
+    let args = [&fixture.args(&target)[..], &linked].concat();
+    let mut key = fixture.key(&args);
+    for name in ["archive.a", "link.x", "version.map", "listed.o", "early.o", "lib/libbar.a"] {
+        fs::write(out.join(name), "changed").unwrap();
+        let changed = fixture.key(&args);
+        assert_ne!(key, changed, "{name} is keyed");
+        key = changed;
+    }
+    fs::write(out.join("unnamed.o"), "beside the named files").unwrap();
+    assert_eq!(key, fixture.key(&args), "the directory of an rpath is not keyed");
+
+    let library = [&fixture.args(&target)[..], &linked[2..]].concat();
+    let rlib = fixture.key(&library);
+    fs::write(out.join("link.x"), "changed again").unwrap();
+    assert_eq!(rlib, fixture.key(&library), "a crate that does not link does not read them");
+}
+
+#[test]
+fn named_file_is_keyed_alike_in_every_worktree_and_only_once_it_exists() {
+    let fixture = fixture("link-script", "");
+    let key = |name: &str, script: bool| {
+        let target = fixture.worktree(name, "metadata");
+        let out = target.join("debug/build/foo/run/out");
+        fs::create_dir_all(&out).unwrap();
+        if script {
+            let text = format!("INCLUDE {}/memory.x\n", out.display());
+            fs::write(out.join("link.x"), text).unwrap();
+        }
+        let link = format!("link-arg=-T{}/link.x", out.display());
+        let linked = ["--crate-type", "bin", "-C", &link].map(str::to_string);
+        fixture.key(&[&fixture.args(&target)[..], &linked].concat())
+    };
+    let first = key("first", true);
+    assert_eq!(
+        first,
+        key("a-worktree-with-a-longer-path", true),
+        "a text file is keyed by placeholder"
+    );
+    let missing = key("missing", false);
+    assert_ne!(first, missing);
+    assert_eq!(missing, key("missing-too", false));
+}
+
+#[test]
+fn custom_target_and_sanitizer_lists_are_keyed_by_their_contents() {
+    let fixture = fixture("custom-target", "");
+    let target = fixture.worktree("only", "metadata");
+    let (spec, list) = (fixture.root.join("board.json"), fixture.root.join("ignored.txt"));
+    fs::write(&spec, "{}").and_then(|()| fs::write(&list, "fun:a")).unwrap();
+    let extra = [
+        "--target".to_string(),
+        spec.display().to_string(),
+        format!("-Zsanitizer-ignorelist={}", list.display()),
+    ];
+    let args = [&fixture.args(&target)[..], &extra].concat();
+    let first = fixture.key(&args);
+    fs::write(&spec, r#"{"arch": "arm"}"#).unwrap();
+    let second = fixture.key(&args);
+    assert_ne!(first, second);
+    fs::write(&list, "fun:b").unwrap();
+    assert_ne!(second, fixture.key(&args));
+}
+
 #[test]
 fn own_crate_is_shared_from_the_repository_of_its_source_wherever_the_target_lies() {
     let fixture = own("repositories");

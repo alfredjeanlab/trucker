@@ -84,7 +84,7 @@ tp() {
 }
 sentinels() {
   bench/sentinel "$root" "$root/sent" "$out/sentinels" sqlx-migrate sqlx rustls rocksdb jemalloc openssl wasmtime \
-    prost embed vergen bevy pyo3 workflows wasm tests cxx cmake
+    prost embed vergen bevy pyo3 workflows wasm tests cxx cmake link-arg
   local status=$?
   if [ "$status" -ne 0 ] || grep -q '"verdict":"fail"' "$out/sentinels/sentinels.jsonl"; then
     echo "SENTINEL FAILURE" >> "$log/drive.log"

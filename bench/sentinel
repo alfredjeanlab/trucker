@@ -148,6 +148,7 @@ change() {
     vergen) fixed_git -C "$dir" commit -q --allow-empty -m "A new commit" ;;
     pyo3) sed -i 's/greeting of the first commit/greeting of the edited worktree/' "$dir/src/lib.rs" ;;
     cxx) sed -i 's/1469598103934665603ull/1469598103934665604ull/' "$dir/src/blob.cc" ;;
+    link-arg) sed -i 's/return 1;/return 2;/' "$dir/src/value.c" ;;
     *) sed -i 's/^fn main() {$/fn main() {\n    println!("edited");/' "$dir/src/main.rs" ;;
   esac
 }

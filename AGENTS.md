@@ -70,8 +70,10 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
     later, which gives each unit a directory of its own. The paths of the target directory,
     CARGO_HOME and the worktree enter a key through placeholders, so two worktrees of one repository compute the same
     key. What rustc names only in its dep-info, such as a source of an own crate or a file of OUT_DIR, selects among
-    the entries of one key. The blind spot, as for cargo, is what a proc macro or build script reads without
-    declaring it, such as a variable, a database, or a file outside the walks that [Own crates](#own-crates) describes.
+    the entries of one key. A file that an argument names for rustc or the linker, such as an object in a link
+    argument, enters by its contents, because rustc leaves it out of its dep-info. The blind spot, as for cargo, is what
+    a proc macro or build script reads without declaring it, such as a variable, a database, or a file outside the
+    walks that [Own crates](#own-crates) describes.
   - `store.rs` owns the entries. An entry is staged in a directory of its own and renamed into place, so a reader
     finds it whole or missing. A miss compiles under the lock of the entry that its inputs select, so a process with
     other sources never waits. A probe finds out once per store whether its filesystem clones, and a copy is renamed
