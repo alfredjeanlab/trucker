@@ -418,16 +418,19 @@ fn store_that_cannot_clone_links_in_and_copies_out_what_its_hash_verifies() {
     assert!(!names.into_iter().any(|name| name.to_string_lossy().ends_with(".trucker")));
     assert_eq!(build(&fourth), Ok(("hit".to_string(), 0)));
 
-    // The cap counts a linked file at its length whoever links it, and the freed space counts only files with one link.
+    // A file of an entry that a worktree links too counts nothing, until a measure finds that link gone.
     let size = collect(u64::MAX).size;
     fs::remove_file(out(&third).join("libfoo-abc.rlib")).unwrap();
-    assert_eq!(collect(u64::MAX).size, size);
+    assert_eq!(collect(u64::MAX).size, size, "a measure holds for an hour");
+    fs::remove_file(store.join("gc.sizes")).unwrap();
+    let rlib = crate::usage::measure(&entry_of(&store).join("libfoo-abc.rlib")).own;
+    assert!(rlib > 0);
+    assert_eq!(collect(u64::MAX).size, size + rlib);
+    let entry = crate::usage::measure(&entry_of(&store));
+    assert_eq!(entry.shared.len(), 1, "the rmeta that the worktree links");
     age(&entry_of(&store), 7200);
     let collected = collect(0);
-    assert_eq!(
-        (collected.entries, size - collected.size - collected.freed),
-        (1, "rmeta".len() as u64)
-    );
+    assert_eq!((collected.entries, collected.freed), (1, entry.own));
 }
 
 /// The only entry of `foo` in `store`.
@@ -1151,8 +1154,7 @@ fn duplicates_are_reported_only_between_workspaces_and_for_features_or_compatibl
         "      1       0.8 s  hit waited",
         "      1       2.0 s  miss",
     ];
-    let counts =
-        format!("{}\n66.7% of the cached invocations hit\nthe store may take", rows.join("\n"));
+    let counts = format!("{}\n66.7% of the cached invocations hit\ncap: ", rows.join("\n"));
     assert!(before.starts_with(&counts), "{before}");
     let features = "--cfg\nfeature=\"std\"\n";
     recorded(&root, "foo\n1.0.0\nengine/target\n3000", features);
@@ -1302,10 +1304,10 @@ fn gc_removes_what_no_build_used_for_three_days_and_keeps_a_hit_entry() {
     assert_eq!(locks, [false, true, true], "a held lock stays");
     assert!(!flat.exists(), "a lock from before the shards ages out");
     let report = stats(&[], &store).unwrap();
-    let (counts, cap) = report.split_at(report.find("the store may take").unwrap());
+    let (counts, cap) = report.split_at(report.find("cap: ").unwrap());
     assert_eq!(counts, "      1       0.0 s  hit\n100.0% of the cached invocations hit\n");
     assert!(
-        cap.ends_with(" GB, computed from its filesystem\n") || cap.contains(gc::SIZE_VARIABLE),
+        cap.ends_with(" GB (from the filesystem)\n") || cap.contains(gc::SIZE_VARIABLE),
         "{cap}"
     );
 }
@@ -1358,7 +1360,7 @@ fn gc_removes_the_least_recently_used_over_the_cap_or_the_free_space_however_rec
     let store = fixture.root.join("store");
     let entry = |name: &str, seconds| {
         let entry = store.join("entries").join(name);
-        fs::create_dir_all(&entry).and_then(|()| fs::write(entry.join("lib"), [0; 1000])).unwrap();
+        fs::create_dir_all(&entry).and_then(|()| fs::write(entry.join("lib"), [0; 4096])).unwrap();
         age(&entry, seconds);
     };
     entry("oldest", 3 * 3600);
@@ -1368,11 +1370,11 @@ fn gc_removes_the_least_recently_used_over_the_cap_or_the_free_space_however_rec
     let collected = gc::collect(&store, 0, size - 1, false, || (10_000, 10_000));
     assert_eq!(
         collected,
-        gc::Collected { entries: 1, slots: 0, freed: 1000, size: size - 1000, next: 0 }
+        gc::Collected { entries: 1, slots: 0, freed: 4096, size: size - 4096, next: 0 }
     );
     assert!(!store.join("entries/oldest").exists() && store.join("entries/older").exists());
     let collected = gc::collect(&store, 0, 0, false, || (10_000, 10_000));
-    assert_eq!((collected.entries, collected.size), (2, size - 3000));
+    assert_eq!((collected.entries, collected.size), (2, size - 3 * 4096));
     assert!(!store.join("entries/recent").exists(), "an entry used half an hour ago");
 
     entry("unused", 2 * 3600);
@@ -1528,13 +1530,13 @@ fn gc_over_its_cap_removes_recent_entries_and_idle_slots_least_recently_used_fir
     let fixture = fixture("gc-recent", "");
     let (store, pool) = (fixture.root.join("store"), fixture.root.join("store/slots/foo"));
     let entry = |name: &str, seconds| {
-        stored(&store, &format!("entries/{name}/lib"), 1000, 0);
+        stored(&store, &format!("entries/{name}/lib"), 4096, 0);
         age(&store.join("entries").join(name), seconds);
     };
     entry("first", 50 * 60);
     entry("third", 20 * 60);
     for (number, minutes) in [("0", 40), ("1", 10), ("2", 5)] {
-        stored(&store, &format!("slots/foo/{number}.slot/lib"), 1000, 0);
+        stored(&store, &format!("slots/foo/{number}.slot/lib"), 4096, 0);
         stored(&store, &format!("slots/foo/{number}.lock"), 0, minutes * 60);
     }
     let held = fs::File::open(pool.join("1.lock")).unwrap();
@@ -1542,16 +1544,16 @@ fn gc_over_its_cap_removes_recent_entries_and_idle_slots_least_recently_used_fir
 
     let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
     // A cap whose target, a tenth below it, needs two items gone.
-    let cap = (0..size).find(|cap| (1001..=2000).contains(&(size - (cap - cap / 10)))).unwrap();
+    let cap = (0..size).find(|cap| (4097..=8192).contains(&(size - (cap - cap / 10)))).unwrap();
     let collected = gc::collect(&store, 0, cap, false, || (100_000, 100_000));
-    let expected = gc::Collected { entries: 1, slots: 1, freed: 2000, size: size - 2000, next: 0 };
+    let expected = gc::Collected { entries: 1, slots: 1, freed: 8192, size: size - 8192, next: 0 };
     assert_eq!(collected, expected, "the entry used 50 minutes ago, then the slot used 40");
     assert!(!store.join("entries/first").exists() && !pool.join("0.slot").exists());
     assert!(store.join("entries/third").exists());
 
     let collected = gc::collect(&store, 0, 0, false, || (100_000, 100_000));
-    assert_eq!((collected.entries, collected.slots, collected.freed), (1, 1, 2000));
-    assert_eq!(collected.size, size - 4000, "the held slot still counts");
+    assert_eq!((collected.entries, collected.slots, collected.freed), (1, 1, 8192));
+    assert_eq!(collected.size, size - 4 * 4096, "the held slot still counts");
     assert!(pool.join("1.slot").exists() && pool.join("1.lock").exists(), "a held slot stays");
     assert!(!store.join("entries/third").exists() && !pool.join("2.slot").exists());
     assert!(collected.next >= crate::now() + 3599, "the held slot keeps the store over its cap");
@@ -1578,16 +1580,16 @@ fn gc_removes_staging_left_by_a_killed_process_only_once_it_is_an_hour_old() {
 fn gc_counts_slots_under_the_cap_and_removes_the_least_recently_used_of_entries_and_slots() {
     let fixture = fixture("gc-slots", "");
     let (store, pool) = (fixture.root.join("store"), fixture.root.join("store/slots/foo"));
-    stored(&store, "entries/old/lib", 1000, 5 * 3600);
+    stored(&store, "entries/old/lib", 4096, 5 * 3600);
     age(&store.join("entries/old"), 5 * 3600);
     for (number, hours) in [("0", 4), ("1", 2), ("2", 3), ("3", 0)] {
-        stored(&store, &format!("slots/foo/{number}.slot/.trucker-libraries/lib"), 1000, 0);
+        stored(&store, &format!("slots/foo/{number}.slot/.trucker-libraries/lib"), 4096, 0);
         stored(&store, &format!("slots/foo/{number}.source"), 0, 0);
         stored(&store, &format!("slots/foo/{number}.lock"), 0, hours * 3600 + 60);
     }
-    stored(&store, "slots/foo/0.session/foo-1x/s-1-2-3/query", 3000, 0);
-    // A library that a slot links counts its share of the links.
-    let library = stored(&fixture.root, "worktree/libbar.rlib", 1000, 0);
+    stored(&store, "slots/foo/0.session/foo-1x/s-1-2-3/query", 12288, 0);
+    // A library that a slot links counts nothing while its worktree links it too.
+    let library = stored(&fixture.root, "worktree/libbar.rlib", 4096, 0);
     fs::hard_link(&library, pool.join("1.slot/.trucker-libraries/libbar.rlib")).unwrap();
     // What a killed run of gc doomed goes at once, whatever its age.
     stored(&store, "entries/doomed.gc/lib", 1000, 0);
@@ -1598,15 +1600,16 @@ fn gc_counts_slots_under_the_cap_and_removes_the_least_recently_used_of_entries_
     let size = gc::collect(&store, 0, u64::MAX, false, || (10_000, 10_000)).size;
     assert!(!store.join("entries/doomed.gc").exists() && !pool.join("3.session.gc").exists());
     let collected = gc::collect(&store, 0, size - 4500, false, || (10_000, 10_000));
-    let expected = gc::Collected { entries: 1, slots: 1, freed: 5000, size: size - 5000, next: 0 };
+    let expected =
+        gc::Collected { entries: 1, slots: 1, freed: 20480, size: size - 20480, next: 0 };
     assert_eq!(collected, expected, "the oldest entry, then the oldest slot");
     assert!(!store.join("entries/old").exists());
     for part in ["0.slot", "0.session", "0.source", "0.lock"] {
         assert!(!pool.join(part).exists(), "{part}");
     }
     let collected = gc::collect(&store, 0, 0, false, || (10_000, 10_000));
-    assert_eq!((collected.slots, collected.freed), (2, 2000), "a held slot stays");
-    assert_eq!(collected.size, size - 5000 - 1500 - 1000, "a linked library counted half");
+    assert_eq!((collected.slots, collected.freed), (2, 8192), "a held slot stays");
+    assert_eq!(collected.size, size - 20480 - 8192, "the linked library counts nothing");
     assert!(pool.join("2.slot").exists() && !pool.join("1.slot").exists() && library.exists());
     assert!(!pool.join("3.slot").exists(), "a slot used in the last minute goes too");
     drop(held);
@@ -1615,42 +1618,43 @@ fn gc_counts_slots_under_the_cap_and_removes_the_least_recently_used_of_entries_
     assert!(!pool.join("2.slot").exists());
 }
 
-// A clone on APFS is a file of its own, so the slots that clone one library counted it once each.
 #[test]
-#[cfg(target_os = "macos")]
-fn gc_counts_the_blocks_that_slots_share_as_clones_once_and_equal_bytes_elsewhere_twice() {
+fn gc_counts_a_clone_that_a_worktree_holds_as_nothing_and_one_that_only_slots_hold_once() {
     let fixture = fixture("gc-clones", "");
     let store = fixture.root.join("store");
     let library = stored(&fixture.root, "worktree/liba.rlib", 8192, 0);
-    let mut manifests = BTreeMap::new();
     for (pool, hours) in [("foo", 3), ("bar", 2), ("baz", 1)] {
         let copy = store.join(format!("slots/{pool}/0.slot/.trucker-libraries/liba.rlib"));
         fs::create_dir_all(copy.parent().unwrap()).unwrap();
         match pool {
             "baz" => fs::write(&copy, vec![0; 8192]).unwrap(),
-            _ => store::clone(&library, &copy).unwrap(),
+            _ if store::clone(&library, &copy).is_ok() => {}
+            _ => return,
         }
-        let (library, copy) = (unit::identity(&library).unwrap(), unit::identity(&copy).unwrap());
-        let extent = session::extent(
-            &store.join(format!("slots/{pool}/0.slot/.trucker-libraries/liba.rlib")),
-        );
-        let line = format!("liba.rlib\t{library}\t{copy}\t{}\n", extent.unwrap());
-        fs::write(store.join(format!("slots/{pool}/0.libraries")), &line).unwrap();
-        manifests.insert(pool, line.len() as u64);
         stored(&store, &format!("slots/{pool}/0.lock"), 0, hours * 3600);
     }
-    let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
-    assert_eq!(
-        size,
-        2 * 8192 + manifests.values().sum::<u64>(),
-        "the clones once and the copy apart"
-    );
+    let collect = |cap| gc::collect(&store, 0, cap, false, || (100_000, 100_000));
+    let size = collect(u64::MAX).size;
+    fs::remove_file(&library).unwrap();
+    assert_eq!(collect(u64::MAX).size, size, "a measure holds for an hour");
+    // A run measures again an eighth of what was measured over an hour before, which is one slot of three.
+    let sizes = fs::read_to_string(store.join("gc.sizes")).unwrap();
+    let aged = sizes.lines().map(|line| {
+        let mut fields = Vec::from_iter(line.split('\t'));
+        if fields.len() > 3 {
+            fields[3] = "0";
+        }
+        fields.join("\t") + "\n"
+    });
+    fs::write(store.join("gc.sizes"), String::from_iter(aged)).unwrap();
+    // On XFS and btrfs the two clones in slots counted once from the start, as FIEMAP does not count holders.
+    let counted = if cfg!(target_os = "macos") { 8192 } else { 0 };
+    assert_eq!(collect(u64::MAX).size, size + counted, "the newest measure counts the clones");
     let held = ["bar", "baz"]
         .map(|pool| fs::File::open(store.join(format!("slots/{pool}/0.lock"))).unwrap());
     held.iter().for_each(|lock| lock.try_lock().unwrap());
-    let collected = gc::collect(&store, 0, 0, false, || (100_000, 100_000));
-    assert_eq!(collected.slots, 1);
-    assert_eq!(collected.size, size - manifests["foo"], "another slot still holds the clone");
+    let collected = collect(0);
+    assert_eq!((collected.slots, collected.freed), (1, 0), "another slot still holds the clone");
 }
 
 #[test]
@@ -1658,21 +1662,21 @@ fn gc_removes_an_entry_that_no_build_hit_for_an_hour_before_what_builds_used_ear
     let fixture = fixture("gc-unhit", "");
     let store = fixture.root.join("store");
     // A stored entry that no build hit has an mtime within a second of its birth, as one aged here does.
-    stored(&store, "entries/unhit/lib", 1000, 0);
+    stored(&store, "entries/unhit/lib", 4096, 0);
     age(&store.join("entries/unhit"), 2 * 3600);
-    stored(&store, "slots/foo/0.slot/lib", 1000, 0);
+    stored(&store, "slots/foo/0.slot/lib", 4096, 0);
     stored(&store, "slots/foo/0.lock", 0, 3 * 3600);
     #[cfg(target_os = "macos")]
     {
         use std::os::macos::fs::FileTimesExt;
-        stored(&store, "entries/hit/lib", 1000, 0);
+        stored(&store, "entries/hit/lib", 4096, 0);
         let born =
             fs::FileTimes::new().set_created(SystemTime::now() - Duration::from_secs(5 * 3600));
         let used = born.set_modified(SystemTime::now() - Duration::from_secs(4 * 3600));
         fs::File::open(store.join("entries/hit")).unwrap().set_times(used).unwrap();
     }
     let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
-    let cap = (0..size).find(|cap| (1..=1000).contains(&(size - (cap - cap / 10)))).unwrap();
+    let cap = (0..size).find(|cap| (1..=4096).contains(&(size - (cap - cap / 10)))).unwrap();
     let collected = gc::collect(&store, 0, cap, false, || (100_000, 100_000));
     assert_eq!((collected.entries, collected.slots), (1, 0));
     assert!(!store.join("entries/unhit").exists() && store.join("slots/foo/0.slot").exists());
@@ -1684,12 +1688,12 @@ fn gc_removes_an_entry_that_no_build_hit_for_an_hour_before_what_builds_used_ear
 fn gc_does_not_prefer_an_entry_that_no_build_hit_but_that_is_younger_than_an_hour() {
     let fixture = fixture("gc-young", "");
     let store = fixture.root.join("store");
-    stored(&store, "entries/young/lib", 1000, 0);
+    stored(&store, "entries/young/lib", 4096, 0);
     age(&store.join("entries/young"), 10 * 60);
-    stored(&store, "slots/foo/0.slot/lib", 1000, 0);
+    stored(&store, "slots/foo/0.slot/lib", 4096, 0);
     stored(&store, "slots/foo/0.lock", 0, 30 * 60);
     let size = gc::collect(&store, 0, u64::MAX, false, || (100_000, 100_000)).size;
-    let cap = (0..size).find(|cap| (1..=1000).contains(&(size - (cap - cap / 10)))).unwrap();
+    let cap = (0..size).find(|cap| (1..=4096).contains(&(size - (cap - cap / 10)))).unwrap();
     let collected = gc::collect(&store, 0, cap, false, || (100_000, 100_000));
     assert_eq!((collected.entries, collected.slots), (0, 1), "the slot used 30 minutes ago");
     assert!(store.join("entries/young").exists());
@@ -1737,10 +1741,10 @@ fn gc_of_all_removes_what_was_used_just_now_but_keeps_held_slots_staging_and_loc
 fn gc_measures_only_the_entries_and_slots_that_changed_since_its_last_run() {
     let fixture = fixture("gc-sizes", "");
     let store = fixture.root.join("store");
-    let entry = stored(&store, "entries/entry/lib", 1000, 0);
-    let idle = stored(&store, "slots/foo/0.slot/lib", 1000, 0);
-    let busy = stored(&store, "slots/foo/1.slot/lib", 1000, 0);
-    let held = stored(&store, "slots/foo/2.slot/lib", 1000, 0);
+    let entry = stored(&store, "entries/entry/lib", 4096, 0);
+    let idle = stored(&store, "slots/foo/0.slot/lib", 4096, 0);
+    let busy = stored(&store, "slots/foo/1.slot/lib", 4096, 0);
+    let held = stored(&store, "slots/foo/2.slot/lib", 4096, 0);
     let lock = stored(&store, "slots/foo/0.lock", 0, 7200);
     let busy_lock = stored(&store, "slots/foo/1.lock", 0, 60);
     let held_lock = fs::File::create(stored(&store, "slots/foo/2.lock", 0, 60)).unwrap();
@@ -1748,20 +1752,20 @@ fn gc_measures_only_the_entries_and_slots_that_changed_since_its_last_run() {
     let size = || gc::collect(&store, 0, u64::MAX, false, || (100, 100)).size;
     let first = size();
     for path in [&entry, &idle, &busy, &held] {
-        fs::write(path, [0; 1500]).unwrap();
+        fs::write(path, [0; 8192]).unwrap();
     }
-    assert_eq!(size(), first + 500, "only a slot that a compile holds is measured again");
+    assert_eq!(size(), first + 4096, "only a slot that a compile holds is measured again");
     age(&busy_lock, 30);
     assert_eq!(
         size(),
-        first + 1000,
+        first + 8192,
         "a slot that a compile took in the last hour is measured again"
     );
     age(&lock, 7000);
-    assert_eq!(size(), first + 1500, "a slot that a compile took is measured again");
+    assert_eq!(size(), first + 12288, "a slot that a compile took is measured again");
     fs::remove_dir_all(entry.parent().unwrap()).unwrap();
-    stored(&store, "entries/entry/lib", 3000, 0);
-    assert_eq!(size(), first + 3500, "an entry stored again under its name is measured again");
+    stored(&store, "entries/entry/lib", 12288, 0);
+    assert_eq!(size(), first + 20480, "an entry stored again under its name is measured again");
 }
 
 #[test]
@@ -1879,7 +1883,18 @@ fn stats_gives_the_size_of_the_store_at_its_last_gc() {
     let store = fixture.root.join("store");
     fs::write(store.join("log"), "100 - 5 gc 1 2 3000000000 4\n101 foo 1 hit\n").unwrap();
     let report = stats(&[], &store).unwrap();
-    assert!(report.contains("the store held 3.0 GB at its last gc, of a cap of "), "{report}");
+    assert!(report.contains("last gc: 3.0 GB of a "), "{report}");
+}
+
+// A cap that cargo's `[env]` sets reaches the gc that a build starts, but not `trucker stats` in a shell.
+#[test]
+fn stats_gives_the_cap_that_the_last_gc_applied() {
+    let fixture = fixture("gc-stats-cap", "");
+    let store = fixture.root.join("store");
+    fs::write(store.join("log"), "100 - 5 gc 1 2 3000000000 4 137438953472 1\n").unwrap();
+    let report = stats(&[], &store).unwrap();
+    let expected = format!("last gc: 3.0 GB of a 137.4 GB cap (from {})", gc::SIZE_VARIABLE);
+    assert!(report.contains(&expected), "{report}");
 }
 
 #[test]
@@ -2727,8 +2742,7 @@ fn carried_compile_runs_in_a_slot_and_names_only_the_worktree_to_cargo_and_the_s
             "a clone of the same contents stays"
         );
         let manifest = fs::read_to_string(linking.replace(".slot", ".libraries")).unwrap();
-        let extent = session::extent(Path::new(&rmeta)).map(|offset| offset.to_string());
-        assert!(manifest.ends_with(&format!("\t{}\n", extent.unwrap_or_default())), "{manifest}");
+        assert!(manifest.ends_with("\t\n"), "{manifest}");
         let library = format!("{libraries}/libdep-def.rmeta");
         fs::remove_file(&library).and_then(|()| fs::write(&library, "rmeta")).unwrap();
         retaken();
@@ -3266,7 +3280,7 @@ fn gc_removes_the_slots_that_no_compile_used_for_three_days_with_their_snapshots
         ("slots/foo/1.session.1", 60),
     ] {
         fs::create_dir_all(store.join(path))
-            .and_then(|()| fs::write(store.join(path).join("lib"), [0; 1000]))
+            .and_then(|()| fs::write(store.join(path).join("lib"), [0; 4096]))
             .unwrap();
         age(&store.join(path), seconds);
     }
@@ -3287,7 +3301,7 @@ fn gc_removes_the_slots_that_no_compile_used_for_three_days_with_their_snapshots
     assert!(!pool.join("0.session.1").exists(), "a snapshot left in staging is removed");
     assert!(pool.join("1.session.1").exists(), "a leftover of the last hour stays");
     let collected = gc::collect(&store, cut, size - 1, false, || (100_000, 100_000));
-    assert_eq!((collected.entries, collected.freed), (1, 1000));
+    assert_eq!((collected.entries, collected.freed), (1, 4096));
     assert!(!store.join("entries/old").exists());
     assert!(pool.join("0.source").exists(), "a record stays with its slot");
     assert!(pool.join("0.session").exists(), "a snapshot stays with its slot");
@@ -3791,4 +3805,26 @@ fn miss_of_an_own_crate_outside_the_workspace_root_is_noted() {
     assert_eq!(note("a/src/lib.rs", true, "miss"), None);
     assert_eq!(note("/repo/other/b/src/lib.rs", true, "hit"), None);
     assert_eq!(note("/home/cargo/registry/src/index/b-1.0.0/src/lib.rs", false, "miss"), None);
+}
+
+#[test]
+fn a_clone_counts_once_where_the_store_holds_all_of_its_clones() {
+    let fixture = fixture("usage-clones", "");
+    let (inside, outside) = (fixture.root.join("inside"), fixture.root.join("outside"));
+    fs::create_dir_all(&inside).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(inside.join("a"), vec![7u8; 1 << 20]).unwrap();
+    if store::clone(&inside.join("a"), &inside.join("b")).is_err() {
+        return;
+    }
+    let usage = crate::usage::measure(&inside);
+    assert_eq!(usage.shared.len(), 2, "{usage:?}");
+    assert!(usage.shared[0].freed_by(2) && usage.shared[0].key == usage.shared[1].key, "{usage:?}");
+    store::clone(&inside.join("a"), &outside.join("c")).unwrap();
+    // FIEMAP does not count the holders of an extent, so on XFS and btrfs two files that share one seem to hold it
+    // alone.
+    let usage = crate::usage::measure(&inside);
+    assert_eq!(usage.shared[0].freed_by(2), !cfg!(target_os = "macos"), "{usage:?}");
+    let usage = crate::usage::measure(&inside.join("a"));
+    assert!(!usage.shared[0].freed_by(1), "{usage:?}");
 }

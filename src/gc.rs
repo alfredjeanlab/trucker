@@ -5,13 +5,14 @@
 //! of its lock, so an mtime is the last use. An entry or a part of a slot is renamed out of reach before it is deleted,
 //! so a build that reads it then falls back as on a miss. Removal never follows a symlink.
 //!
-//! The cap bounds the length of the files of the store. A file beside the entries and slots, such as a memo, counts
-//! its [`allocated`] blocks where they exceed its length. A file of an entry counts whole even where a worktree links
-//! it too, because the removal of that worktree leaves the file to the store. A file of a slot counts its length
-//! divided among its links, and a block that several slot libraries share as [`clones`] counts once. The space reported
-//! as freed counts only files with one link, and on disk it can be less, because clones share blocks.
+//! The cap bounds the bytes that the store takes on disk, as [`crate::usage`] measures them. A block that the store
+//! shares with a file outside it, as an entry shares with the target directory that it was stored from, does not
+//! count. A [`Piece`] that only the store holds counts once, and is freed with the last item that holds it.
+//!
+//! A remembered measure goes stale where a file outside the store stops sharing its blocks, so each run measures
+//! again the [`REFRESH`] share of the items that were measured longest ago.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -25,6 +26,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, io};
 
 use crate::unit::file_hash;
+use crate::usage::{self, Key, Piece, allocated};
 
 /// The age in seconds after which an entry, a record of reads, a lock file or a log line is removed.
 ///
@@ -93,6 +95,13 @@ const SIZES: &str = "gc.sizes";
 /// The name in [`SIZES`] of the time of the last [`SWEEP`] and of the bytes of the records of reads and candidates.
 const RECORDS: &str = "records";
 
+/// The share of the remembered items that a run measures again, oldest measure first, among those measured over an
+/// [`INTERVAL`] before.
+///
+/// A run that a miss starts comes at most once per [`INTERVAL`], so while builds run, a measure is at most about this
+/// many hours old.
+const REFRESH: usize = 8;
+
 /// The interval in seconds between two sweeps of the records of reads, candidates, locks and log.
 ///
 /// It keeps each for at most a day past [`UNUSED_AGE`]. The memos are swept on every run, as [`MEMO_AGE`] is short.
@@ -145,11 +154,16 @@ pub fn run(store: &Path, all: bool, wait: bool) -> String {
         Err(_) => return format!("trucker gc cannot take its lock in {}\n", store.display()),
     };
     let started = Instant::now();
-    let (cap, _) = store_cap(store);
+    let (cap, set) = store_cap(store);
     let cut = crate::now().saturating_sub(UNUSED_AGE);
     let Collected { entries, slots, freed, size, next } =
         collect(store, cut, cap, all, || space(store));
-    crate::log(store, "-", started, &format!("gc {entries} {freed} {size} {slots}"));
+    crate::log(
+        store,
+        "-",
+        started,
+        &format!("gc {entries} {freed} {size} {slots} {cap} {}", u8::from(set)),
+    );
     // The room is what the store may gain before it is over its bounds, after which a miss starts gc.
     let (total, free) = space(store);
     let room = cap.saturating_sub(size).min(free.saturating_sub(total / 100 * FREE_PERCENT));
@@ -201,7 +215,7 @@ pub fn bytes(text: &str) -> Option<u64> {
 ///
 /// Each addition is a line appended to `gc.added`, so concurrent builds do not need a lock.
 pub fn add(store: &Path, path: &Path) {
-    add_bytes(store, size(path, false).0);
+    add_bytes(store, length(path));
 }
 
 /// Adds `bytes` to the bytes that `store` gained since a miss last started gc.
@@ -305,10 +319,12 @@ struct Item {
     bytes: u64,
     /// What [`SIZES`] remembers `bytes` under, where the item cannot change before that does.
     stamp: Option<String>,
+    /// The time in seconds since 1970 at which `bytes` and `shared` were measured.
+    measured: u64,
+    /// The pieces that the item may share with other files, which `bytes` leaves out.
+    shared: Vec<Piece>,
     /// The pool and number of a slot, which is `None` for an entry.
     slot: Option<(PathBuf, String)>,
-    /// The libraries that the slot holds as [`clones`], which `bytes` leaves out.
-    clones: Vec<(String, u64)>,
     spent: bool,
 }
 
@@ -332,15 +348,21 @@ pub fn collect(
     let unused = if all { now } else { cut };
     let mut phase = Phase(Instant::now());
     let known = remembered(store);
-    let measured = |path: &Path, stamp: &Option<String>| {
+    let stale = stale(&known, now);
+    // The remembered measure of an item, unless the item changed or its measure is among the stale.
+    let recalled = |path: &Path, stamp: &Option<String>| {
         let relative = path.strip_prefix(store).unwrap_or(path).to_string_lossy();
-        let known = known.get(&*relative).filter(|(was, _)| Some(was) == stamp.as_ref());
-        known.map(|(_, bytes)| *bytes)
+        let known = known.get(&*relative).filter(|known| Some(&known.stamp) == stamp.as_ref());
+        let known = known.filter(|_| !stale.contains(&*relative));
+        known.map(|known| (known.bytes, known.measured, known.shared.clone()))
     };
+    let fresh = |usage: usage::Usage| (usage.own, now, usage.shared);
+    // What lies beside the items, which no run removes by the order of [`Item`].
+    let mut beside = Vec::new();
     // What builds leave beside the items, such as records of reads, candidates and lock files, lies in directories of
     // tens of thousands of names, so it is swept and counted once per [`SWEEP`].
     let swept =
-        known.get(RECORDS).and_then(|(time, bytes)| Some((time.parse::<u64>().ok()?, *bytes)));
+        known.get(RECORDS).and_then(|known| Some((known.stamp.parse::<u64>().ok()?, known.bytes)));
     let swept = swept.filter(|(time, _)| !all && *time > now.saturating_sub(SWEEP) && *time <= now);
     let mut records = (now, 0);
     // The bytes of what is not an entry or a slot, which each run lists anyway.
@@ -351,11 +373,12 @@ pub fn collect(
         if !name.contains('.') {
             let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
             let stamp = Some(stamp(&path, &metadata));
-            let bytes = measured(&path, &stamp).unwrap_or_else(|| size(&path, false).0);
+            let (bytes, measured, shared) =
+                recalled(&path, &stamp).unwrap_or_else(|| fresh(usage::measure(&path)));
             let (time, spent) =
                 (seconds(metadata.modified()), spent(metadata.created(), metadata.modified(), now));
             let path = path.clone();
-            items.push(Item { time, path, bytes, stamp, slot: None, clones: Vec::new(), spent });
+            items.push(Item { time, path, bytes, stamp, measured, shared, slot: None, spent });
         } else if path.extension() == Some(DOOMED.as_ref()) {
             // Only gc dooms an entry, and this run holds the lock of gc, so the run that doomed it was killed.
             remove(&path);
@@ -387,7 +410,7 @@ pub fn collect(
         if stale {
             remove(&path);
         } else {
-            rest += size(&path, false).0;
+            beside.push(usage::measure(&path));
         }
     }
     let memos = sweep(store, if all { now } else { now.saturating_sub(MEMO_AGE) }, all);
@@ -425,27 +448,28 @@ pub fn collect(
                 // Only gc dooms the parts of a slot, under the lock of gc.
                 Some((_, DOOMED)) => remove(&path),
                 _ if older(&path, abandoned) => remove(&path),
-                _ => rest += size(&path, false).0,
+                _ => beside.push(usage::measure(&path)),
             }
         }
         for (number, (lock, newest)) in slots {
             let time = lock.as_ref().map_or(newest, |lock| seconds(lock.modified()));
             let path = pool.join(&number);
             let part = |kind: &str| pool.join(format!("{number}.{kind}"));
-            // The size leaves out the clones that the manifest of the libraries lists, so it holds while both stay.
-            let listed =
-                nanos(fs::symlink_metadata(part("libraries")).and_then(|file| file.modified()));
-            let stamp = lock.map(|lock| format!("{}.{listed}", nanos(lock.modified())));
-            let clones = clones(&part("libraries"));
-            let own =
-                |bytes: u64| bytes.saturating_sub(clones.iter().map(|(_, length)| length).sum());
-            let measure = || own(SLOT.iter().map(|kind| size(&part(kind), true).0).sum::<u64>());
+            let stamp = lock.map(|lock| nanos(lock.modified()).to_string());
+            let measure = || {
+                let mut sum = usage::Usage::default();
+                for usage in SLOT.iter().map(|kind| usage::measure(&part(kind))) {
+                    sum.own += usage.own;
+                    sum.shared.extend(usage.shared);
+                }
+                fresh(sum)
+            };
             // A slot changes only under its lock, and a compile that takes the lock sets its mtime, so a size measured
             // under the lock holds until the mtime changes. A size measured while a compile holds the lock may be stale,
             // so it counts toward this run but is not remembered, and [`evict`] takes the lock again anyway. A lock
             // without parts, as `wait.lock` is, guards nothing that gc measures, and a slot without a lock has no stamp.
-            let (bytes, stamp) = match measured(&path, &stamp) {
-                Some(bytes) => (bytes, stamp),
+            let ((bytes, measured, shared), stamp) = match recalled(&path, &stamp) {
+                Some(known) => (known, stamp),
                 None if time > abandoned && stamp.is_some() && newest > 0 => {
                     match unlocked(&part("lock")) {
                         Some(_lock) => (measure(), stamp),
@@ -455,7 +479,7 @@ pub fn collect(
                 None => (measure(), stamp),
             };
             let slot = Some((pool.clone(), number));
-            items.push(Item { time, path, bytes, stamp, slot, clones, spent: false });
+            items.push(Item { time, path, bytes, stamp, measured, shared, slot, spent: false });
         }
     }
     phase.end("listed the slots");
@@ -476,19 +500,29 @@ pub fn collect(
         {
             remove(&path);
         }
-        rest += size(&path, false).0;
+        beside.push(usage::measure(&path));
     }
     // The file of the sizes does not count, so that a run sees the size that the last one left.
     let files = children(store).into_iter().filter(|path| !path.ends_with(SIZES));
     let files = files.filter_map(|path| fs::symlink_metadata(path).ok());
     rest += files.filter(fs::Metadata::is_file).map(|file| allocated(&file)).sum::<u64>();
     items.sort_by_key(|item| (!item.spent, item.time));
-    // The slots that hold each block as a clone, and its length, which counts until the last of them goes.
-    let mut holders = HashMap::<String, (usize, u64)>::new();
-    for (extent, length) in items.iter().flat_map(|item| &item.clones) {
-        holders.entry(extent.clone()).or_insert((0, *length)).0 += 1;
+    rest += beside.iter().map(|usage| usage.own).sum::<u64>();
+    let beside = beside.iter().flat_map(|usage| usage.shared.iter().map(|piece| (now, piece)));
+    let pieces =
+        items.iter().flat_map(|item| item.shared.iter().map(|piece| (item.measured, piece)));
+    // The holders in the store of each piece, as its newest measure counts them, where the store holds all of it. Such
+    // a piece counts until the last of them goes.
+    let mut holders = HashMap::<Key, (u64, u64, Piece)>::new();
+    for (measured, piece) in pieces.chain(beside) {
+        let (held, newest, kept) = holders.entry(piece.key).or_insert((0, measured, *piece));
+        *held += 1;
+        if measured > *newest {
+            (*newest, *kept) = (measured, *piece);
+        }
     }
-    let shared = holders.values().map(|(_, length)| length).sum::<u64>();
+    holders.retain(|_, (held, _, piece)| piece.freed_by(*held));
+    let shared = holders.values().map(|(_, _, piece)| piece.bytes).sum::<u64>();
     let size = rest + memos + records.1 + shared + items.iter().map(|item| item.bytes).sum::<u64>();
     let mut collected = Collected { entries: 0, slots: 0, freed: 0, size, next: 0 };
     let (total, mut free) = space();
@@ -500,18 +534,19 @@ pub fn collect(
     for item in items {
         // An item that a compile holds stays, because [`evict`] does not take a lock that another process holds.
         let due = all || item.time <= cut || short(collected.size, free);
-        if let Some(unlinked) = due.then(|| evict(&item)).flatten() {
+        if due && evict(&item) {
             *if item.slot.is_some() { &mut collected.slots } else { &mut collected.entries } += 1;
-            collected.freed += unlinked;
-            collected.size = collected.size.saturating_sub(item.bytes);
-            for (extent, _) in &item.clones {
-                if let Some((slots, length)) = holders.get_mut(extent) {
-                    *slots -= 1;
-                    if *slots == 0 {
-                        collected.size = collected.size.saturating_sub(*length);
+            let mut freed = item.bytes;
+            for piece in &item.shared {
+                if let Some((held, _, piece)) = holders.get_mut(&piece.key) {
+                    *held -= 1;
+                    if *held == 0 {
+                        freed += piece.bytes;
                     }
                 }
             }
+            collected.freed += freed;
+            collected.size = collected.size.saturating_sub(freed);
             if free < floor.saturating_add(margin) {
                 free = space().1;
             }
@@ -519,7 +554,9 @@ pub fn collect(
         }
         if let Some(stamp) = &item.stamp {
             let relative = item.path.strip_prefix(store).unwrap_or(&item.path).to_string_lossy();
-            let _ = writeln!(sizes, "{relative}\t{stamp}\t{}", item.bytes);
+            let shared = Vec::from_iter(item.shared.iter().map(Piece::word)).join(" ");
+            let _ =
+                writeln!(sizes, "{relative}\t{stamp}\t{}\t{}\t{shared}", item.bytes, item.measured);
         }
     }
     for pool in &pools {
@@ -534,20 +571,6 @@ pub fn collect(
         fs::write(&staging, sizes).and_then(|()| crate::store::rename(&staging, store.join(SIZES)));
     phase.end(&format!("removed {} entries and {} slots", collected.entries, collected.slots));
     collected
-}
-
-/// The clones that the libraries manifest at `path` lists with an extent, each by that extent and with its length.
-///
-/// Clones that start at one extent share their blocks, so the slots that hold them count their length once. A clone
-/// without an extent, or a manifest in another format, counts whole.
-fn clones(path: &Path) -> Vec<(String, u64)> {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    let line = |line: &str| {
-        let [_, _, clone, extent] = Vec::from_iter(line.split('\t'))[..] else { return None };
-        let length = clone.split(' ').nth(2)?.parse().ok()?;
-        (!extent.is_empty()).then(|| (format!("{extent} {length}"), length))
-    };
-    text.lines().filter_map(line).collect()
 }
 
 /// Whether no build has hit an entry of these birth and modification times since it was stored over [`UNHIT_AGE`]
@@ -602,31 +625,30 @@ impl Phase {
     }
 }
 
-/// Removes `item` unless its lock is taken, and returns the bytes of its files that had one link.
+/// Removes `item` unless its lock is taken, and returns whether it did.
 ///
 /// Each part is renamed out of reach first, because a compile uses the snapshot of a slot without a check, so a killed
 /// run must not leave part of one. The next run removes what such a run left.
-fn evict(item: &Item) -> Option<u64> {
+fn evict(item: &Item) -> bool {
     let Some((pool, number)) = &item.slot else {
         let doomed = item.path.with_extension(DOOMED);
-        crate::store::rename(&item.path, &doomed).ok()?;
-        let unlinked = size(&doomed, false).1;
+        if crate::store::rename(&item.path, &doomed).is_err() {
+            return false;
+        }
         remove(&doomed);
-        return Some(unlinked);
+        return true;
     };
     let lock = pool.join(format!("{number}.lock"));
-    let _lock = unlocked(&lock)?;
-    let mut unlinked = 0;
+    let Some(_lock) = unlocked(&lock) else { return false };
     for kind in SLOT {
         let part = pool.join(format!("{number}.{kind}"));
         let doomed = pool.join(format!("{number}.{kind}.{DOOMED}"));
         if crate::store::rename(&part, &doomed).is_ok() {
-            unlinked += size(&doomed, true).1;
             remove(&doomed);
         }
     }
     remove(&lock);
-    Some(unlinked)
+    true
 }
 
 /// Removes the memos of `store` that were written before `cut`, and returns the bytes of those that stay.
@@ -667,30 +689,47 @@ fn files_in_shards(directory: &Path) -> impl Iterator<Item = PathBuf> {
     })
 }
 
-/// The bytes that `file` takes on disk, which exceed its length where it is smaller than a block.
+/// What [`SIZES`] remembers of an item, or of the records under [`RECORDS`].
+struct Known {
+    /// What the measure holds for, or the time of the last [`SWEEP`] for the records.
+    stamp: String,
+    bytes: u64,
+    measured: u64,
+    shared: Vec<Piece>,
+}
+
+/// What [`SIZES`] remembers of each item by its path in the store.
 ///
-/// A memo of 32 bytes takes a block of 4 KiB on APFS, ext4 and XFS. A filesystem that keeps a small file in its
-/// metadata, as btrfs does, allocates no block to it, so the length is the least that a file counts.
-#[cfg(unix)]
-fn allocated(file: &fs::Metadata) -> u64 {
-    file.len().max(file.blocks() * 512)
-}
-
-/// The length of `file`, because NTFS keeps a small file within its record in the master file table.
-#[cfg(windows)]
-fn allocated(file: &fs::Metadata) -> u64 {
-    file.len()
-}
-
-/// The size of each item that [`SIZES`] remembers by its path in the store, with the stamp that it holds for.
-fn remembered(store: &Path) -> HashMap<String, (String, u64)> {
+/// A line of an item has the stamp, the bytes, the time of the measure and the pieces, and the line of [`RECORDS`]
+/// only the first two. A line of an item without the time of its measure counted lengths, so it is not remembered.
+fn remembered(store: &Path) -> HashMap<String, Known> {
     let text = fs::read_to_string(store.join(SIZES)).unwrap_or_default();
     let line = |line: &str| {
         let mut fields = line.split('\t');
         let (path, stamp) = (fields.next()?.to_string(), fields.next()?.to_string());
-        Some((path, (stamp, fields.next()?.parse().ok()?)))
+        let bytes = fields.next()?.parse().ok()?;
+        let measured = match fields.next() {
+            Some(time) => time.parse().ok()?,
+            None if path == RECORDS => 0,
+            None => return None,
+        };
+        let words = fields.next().unwrap_or_default().split(' ').filter(|word| !word.is_empty());
+        let shared = words.map(Piece::parse).collect::<Option<_>>()?;
+        Some((path, Known { stamp, bytes, measured, shared }))
     };
     text.lines().filter_map(line).collect()
+}
+
+/// The paths of the remembered items that a run at `now` measures again.
+///
+/// They are the [`REFRESH`] share of the items that were measured longest ago, among those measured over an
+/// [`INTERVAL`] before.
+fn stale(known: &HashMap<String, Known>, now: u64) -> HashSet<&str> {
+    let mut items = Vec::from_iter(known.iter().filter(|(path, _)| *path != RECORDS));
+    let share = items.len().div_ceil(REFRESH);
+    items.retain(|(_, known)| known.measured.saturating_add(INTERVAL) <= now);
+    items.sort_by_key(|(path, known)| (known.measured, *path));
+    items.into_iter().take(share).map(|(path, _)| path.as_str()).collect()
 }
 
 /// What tells an entry from another that a later build stores under its name, which is its inode and birth time.
@@ -747,26 +786,12 @@ fn children(directory: &Path) -> Vec<PathBuf> {
     )
 }
 
-/// The length of the files under `path`, and of those with one link.
-///
-/// Where `shared`, a file with several links counts its length divided among them, as a library that a slot links
-/// counts once across the slots and the worktree that link it.
-fn size(path: &Path, shared: bool) -> (u64, u64) {
+/// The length of the files under `path`, which is what a new entry may take once nothing else shares its blocks.
+fn length(path: &Path) -> u64 {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => children(path).iter().fold((0, 0), |sum, child| {
-            let size = size(child, shared);
-            (sum.0 + size.0, sum.1 + size.1)
-        }),
-        Ok(metadata) => {
-            #[cfg(unix)]
-            let links = metadata.nlink().max(1);
-            #[cfg(windows)]
-            let links = crate::windows::information(path, false)
-                .map_or(1, |(_, _, links, _)| u64::from(links.max(1)));
-            let length = metadata.len();
-            (if shared { length / links } else { length }, if links > 1 { 0 } else { length })
-        }
-        _ => (0, 0),
+        Ok(metadata) if metadata.is_dir() => children(path).iter().map(|child| length(child)).sum(),
+        Ok(metadata) => metadata.len(),
+        Err(_) => 0,
     }
 }
 

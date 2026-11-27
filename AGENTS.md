@@ -85,12 +85,16 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
   - `gc.rs` removes what no build has used for three days, then the entries and slots while the store is within a
     tenth of its cap, however recently used. An entry that no build hit and that is over an hour old goes first, and
     the rest go least recently used first. A hit sets the mtime, so an entry whose mtime is within a second of its
-    birth time was never hit. Only a slot that a compile holds stays, and a run reads
-    remembered sizes rather than walking the store. Staging counts as abandoned once it is an hour old, so
-    `trucker gc --all` keeps younger staging, the lock files and the log. It removes each directory of memos whole,
-    without reading the metadata of each memo. A memo or another small file beside the items counts the blocks that it
-    takes, which can be 128 times its length. Every run removes the memos that are four hours old, even those that a
-    build read since, because most name a library that a later build replaced, and a live memo costs one hash.
+    birth time was never hit. Only a slot that a compile holds stays, and a run reads remembered sizes rather than
+    walking the store. It measures again an eighth of them, those measured longest ago, because a size changes where a
+    worktree stops sharing a block. Staging counts as abandoned once it is an hour old, so `trucker gc --all` keeps
+    younger staging, the lock files and the log. It removes each directory of memos whole, without reading the
+    metadata of each memo. A memo or another small file beside the items counts the blocks that it takes, which can be
+    128 times its length. Every run removes the memos that are four hours old, even those that a build read since,
+    because most name a library that a later build replaced, and a live memo costs one hash.
+  - `usage.rs` measures the disk that files take, as their removal would free it. A block that a worktree shares
+    counts nothing, and one that only the store holds counts once. APFS reports clone counts, and FIEMAP reports
+    shared extents on XFS and btrfs.
   - `duplicates.rs` is the report of `trucker stats --duplicates`.
   - `windows.rs` holds the Windows twins of the Unix system calls, and `windows_scan.rs` the scan for baked paths on
     Windows, which the tests run everywhere.
@@ -176,8 +180,7 @@ worktree's in the arguments and the environment.
     worktree and marked so that its crate is not carried again.
   - cargo receives no line of stderr twice, because it panics at a second artifact notification.
   - A carried compile that links reads its libraries in the slot. Linux hard-links them, so that worktrees share
-    their page cache, and macOS clones them. `<number>.libraries` lists the extent of each clone, so gc counts a block
-    that slots share once.
+    their page cache, and macOS clones them.
 
 A compile is not carried where cargo runs rustc from outside the worktree, where the target directory lies outside it,
 or under local ThinLTO, which rewrites the previous session in place.

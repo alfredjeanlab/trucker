@@ -19,6 +19,7 @@ mod store;
 #[cfg(unix)]
 mod tests;
 mod unit;
+mod usage;
 #[cfg(windows)]
 mod windows;
 #[cfg(any(windows, test))]
@@ -548,13 +549,22 @@ fn stats(args: &[String], store: &Path) -> Option<String> {
         return Some(duplicates::report(&store.join("entries"), start));
     }
     let (mut totals, mut text) = (BTreeMap::<String, (u64, u64)>::new(), String::new());
-    let mut size = None;
+    // The size that the last gc left, with the cap that it applied where its line records one.
+    let mut last = None;
     for line in fs::read_to_string(store.join("log")).unwrap_or_default().lines() {
         let fields = Vec::from_iter(line.splitn(4, ' '));
         if let [_, _, _, outcome] = fields[..]
             && let Some(collected) = outcome.strip_prefix("gc ")
         {
-            size = collected.split(' ').nth(2).and_then(|size| size.parse::<u64>().ok()).or(size);
+            let numbers =
+                Vec::from_iter(collected.split(' ').map(|field| field.parse::<u64>().ok()));
+            if let Some(&Some(size)) = numbers.get(2) {
+                let applied = match numbers.get(4..6) {
+                    Some(&[Some(cap), Some(set)]) => Some((cap, set == 1)),
+                    _ => None,
+                };
+                last = Some((size, applied));
+            }
         } else if let [time, _, milliseconds, outcome] = fields[..]
             && time.parse::<u64>().is_ok_and(|time| time >= start)
         {
@@ -572,22 +582,27 @@ fn stats(args: &[String], store: &Path) -> Option<String> {
         let share = 100.0 * hits as f64 / (hits + misses) as f64;
         let _ = writeln!(text, "{share:.1}% of the cached invocations hit");
     }
-    let (cap, set) = gc::store_cap(store);
-    let source = if set {
-        format!("as {} sets", gc::SIZE_VARIABLE)
-    } else {
-        "computed from its filesystem".to_string()
-    };
     let gigabytes = |bytes: u64| bytes as f64 / 1e9;
-    let _ = match size {
-        Some(size) => writeln!(
-            text,
-            "the store held {:.1} GB at its last gc, of a cap of {:.1} GB {source}, both counting the length of its \
-             files, which clones may share",
-            gigabytes(size),
-            gigabytes(cap)
-        ),
-        None => writeln!(text, "the store may take {:.1} GB, {source}", gigabytes(cap)),
+    let source = |set: bool| {
+        if set { format!("from {}", gc::SIZE_VARIABLE) } else { "from the filesystem".to_string() }
+    };
+    // A build may set the cap through the environment of cargo, which this process does not see, so the cap of the
+    // last gc is the one that applies.
+    let _ = match last {
+        Some((size, applied)) => {
+            let (cap, set) = applied.unwrap_or_else(|| gc::store_cap(store));
+            writeln!(
+                text,
+                "last gc: {:.1} GB of a {:.1} GB cap ({})",
+                gigabytes(size),
+                gigabytes(cap),
+                source(set)
+            )
+        }
+        None => {
+            let (cap, set) = gc::store_cap(store);
+            writeln!(text, "cap: {:.1} GB ({})", gigabytes(cap), source(set))
+        }
     };
     Some(text)
 }

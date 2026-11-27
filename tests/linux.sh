@@ -2,7 +2,7 @@
 # The Linux path, run inside a local VM whose root is ext4: `limactl shell <vm> bash tests/linux.sh`.
 #
 # Worktrees and the store live on /work, an XFS filesystem in a file on the root disk, where files clone. The unit
-# tests run there, then two copies of one workspace, each its own git worktree, are built with a shared store. At the
+# tests run there and on btrfs, then two copies of one workspace, each its own git worktree, are built with a shared store. At the
 # end the store is put on another filesystem, which must say so once, then on ext4 with two workspaces, which cannot
 # clone and so must store by hard link, restore by copy and carry a session by hard link.
 set -euo pipefail
@@ -19,8 +19,18 @@ fi
 rm -rf /work/tmp /work/e2e /work/cache /work/concurrent "$HOME"/e2e-ext4* "$HOME/cache-ext4"
 mkdir -p /work/tmp /work/e2e
 
+if ! findmnt -n -t btrfs /work-btrfs > /dev/null; then
+    sudo truncate -s 4G /var/lib/work-btrfs.img
+    sudo mkfs.btrfs -q -f /var/lib/work-btrfs.img
+    sudo mkdir -p /work-btrfs
+    sudo mount -o loop /var/lib/work-btrfs.img /work-btrfs
+    sudo chown "$(id -u):$(id -g)" /work-btrfs
+fi
+rm -rf /work-btrfs/tmp && mkdir -p /work-btrfs/tmp
+
 export CARGO_TARGET_DIR=/work/trucker-target
 (cd "$here" && TMPDIR=/work/tmp cargo test --release --quiet 2> /dev/null)
+(cd "$here" && TMPDIR=/work-btrfs/tmp cargo test --release --quiet 2> /dev/null)
 (cd "$here" && cargo build --release --quiet)
 wrapper=$CARGO_TARGET_DIR/release/trucker
 unset CARGO_TARGET_DIR
@@ -70,15 +80,21 @@ expect "misses of two concurrent builds" "$(outcomes /work/concurrent miss)" "$m
 
 # gc keeps what the builds used. Entries unused for four days go, and the next build compiles them again. A miss
 # started a gc in the background, which may still hold the lock.
-collect() {
+report() {
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         out=$(XDG_CACHE_HOME=/work/cache "$wrapper" gc)
         [[ $out == removed* ]] && break
         sleep 1
     done
-    echo "$out" | cut -d' ' -f2
+    echo "$out"
 }
+collect() { report | cut -d' ' -f2; }
 expect "entries removed by gc after two builds" "$(collect)" 0
+# The entries share their blocks with the target directories, so the store counts far less than their length.
+taken=$(report | sed -n 's/.*store is now \([0-9.]*\) MB.*/\1/p')
+length=$(du -s --apparent-size -B1 /work/cache/trucker/entries | cut -f1)
+awk -v taken="$taken" -v bytes="$length" 'BEGIN { exit !(taken * 1e6 < bytes / 2) }' ||
+    { echo "FAILED: the store counts $taken MB of entries $length bytes long"; exit 1; }
 find /work/cache/trucker/entries /work/cache/trucker/scripts -mindepth 1 -maxdepth 1 -exec touch -h -d '4 days ago' {} +
 removed=$(collect)
 [ "$removed" -gt 0 ] || { echo "FAILED: gc removed no entry unused for four days"; exit 1; }

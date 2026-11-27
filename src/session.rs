@@ -255,8 +255,8 @@ impl Slot {
     /// the clone and its own after, and a clone stays only where both match again.
     /// A library is listed only where its ctime was over a second old before it was read, because a write in the same
     /// tick of a coarse clock would leave its identity alone. The file is removed while the libraries change, and the
-    /// libraries are removed where it is missing. A clone is also listed with its [`extent`], by which gc counts the
-    /// blocks that clones share once.
+    /// libraries are removed where it is missing. A fourth field is left empty, and only a manifest that has it is
+    /// read.
     /// A clone also stays where its remembered hash matches that of its library, as after a new worktree restores the
     /// libraries, because a new clone is read from disk again.
     fn share_libraries(&self, args: &[String]) -> io::Result<Vec<PathBuf>> {
@@ -290,14 +290,7 @@ impl Slot {
             if file.ctime().saturating_add(1) >= started {
                 return Ok(String::new());
             }
-            let extent = extent(copy).filter(|_| !self.links_libraries());
-            let extent = extent.map(|offset| offset.to_string()).unwrap_or_default();
-            Ok(format!(
-                "{}\t{}\t{}\t{extent}\n",
-                name.display(),
-                identity_of(file),
-                identity(copy)?
-            ))
+            Ok(format!("{}\t{}\t{}\t\n", name.display(), identity_of(file), identity(copy)?))
         };
         for directory in directories {
             fs::create_dir_all(libraries.join(directory))?;
@@ -652,25 +645,6 @@ impl Slot {
             .and_then(|()| fs::create_dir_all(&self.sessions))
             .and_then(|()| fs::write(self.sessions.join(SLOT), self.number.to_string()))
     }
-}
-
-/// The offset on its device of the first block of the file at `path`, which its clones share until one is written.
-///
-/// It is `None` where the filesystem does not tell it, as on a platform other than macOS.
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-pub fn extent(path: &Path) -> Option<u64> {
-    use std::os::fd::AsRawFd;
-    let file = fs::File::open(path).ok()?;
-    let mut place = libc::log2phys { l2p_flags: 0, l2p_contigbytes: 1, l2p_devoffset: 0 };
-    // SAFETY: the descriptor is an open file, and the command writes only the struct that it is given.
-    let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_LOG2PHYS_EXT, &mut place) };
-    (asked == 0).then(|| u64::try_from(place.l2p_devoffset).ok()).flatten()
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn extent(_: &Path) -> Option<u64> {
-    None
 }
 
 /// Hard-links `library` to `copy`, and remembers for the link the hash that `memos` hold for the library.

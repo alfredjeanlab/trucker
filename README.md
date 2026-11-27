@@ -47,6 +47,7 @@ trucker --version               # the version, and a hash of the binary that tel
 Trucker automatically decides whether to run `trucker gc` after a miss so it rarely needs to be run by hand.
 Trucker will use up to 10% of the filesystem, between 16 GiB and 100 GiB,
 and always leaves behind at least 10% free space on the disk.
+The cap counts the disk that the store adds, so a block that it shares with a target directory does not count.
 Once the store comes within a tenth of its cap or of that floor, gc removes entries that no build hit for an hour,
 then the least recently used, however recently used, until it is a tenth of its cap clear again.
 It keeps only what a running compile holds.
