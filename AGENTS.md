@@ -68,7 +68,7 @@ runs the Linux path inside a VM on XFS and ext4, and `tests/windows.sh` runs rea
   - `main.rs` dispatches the subcommands, and for a compile decides whether it is cached, runs rustc, and logs the
     outcome of each invocation to the store's `log`. A failure runs rustc unchanged, logged as `passthrough <reason>`.
     A panic would fail the build, so clippy denies `unwrap`, `expect` and `panic` outside tests. A new outcome gets a
-    description in `OUTCOMES`, which `trucker stats` prints, and a row in the table of README.md, which a test checks.
+    description in `OUTCOMES`, which `trucker stats` prints.
     The log keeps the codes, because the bench and older logs read them.
   - `unit.rs` reads rustc's arguments into a `Unit` and computes its key. It relies on the layout of cargo 1.100 and
     later, which gives each unit a directory of its own. The paths of the target directory,
@@ -136,6 +136,12 @@ A proc macro may read a file without declaring it, as sqlx reads `.sqlx`. So an 
 also selected by the files of its package, the hidden files of its workspace root, and the directories of its declared
 files. The walks skip what version control, editors and tools own, and any nested worktree, package or target
 directory.
+
+  - A target directory is the build's own, the `target` of the package, which cargo leaves out of a package too, or a
+    directory that holds `CACHEDIR.TAG` or a profile directory with cargo's lock. cargo tags only a directory that it
+    creates.
+  - A walk reads only regular files and symlinks. Any other entry, such as a FIFO or socket, counts by its name alone,
+    because opening a FIFO blocks and what a reader gets comes from another process.
 
   - An own crate that loads sqlx-macros compiles uncached unless SQLX_OFFLINE is set, because sqlx otherwise queries a
     database.

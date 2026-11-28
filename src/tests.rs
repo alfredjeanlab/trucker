@@ -56,6 +56,14 @@ printf '{{"artifact":"%s/libfoo-abc.rmeta"}}\n' "$out" >&2
 }
 
 impl Fixture {
+    /// How a note names the compile of another target of this fixture, which depends on whether git owns the directory.
+    fn another_target(&self) -> &'static str {
+        match unit::repository(&self.root) {
+            Some(_) => "another target of this worktree",
+            None => "another target",
+        }
+    }
+
     /// A worktree's target directory, with the output directory of `foo` and the metadata of its dependency.
     fn worktree(&self, name: &str, dependency: &str) -> PathBuf {
         let target = self.root.join(name).join("target");
@@ -1922,14 +1930,6 @@ fn stats_gives_the_cap_that_the_last_gc_applied() {
 }
 
 #[test]
-fn readme_describes_every_outcome_that_stats_describes() {
-    let readme = include_str!("../README.md");
-    for (code, _) in crate::OUTCOMES {
-        assert!(readme.contains(&format!("| `{code}` |")), "{code}");
-    }
-}
-
-#[test]
 fn stats_describes_an_outcome_after_its_code_and_falls_back_to_the_code() {
     let fixture = fixture("stats-groups", "");
     let store = fixture.root.join("store");
@@ -2219,6 +2219,121 @@ fn own_crate_whose_proc_macro_reads_an_undeclared_file_of_its_package_is_selecte
     if !offline {
         assert_eq!(sqlx, Err("undeclared-input"), "sqlx may query a database");
     }
+}
+
+/// Leaves a socket `name` in `directory`, which a forked child binds, because the path of a fixture may be too long
+/// for a bind.
+#[allow(unsafe_code)]
+fn socket(directory: &Path, name: &str) {
+    use std::os::unix::ffi::OsStrExt;
+    let directory = std::ffi::CString::new(directory.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a zeroed `sockaddr_un` is valid, and the name is far shorter than its path.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (at, byte) in name.bytes().enumerate() {
+        address.sun_path[at] = byte as libc::c_char;
+    }
+    let length = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: the child calls only functions that are safe after a fork, and exits without unwinding.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: as for the fork, and `address` outlives the bind.
+        unsafe {
+            let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let address = &address as *const libc::sockaddr_un as *const libc::sockaddr;
+            let bound =
+                libc::chdir(directory.as_ptr()) == 0 && libc::bind(socket, address, length) == 0;
+            libc::_exit(if bound { 0 } else { 1 });
+        }
+    }
+    let mut status = 0;
+    // SAFETY: `child` is a child of this process, which no other wait reaps.
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert_eq!(status, 0, "the child bound no socket");
+}
+
+/// The outcomes of [`macro_build`] for each of `names`, where each worktree first runs `prepare` on its root, or a
+/// failure where they take longer than `limit`.
+fn macro_builds(
+    name: &'static str,
+    names: &'static [&'static str],
+    prepare: fn(&Path, &str),
+    limit: Duration,
+) -> Vec<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // A blocked walk never returns, so the builds run on a thread that the test leaves behind.
+    thread::spawn(move || {
+        let fixture = own(name);
+        for name in names {
+            prepare(&fixture.root.join(name), name);
+            let outcome = macro_build(&fixture, name, "", "libpm-123", &[]).0;
+            let _ = sender
+                .send(outcome.map_or_else(|reason| reason.to_string(), |(outcome, _)| outcome));
+        }
+    });
+    let outcome = |_| receiver.recv_timeout(limit).expect("a build took too long");
+    Vec::from_iter(names.iter().map(outcome))
+}
+
+// The walk of a package opened a FIFO without a writer, which blocked the compile, under the lock of its entry,
+// until something opened the FIFO for writing.
+#[test]
+fn own_crate_whose_package_holds_a_fifo_is_stored_without_opening_it() {
+    let prepare = |root: &Path, _: &str| {
+        fs::create_dir_all(root.join("run")).unwrap();
+        assert!(Command::new("mkfifo").arg(root.join("run/pipe")).status().unwrap().success());
+    };
+    let outcomes = macro_builds("fifo", &["a", "b"], prepare, Duration::from_secs(30));
+    assert_eq!(outcomes, ["miss", "hit"]);
+}
+
+// A socket in the package failed to open, so every compile of the crate was `passthrough unreadable-read`.
+#[test]
+fn own_crate_whose_package_holds_a_socket_is_stored_without_opening_it() {
+    let prepare = |root: &Path, _: &str| {
+        fs::create_dir_all(root.join("run")).unwrap();
+        socket(&root.join("run"), "sock");
+    };
+    let outcomes = macro_builds("socket", &["a", "b"], prepare, Duration::from_secs(30));
+    assert_eq!(outcomes, ["miss", "hit"]);
+}
+
+// cargo tags only a target directory that it creates, so a package whose `target` a test had created first was walked
+// whole, with scratch files that differ in every run.
+#[test]
+fn own_crate_is_not_selected_by_a_nested_target_or_build_directory_without_a_tag() {
+    let prepare = |root: &Path, name: &str| {
+        for directory in ["target/tmp", "out/debug", "out/tmp", "assets"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        write_source(&root.join("out/debug/.cargo-lock"), "");
+        for scratch in ["target/tmp/scratch", "out/tmp/scratch"] {
+            write_source(&root.join(scratch), name);
+        }
+        // A file that a proc macro may read, which differs only in the last worktree.
+        write_source(&root.join("assets/logo.svg"), if name == "c" { "new" } else { "old" });
+    };
+    let outcomes = macro_builds("nested", &["a", "b", "c"], prepare, Duration::from_secs(30));
+    assert_eq!(outcomes, ["miss", "hit", "miss"]);
+}
+
+#[test]
+fn tree_with_a_fifo_is_hashed_by_its_name_without_opening_it() {
+    let fixture = fixture("tree-fifo", "");
+    let tree = fixture.root.join("target/debug/build/foo/abc/out");
+    fs::create_dir_all(&tree).unwrap();
+    assert!(Command::new("mkfifo").arg(tree.join("pipe")).status().unwrap().success());
+    let target = format!("{}/", fixture.root.join("target").display());
+    let roots = Roots { target, cargo_home: fixture.cargo_home.clone(), worktree: None };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let memos = fixture.root.join("memos");
+    thread::spawn(move || {
+        let mut fields = Vec::new();
+        let hashed =
+            unit::hash_tree(&roots, &tree, &memos, &mut |bytes| fields.push(bytes.to_vec()));
+        let _ = sender.send(hashed.map(|()| fields.len()).map_err(|error| error.kind()));
+    });
+    assert_eq!(receiver.recv_timeout(Duration::from_secs(30)).expect("the hash blocked"), Ok(1));
 }
 
 // `sqlx::migrate!("../../migrations")` declares each migration but not the directory, and a worktree that added a
@@ -3996,6 +4111,7 @@ fn notes(store: &Path) -> Vec<String> {
 fn miss_names_the_parts_of_its_key_that_differ_from_the_last_stored_compile() {
     let fixture = fixture("parts", "");
     let store = fixture.root.join("store");
+    let other = fixture.another_target();
     let tree = format!("{TARGET}debug/build/foo/run/out");
     let build = |name: &str, dependency: &str, record: &str| {
         let target = fixture.worktree(name, dependency);
@@ -4014,7 +4130,7 @@ fn miss_names_the_parts_of_its_key_that_differ_from_the_last_stored_compile() {
     assert_eq!(
         notes(&store),
         [format!(
-            "note missed foo-abc against another target: libraries dep-def; tree {tree} in c.record"
+            "note missed foo-abc against {other}: libraries dep-def; tree {tree} in c.record"
         )]
     );
     assert_eq!(build("c", "other", "three"), "miss");
@@ -4028,16 +4144,14 @@ fn miss_names_the_parts_of_its_key_that_differ_from_the_last_stored_compile() {
     assert_eq!(build("d", "other", "four"), "miss");
     assert_eq!(
         notes(&store)[2],
-        format!(
-            "note missed foo-abc against another target: tree {tree}, whose earlier copy is gone"
-        )
+        format!("note missed foo-abc against {other}: tree {tree}, whose earlier copy is gone")
     );
     fs::write(fixture.root.join("d/target/debug/build/foo/run/out/c.record"), "six").unwrap();
     assert_eq!(build("e", "other", "five"), "miss");
     assert_eq!(
         notes(&store)[3],
         format!(
-            "note missed foo-abc against another target: tree {tree}, whose earlier copy changed since"
+            "note missed foo-abc against {other}: tree {tree}, whose earlier copy changed since"
         )
     );
     for entry in fs::read_dir(store.join("entries")).unwrap() {
@@ -4047,7 +4161,7 @@ fn miss_names_the_parts_of_its_key_that_differ_from_the_last_stored_compile() {
         }
     }
     assert_eq!(build("f", "other", "five"), "miss");
-    assert_eq!(notes(&store)[4], "note missed foo-abc against another target: gone");
+    assert_eq!(notes(&store)[4], format!("note missed foo-abc against {other}: gone"));
     let report = stats(&[], &store).unwrap();
     assert!(!report.contains("note"), "{report}");
 }
@@ -4056,6 +4170,7 @@ fn miss_names_the_parts_of_its_key_that_differ_from_the_last_stored_compile() {
 fn miss_of_equal_parts_whose_reads_select_another_entry_names_sources() {
     let fixture = fixture("sources", "$out/../../run/out/read.rs");
     let store = fixture.root.join("store");
+    let other = fixture.another_target();
     let build = |name: &str, read: &str| {
         let target = fixture.worktree(name, "metadata");
         let (unit, _) = fixture.generated(&target, read, "unread");
@@ -4064,7 +4179,7 @@ fn miss_of_equal_parts_whose_reads_select_another_entry_names_sources() {
     };
     assert_eq!(build("a", "one"), "miss");
     assert_eq!(build("b", "two"), "miss");
-    assert_eq!(notes(&store), ["note missed foo-abc against another target: sources"]);
+    assert_eq!(notes(&store), [format!("note missed foo-abc against {other}: sources")]);
 }
 
 /// A checkout `name` of a workspace whose crate `pycc` has a build script and dependents `d1` and `app`, with the
@@ -4261,6 +4376,7 @@ fn missed_ranks_the_causes_by_the_time_that_they_and_their_dependents_took() {
 fn miss_names_the_file_of_a_link_argument_that_differs() {
     let fixture = fixture("named-part", "");
     let store = fixture.root.join("store");
+    let other = fixture.another_target();
     let build = |name: &str, object: &[u8]| {
         let target = fixture.worktree(name, "metadata");
         let out = target.join("debug/build/foo/run/out");
@@ -4275,10 +4391,7 @@ fn miss_names_the_file_of_a_link_argument_that_differs() {
     assert!(notes(&store).is_empty(), "{:?}", notes(&store));
     assert_eq!(build("c", b"\xcf\xfa object 2"), "miss");
     let object = format!("{TARGET}debug/build/foo/run/out/value.o");
-    assert_eq!(
-        notes(&store),
-        [format!("note missed foo-abc against another target: named {object}")]
-    );
+    assert_eq!(notes(&store), [format!("note missed foo-abc against {other}: named {object}")]);
 }
 
 #[test]

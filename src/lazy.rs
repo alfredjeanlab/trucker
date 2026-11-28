@@ -57,8 +57,9 @@ pub fn scan(paths: &[PathBuf], texts: &[&str]) -> Option<(Vec<blake3::Hash>, boo
     const SEGMENT: usize = 1 << 20;
     let finders = Vec::from_iter(texts.iter().map(memchr::memmem::Finder::new));
     let overlap = texts.iter().map(|text| text.len().saturating_sub(1)).max().unwrap_or(0);
-    let open =
-        |path| fs::File::open(path).and_then(|file| Ok((file.metadata()?.len() as usize, file)));
+    let open = |path| {
+        crate::unit::open_regular(path).and_then(|file| Ok((file.metadata()?.len() as usize, file)))
+    };
     let files = paths.iter().map(|path| open(path).ok()).collect::<Option<Vec<_>>>()?;
     let segments = files.iter().enumerate().flat_map(|(file, (length, _))| {
         (0..(*length).max(1)).step_by(SEGMENT).map(move |start| (file, start))

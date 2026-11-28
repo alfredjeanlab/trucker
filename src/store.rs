@@ -354,14 +354,19 @@ fn any_file(paths: &[impl AsRef<Path> + Sync], contains: impl Fn(&[u8]) -> bool 
 
 /// A map of the file at `path`, or `None` where it is too small for a map to be cheaper than a read, or cannot be
 /// mapped.
-#[allow(unsafe_code)]
 pub fn map(path: &Path) -> Option<memmap2::Mmap> {
-    let file = fs::File::open(path).ok()?;
+    map_file(&crate::unit::open_regular(path).ok()?)
+}
+
+/// A map of `file`, as [`map`] gives it.
+#[allow(unsafe_code)]
+pub fn map_file(file: &fs::File) -> Option<memmap2::Mmap> {
     if file.metadata().ok()?.len() < 1 << 16 {
         return None;
     }
-    // SAFETY: the file is an output of a process that has exited, so nothing writes it while it is mapped.
-    unsafe { memmap2::Mmap::map(&file) }.ok()
+    // SAFETY: the map is only read. A file that a writer shrinks while it is mapped can fault, as under the map that
+    // blake3's `update_mmap` takes, so a source is mapped no more than blake3 would map it.
+    unsafe { memmap2::Mmap::map(file) }.ok()
 }
 
 /// Stores the outputs of `unit`, rustc's `stderr` and the `record` of the compile under `key` in `entries`.

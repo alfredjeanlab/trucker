@@ -50,7 +50,15 @@ const UNREAD: &[&str] = &[
 
 /// The names of the entries that make a directory another worktree, package or target directory, which no walk of
 /// [`Unit::package_hash`] enters.
+///
+/// cargo writes `CACHEDIR.TAG` only into a target directory that it creates, so [`is_profile`] finds the others.
 const ROOT_MARKERS: &[&str] = &["Cargo.toml", ".git", "CACHEDIR.TAG"];
+
+/// What a walk feeds for an entry that is neither a directory, a symlink nor a regular file, such as a FIFO or socket.
+///
+/// Its name counts but nothing is read from it, because opening a FIFO blocks and what a reader gets comes from another
+/// process, which no hash of a file can cover.
+const SPECIAL: &[u8] = b"special";
 
 /// The codegen and unstable options whose values rustc passes to the linker.
 const LINK_ARGUMENTS: &[&str] = &["link-arg", "link-args", "pre-link-arg", "pre-link-args"];
@@ -269,7 +277,37 @@ pub fn is_keyed(name: &str) -> bool {
 }
 
 pub fn file_hash(path: &Path) -> io::Result<blake3::Hash> {
-    Ok(blake3::Hasher::new().update_mmap(path)?.finalize())
+    let file = open_regular(path)?;
+    let mut hasher = blake3::Hasher::new();
+    match crate::store::map_file(&file) {
+        Some(map) => hasher.update(&map),
+        None => hasher.update_reader(&file)?,
+    };
+    Ok(hasher.finalize())
+}
+
+/// The file at `path`, opened for reading, where it is a regular file.
+///
+/// The open does not block, as that of a FIFO without a writer would. The type is read from the open file, so a path
+/// that a FIFO or device replaced after it was listed fails with `InvalidInput`.
+#[cfg(unix)]
+pub fn open_regular(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    Ok(file)
+}
+
+/// The file at `path`, opened for reading, where it is a regular file, as on Unix.
+#[cfg(windows)]
+pub fn open_regular(path: &Path) -> io::Result<fs::File> {
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    Ok(file)
 }
 
 /// The identity of the file at `path`, as [`identity_of`] gives it.
@@ -409,6 +447,8 @@ enum Listed {
     Link(Vec<u8>),
     /// A file, with its metadata, which does not follow a symlink.
     File(fs::Metadata),
+    /// An entry that is fed as [`SPECIAL`].
+    Special,
 }
 
 /// Feeds the hash of the names and contents of every entry under `root` to `field`.
@@ -438,6 +478,7 @@ pub fn hash_tree(
             Listed::File(file) => {
                 feed(&mut listing, format!("file {}", identity_of(file)).as_bytes())
             }
+            Listed::Special => feed(&mut listing, SPECIAL),
         }
     }
     let worktree = roots.worktree.as_deref().unwrap_or_default();
@@ -467,6 +508,7 @@ pub fn hash_tree(
                 let (hash, _) = hashed.next().ok_or(io::ErrorKind::InvalidData)?;
                 feed(&mut tree, &[b"file ", hash.as_bytes().as_slice()].concat());
             }
+            Listed::Special => feed(&mut tree, SPECIAL),
         }
     }
     let tree = tree.finalize();
@@ -492,8 +534,10 @@ fn list_tree(roots: &Roots, root: &Path) -> io::Result<Vec<(PathBuf, Listed)>> {
                 Listed::Directory
             } else if kind.is_symlink() {
                 Listed::Link(link_target(roots, &entry.path())?)
-            } else {
+            } else if kind.is_file() {
                 Listed::File(entry.metadata()?)
+            } else {
+                Listed::Special
             };
             entries.push((directory.join(entry.file_name()), listed));
         }
@@ -521,6 +565,7 @@ pub fn tree_entries(
         Listed::Directory => Ok(b"directory".to_vec()),
         Listed::Link(target) => Ok([b"link ", &target[..]].concat()),
         Listed::File(_) => Ok(tree_file_hash(roots, &root.join(path), memos)?.as_bytes().to_vec()),
+        Listed::Special => Ok(SPECIAL.to_vec()),
     })?;
     Ok(listed.into_iter().map(|(path, _)| path).zip(fed).collect())
 }
@@ -560,10 +605,15 @@ fn tree_file_hash(roots: &Roots, path: &Path, memos: &Path) -> io::Result<blake3
     if let Some(Ok(bytes)) = recalled(memos, &before).map(<[u8; 32]>::try_from) {
         return Ok(blake3::Hash::from_bytes(bytes));
     }
-    let map = crate::store::map(path);
+    let mut opened = open_regular(path)?;
+    let map = crate::store::map_file(&opened);
     let bytes = match &map {
         Some(map) => std::borrow::Cow::Borrowed(&map[..]),
-        None => std::borrow::Cow::Owned(fs::read(path)?),
+        None => {
+            let mut bytes = Vec::new();
+            io::Read::read_to_end(&mut opened, &mut bytes)?;
+            std::borrow::Cow::Owned(bytes)
+        }
     };
     if let Ok(text) = std::str::from_utf8(&bytes) {
         return Ok(blake3::hash(roots.normalized(text).as_bytes()));
@@ -636,6 +686,28 @@ pub fn target_directory<'a>(out_dir: &'a Path, triple: Option<&str>) -> Option<&
         return if named { above.parent() } else { Some(above) };
     }
     out_dir.ancestors().find(|directory| directory.join("CACHEDIR.TAG").exists())
+}
+
+/// An entry that [`Unit::package_hash`] takes.
+enum Walked {
+    /// A directory of a `dir` walk, which counts by its name alone.
+    Named,
+    /// A regular file or symlink, with its metadata, which does not follow a symlink.
+    File(fs::Metadata),
+    /// An entry that is fed as [`SPECIAL`].
+    Special,
+}
+
+/// The lock files that cargo keeps in every profile directory of a target directory, and of a separate build directory.
+const PROFILE_LOCKS: &[&str] = &[".cargo-lock", ".cargo-build-lock"];
+
+/// Whether `entry` is a directory that holds an entry of [`PROFILE_LOCKS`], as a profile directory of cargo does.
+///
+/// Its parent is a target or build directory, whatever its name and even where cargo did not create it.
+fn is_profile(entry: &fs::DirEntry) -> bool {
+    let directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+    directory
+        && PROFILE_LOCKS.iter().any(|lock| fs::symlink_metadata(entry.path().join(lock)).is_ok())
 }
 
 impl Unit {
@@ -833,17 +905,24 @@ impl Unit {
         packages
     }
 
-    /// Whether `path` is the target directory or holds an entry of [`ROOT_MARKERS`], as another worktree, package or
+    /// Whether `path` is a target directory or holds an entry of [`ROOT_MARKERS`], as another worktree, package or
     /// target directory does, which no walk enters.
     fn other_root(&self, path: &Path) -> bool {
         self.is_target(path)
             || ROOT_MARKERS.iter().any(|name| fs::symlink_metadata(path.join(name)).is_ok())
+            || fs::read_dir(path)
+                .is_ok_and(|entries| entries.flatten().any(|entry| is_profile(&entry)))
     }
 
-    /// Whether `path` is the target directory or the separate one.
+    /// Whether `path` is the target directory, the separate one, or the directory `target` of the package.
+    ///
+    /// cargo leaves the directory `target` of a package root out of the files that it packages, and a build of the
+    /// package alone writes there.
     fn is_target(&self, path: &Path) -> bool {
         let targets = [Some(self.roots.target.as_str()), self.roots.separate_target()];
+        let package = self.package.as_deref().map(|package| lexical(package).join("target"));
         targets.into_iter().flatten().any(|target| Path::new(target) == path)
+            || package.is_some_and(|package| package == path)
     }
 
     /// The directories outside the walk of the package that hold a file of `declared`, each as a `dir` read.
@@ -904,15 +983,14 @@ impl Unit {
                 || (directory && self.is_target(path))
                 || (directory && kind == "dir" && self.other_root(path))
         };
-        // Each entry of the walk with its metadata, which does not follow a symlink, or None for a directory of a
-        // `dir` walk, which counts by its name alone.
         let (mut files, mut pending) = (Vec::new(), vec![root.to_path_buf()]);
         while let Some(directory) = pending.pop() {
             let entries =
                 fs::read_dir(&directory).and_then(Iterator::collect::<io::Result<Vec<_>>>);
             let entries = entries.map_err(|_| "unreadable-read")?;
-            let marker =
-                |entry: &fs::DirEntry| ROOT_MARKERS.iter().any(|name| entry.file_name() == *name);
+            let marker = |entry: &fs::DirEntry| {
+                ROOT_MARKERS.iter().any(|name| entry.file_name() == *name) || is_profile(entry)
+            };
             if directory != root && entries.iter().any(marker) {
                 continue;
             }
@@ -926,11 +1004,14 @@ impl Unit {
                     continue;
                 }
                 if entry_kind.is_dir() && kind == "dir" {
-                    files.push((path, None));
+                    files.push((path, Walked::Named));
                 } else if entry_kind.is_dir() {
                     pending.push(path);
+                } else if entry_kind.is_file() || entry_kind.is_symlink() {
+                    let file = entry.metadata().map_err(|_| "unreadable-read")?;
+                    files.push((path, Walked::File(file)));
                 } else {
-                    files.push((path, Some(entry.metadata().map_err(|_| "unreadable-read")?)));
+                    files.push((path, Walked::Special));
                 }
             }
         }
@@ -939,21 +1020,26 @@ impl Unit {
             path.strip_prefix(root).unwrap_or(path).as_os_str().as_encoded_bytes()
         }
         let mut listing = blake3::Hasher::new();
-        for (path, file) in &files {
-            let identity = file.as_ref().map(identity_of).unwrap_or_default();
+        for (path, entry) in &files {
+            let identity = match entry {
+                Walked::Named => String::new(),
+                Walked::File(file) => identity_of(file),
+                Walked::Special => String::from_utf8_lossy(SPECIAL).into_owned(),
+            };
             for field in [relative(path, root), identity.as_bytes()] {
                 listing.update(&(field.len() as u64).to_le_bytes()).update(field);
             }
         }
         let listing = format!("walk {}", listing.finalize().to_hex());
         let memo = recalled(memos, &listing).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
-        let hash = |(path, file): &(PathBuf, Option<fs::Metadata>)| {
-            let contents = match file {
-                None => return io::Result::Ok((Vec::new(), None)),
-                Some(file) if file.is_symlink() => {
+        let hash = |(path, entry): &(PathBuf, Walked)| {
+            let contents = match entry {
+                Walked::Named => return io::Result::Ok((Vec::new(), None)),
+                Walked::Special => return Ok((SPECIAL.to_vec(), None)),
+                Walked::File(file) if file.is_symlink() => {
                     fs::read_link(path)?.into_os_string().into_encoded_bytes()
                 }
-                Some(_) => file_hash(path)?.as_bytes().to_vec(),
+                Walked::File(_) => file_hash(path)?.as_bytes().to_vec(),
             };
             // The metadata is read again after the hash, so that a write during the hash is seen.
             Ok((contents, Some(fs::symlink_metadata(path)?)))
@@ -963,10 +1049,14 @@ impl Unit {
             None => Some(on_every_core(&files, hash).map_err(|_| "unreadable-read")?),
         };
         let (mut hasher, mut unchanged) = (blake3::Hasher::new(), true);
-        for (at, (path, file)) in files.iter().enumerate() {
+        for (at, (path, entry)) in files.iter().enumerate() {
+            let file = match entry {
+                Walked::File(file) => Some(file),
+                _ => None,
+            };
             let (contents, after) = match &hashed {
                 Some(hashed) => (hashed[at].0.as_slice(), hashed[at].1.as_ref()),
-                None => (&[][..], file.as_ref()),
+                None => (&[][..], file),
             };
             if let Some(after) = after {
                 let modified = after.modified().map_err(|_| "unreadable-read")?;
@@ -975,8 +1065,8 @@ impl Unit {
                 {
                     return Err("changed-source");
                 }
-                unchanged &= settled(after, start)
-                    && file.as_ref().map(identity_of) == Some(identity_of(after));
+                unchanged &=
+                    settled(after, start) && file.map(identity_of) == Some(identity_of(after));
             }
             for field in [relative(path, root), contents] {
                 hasher.update(&(field.len() as u64).to_le_bytes()).update(field);
